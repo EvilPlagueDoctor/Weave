@@ -15,7 +15,24 @@ import java.io.File
  * Design note carried over from the architecture discussion: comments are keyed per PAGE,
  * not per profile, so a comment attaches to the specific project it is about.
  */
-enum class CommentState { Visible, Quarantined, Hidden }
+/**
+ * Where a comment is in the owner's decision, not where it is stored.
+ *
+ * [Provisional] exists because of open mode: a comment published as a service request is
+ * already readable by anyone before the owner has done anything about it. Modelling those as
+ * "quarantined" would be a lie — they are public, they are just not endorsed, and they expire
+ * on their own if the owner never accepts them.
+ */
+enum class CommentState { Accepted, Provisional, Held, Dropped }
+
+/** How a comment reached the page, which determines who could already read it. */
+enum class CommentOrigin {
+    /** Sent to the owner directly. Nobody else can see it until the owner republishes it. */
+    Direct,
+
+    /** Published as an open service request. Readable by anyone, expires on its TTL. */
+    Open,
+}
 
 data class Comment(
     val id: String,
@@ -25,11 +42,18 @@ data class Comment(
     val body: String,
     val createdAt: Long,
     val state: CommentState,
+    val origin: CommentOrigin = CommentOrigin.Direct,
+    /** Open-mode only: when the underlying request lapses. Zero means no expiry. */
+    val expiresAt: Long = 0L,
 ) {
+    fun isExpired(now: Long = System.currentTimeMillis()): Boolean =
+        expiresAt > 0L && now >= expiresAt && state != CommentState.Accepted
+
     fun toJson(): JSONObject = JSONObject()
         .put("id", id).put("page_key", pageKey).put("author_key", authorKey)
         .put("author_name", authorName).put("body", body)
         .put("created_at", createdAt).put("state", state.name)
+        .put("origin", origin.name).put("expires_at", expiresAt)
 
     companion object {
         fun fromJson(o: JSONObject) = Comment(
@@ -39,7 +63,9 @@ data class Comment(
             authorName = o.optString("author_name", "Someone"),
             body = o.optString("body"),
             createdAt = o.optLong("created_at"),
-            state = runCatching { CommentState.valueOf(o.optString("state")) }.getOrDefault(CommentState.Visible),
+            state = runCatching { CommentState.valueOf(o.optString("state")) }.getOrDefault(CommentState.Held),
+            origin = runCatching { CommentOrigin.valueOf(o.optString("origin")) }.getOrDefault(CommentOrigin.Direct),
+            expiresAt = o.optLong("expires_at"),
         )
     }
 }
@@ -47,11 +73,26 @@ data class Comment(
 /** Stable key for "this page of this profile". */
 fun pageKeyOf(mainDht: String, pageId: String): String = "$mainDht#$pageId"
 
+/** Whose page a comment was left on. Moderation authority belongs to this key, not the author's. */
+fun ownerKeyOf(pageKey: String): String = pageKey.substringBefore('#')
+
 interface CommentStore {
+    /** Accepted comments plus, in open mode, unexpired provisional ones. */
     fun forPage(pageKey: String): List<Comment>
-    fun add(pageKey: String, authorKey: String, authorName: String, body: String, state: CommentState): Comment
+    fun add(
+        pageKey: String,
+        authorKey: String,
+        authorName: String,
+        body: String,
+        state: CommentState,
+        origin: CommentOrigin,
+        expiresAt: Long = 0L,
+    ): Comment
     fun setState(id: String, state: CommentState)
-    fun quarantined(): List<Comment>
+    /** Comments held for the owner of [ownerKey]'s pages to decide on. Only the page owner moderates. */
+    fun quarantined(ownerKey: String): List<Comment>
+    /** Comments [authorKey] wrote that are still waiting on someone else's approval. */
+    fun awaitingApproval(authorKey: String): List<Comment>
     /** Comments the local user has hidden for themselves. Hidden for you, still visible to others. */
     fun hideForMe(id: String)
 }
@@ -82,15 +123,28 @@ class LocalCommentStore(context: Context) : CommentStore {
         }
     }
 
-    override fun forPage(pageKey: String): List<Comment> =
-        items.filter { it.pageKey == pageKey && it.id !in hiddenLocally && it.state == CommentState.Visible }
+    override fun forPage(pageKey: String): List<Comment> {
+        val now = System.currentTimeMillis()
+        return items
+            .filter { it.pageKey == pageKey && it.id !in hiddenLocally && !it.isExpired(now) }
+            .filter { it.state == CommentState.Accepted || it.state == CommentState.Provisional }
             .sortedBy { it.createdAt }
+    }
 
-    override fun add(pageKey: String, authorKey: String, authorName: String, body: String, state: CommentState): Comment {
+    override fun add(
+        pageKey: String,
+        authorKey: String,
+        authorName: String,
+        body: String,
+        state: CommentState,
+        origin: CommentOrigin,
+        expiresAt: Long,
+    ): Comment {
         val comment = Comment(
             id = makeId("comment"), pageKey = pageKey, authorKey = authorKey,
-            authorName = authorName, body = body.trim().take(4000),
+            authorName = authorName, body = body.trim().take(MAX_COMMENT_CHARS),
             createdAt = System.currentTimeMillis(), state = state,
+            origin = origin, expiresAt = expiresAt,
         )
         items.add(comment)
         persist()
@@ -105,8 +159,21 @@ class LocalCommentStore(context: Context) : CommentStore {
         }
     }
 
-    override fun quarantined(): List<Comment> =
-        items.filter { it.state == CommentState.Quarantined }.sortedByDescending { it.createdAt }
+    override fun quarantined(ownerKey: String): List<Comment> {
+        val now = System.currentTimeMillis()
+        return items.filter {
+            ownerKeyOf(it.pageKey) == ownerKey && !it.isExpired(now) &&
+                (it.state == CommentState.Held || it.state == CommentState.Provisional)
+        }.sortedByDescending { it.createdAt }
+    }
+
+    override fun awaitingApproval(authorKey: String): List<Comment> {
+        val now = System.currentTimeMillis()
+        return items.filter {
+            it.authorKey == authorKey && !it.isExpired(now) &&
+                (it.state == CommentState.Held || it.state == CommentState.Provisional)
+        }.sortedByDescending { it.createdAt }
+    }
 
     override fun hideForMe(id: String) {
         hiddenLocally.add(id)
@@ -120,13 +187,48 @@ class LocalCommentStore(context: Context) : CommentStore {
  * toward holding rather than publishing, because a held comment is recoverable and a
  * published one is not.
  */
-fun triageComment(body: String, authorKey: String, existing: List<Comment>, knownAuthors: Set<String>): CommentState {
+const val MAX_COMMENT_CHARS = 4000
+
+/** Anything past this is folded behind a "show more" rather than dropped. */
+const val COMMENT_TRUNCATE_CHARS = 600
+
+/**
+ * Light moderation, as specified: hold repetition, not strangers.
+ *
+ * The earlier version quarantined anyone the reader did not already follow, which on a young
+ * network is everyone — every comment would have been held and the feature would have looked
+ * broken. Being new is not evidence of anything.
+ *
+ * [openMode] decides what an unaccepted comment becomes. In open mode it is already public,
+ * so it becomes [CommentState.Provisional] and shows with a marker. In closed mode only the
+ * owner has it, so it is [CommentState.Held] until they release it.
+ */
+fun triageComment(
+    body: String,
+    authorKey: String,
+    pageOwnerKey: String,
+    existing: List<Comment>,
+    openMode: Boolean,
+): CommentState {
+    // You never moderate yourself on your own page.
+    if (authorKey.isNotBlank() && authorKey == pageOwnerKey) return CommentState.Accepted
+
     val normalized = body.trim().lowercase()
-    if (normalized.isEmpty()) return CommentState.Quarantined
-    val duplicate = existing.any { it.body.trim().lowercase() == normalized }
-    val unknownAuthor = authorKey.isNotBlank() && authorKey !in knownAuthors
-    return if (duplicate || unknownAuthor) CommentState.Quarantined else CommentState.Visible
+    val unaccepted = if (openMode) CommentState.Provisional else CommentState.Held
+    if (normalized.isEmpty()) return CommentState.Dropped
+
+    val duplicateOnPage = existing.any { it.body.trim().lowercase() == normalized }
+    val repeatingAuthor = existing.count { it.authorKey == authorKey && it.authorKey.isNotBlank() } >= 5
+    return if (duplicateOnPage || repeatingAuthor) unaccepted else CommentState.Accepted
 }
+
+/**
+ * Open-mode comments are readable by anyone before the owner sees them, so the reader's own
+ * client trims them. Truncation is display-only — the full text is kept.
+ */
+fun displayBody(comment: Comment, expanded: Boolean): String =
+    if (expanded || comment.body.length <= COMMENT_TRUNCATE_CHARS) comment.body
+    else comment.body.take(COMMENT_TRUNCATE_CHARS).trimEnd() + "\u2026"
 
 /** Who the local user follows. A filter over discovery, not a social graph published anywhere. */
 class FollowStore(context: Context) {

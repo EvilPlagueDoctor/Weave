@@ -164,45 +164,58 @@ fun FirstRunScreen(ownKey: String, onDone: (name: String, backgroundArgb: Int, b
     }
 }
 
-/** Builds the starter document from the first-run answers. */
+/**
+ * Builds the starter document from the first-run answers.
+ *
+ * Two deliberate restrictions. Nothing instructional is written into the document: guidance
+ * copy would be published verbatim by every new user, which is duplicate content under the
+ * duplicate penalty and collapses their signatures together. And every element is a plain
+ * text block, so the simple editor can round-trip the result without its "this page uses the
+ * advanced editor" warning firing on a profile the person has not even opened yet.
+ *
+ * What it does demonstrate is structure: a second page, so the book model is visible from
+ * the first minute rather than being a feature nobody discovers.
+ */
 fun starterProfile(context: Context, name: String, backgroundArgb: Int, blurb: String): ProfileDocument {
     val doc = makeDefaultProfile()
     doc.profileName = name
-    val page = doc.pages.firstOrNull() ?: return doc
-    page.name = context.getString(R.string.default_page_name)
-    page.root.background = BackgroundSpec(kind = BackgroundKind.Solid, solidArgb = backgroundArgb)
 
-    val dark = isDarkArgb(backgroundArgb)
-    val textArgb = if (dark) 0xFFF5F5F5.toInt() else 0xFF111827.toInt()
+    val home = doc.pages.firstOrNull() ?: return doc
+    home.name = context.getString(R.string.default_page_name)
+    home.root.background = BackgroundSpec(kind = BackgroundKind.Solid, solidArgb = backgroundArgb)
 
-    page.root.children.clear()
-    page.root.children.add(
-        Element(
-            type = ElementType.Text,
-            name = "Name",
-            rect = RectSpec(x = .07f, y = .05f, width = .86f, height = .09f, zIndex = 1),
-            text = name,
-            fontSize = 30f,
-            bold = true,
-            textArgb = textArgb,
-            textAlign = TextAlignMode.Left,
+    val homeBlocks = buildList {
+        add(QuickBlock.Heading(makeId("head"), name))
+        if (blurb.isNotBlank()) add(QuickBlock.Body(makeId("text"), blurb))
+    }
+    applyBlocksToPage(home, homeBlocks, STARTER_REFERENCE_WIDTH, 1f)
+
+    val projects = Page(
+        id = makeId("page"),
+        name = "Projects",
+        aspectRatio = home.aspectRatio,
+        root = Element(
+            type = ElementType.Block,
+            id = makeId("root"),
+            name = "Projects",
+            rect = RectSpec(0f, 0f, 1f, 1f),
+            background = BackgroundSpec(kind = BackgroundKind.Solid, solidArgb = backgroundArgb),
         )
     )
-    if (blurb.isNotBlank()) {
-        page.root.children.add(
-            Element(
-                type = ElementType.Text,
-                name = "About",
-                rect = RectSpec(x = .07f, y = .16f, width = .86f, height = .18f, zIndex = 2),
-                text = blurb,
-                fontSize = 16f,
-                textArgb = textArgb,
-                textAlign = TextAlignMode.Left,
-            )
-        )
-    }
+    applyBlocksToPage(projects, listOf(QuickBlock.Heading(makeId("head"), "Projects")), STARTER_REFERENCE_WIDTH, 1f)
+    doc.pages.add(projects)
+
     return doc
 }
+
+/**
+ * Nominal width used to lay out the starter pages before a real viewport exists.
+ *
+ * The layout is scale invariant: width and font size are both multiplied by the density, so
+ * StaticLayout wraps at the same line count and the resulting fractions are identical at any
+ * real density. Only the physical width the person eventually views at can shift the wrap.
+ */
+private const val STARTER_REFERENCE_WIDTH = 400f
 
 private fun isDarkArgb(argb: Int): Boolean {
     val r = (argb shr 16) and 0xff
@@ -216,11 +229,15 @@ private fun isDarkArgb(argb: Int): Boolean {
 fun MeScreen(
     state: EditorState,
     controller: SocialNetworkController,
+    commentStore: CommentStore,
+    media: LocalMediaStore,
     ownKey: String,
-    onEdit: () -> Unit,
+    onQuickEdit: (Int) -> Unit,
+    onAdvancedEdit: () -> Unit,
     onSettings: () -> Unit,
 ) {
     val ui by controller.ui.collectAsState()
+    val mediaLookup = remember(media) { { e: Element -> media.bitmapFor(e.mediaContentHash) } }
     var pageIndex by remember { mutableIntStateOf(0) }
     val page = state.doc.pages.getOrNull(pageIndex) ?: state.doc.pages.first()
     val scroll = rememberScrollState()
@@ -243,9 +260,13 @@ fun MeScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                TextButton(onClick = onEdit) { Text("Edit") }
+                TextButton(onClick = onAdvancedEdit) { Text("Advanced") }
+                TextButton(onClick = { onQuickEdit(pageIndex) }) { Text("Edit") }
                 Button(
-                    onClick = { controller.publishProfile(state.ownProfileTextForPublish(), state.ownProfileNameForPublish()) },
+                    onClick = {
+                        state.persistActive()
+                        controller.publishProfile(state.ownProfileTextForPublish(), state.ownProfileNameForPublish())
+                    },
                     contentPadding = PaddingValues(horizontal = 14.dp)
                 ) { Text("Publish") }
             }
@@ -255,7 +276,7 @@ fun MeScreen(
             val canvasHeight = canvasWidth / page.aspectRatio.coerceIn(.15f, 6f)
             Column(Modifier.fillMaxSize().verticalScroll(scroll)) {
                 Surface(color = Color.White) {
-                    PageCanvas(page, Modifier.fillMaxWidth().height(canvasHeight), widgetLookup = state::widgetProgramFor)
+                    PageCanvas(page, Modifier.fillMaxWidth().height(canvasHeight), widgetLookup = state::widgetProgramFor, imageLookup = mediaLookup)
                 }
                 PageRail(
                     pageNames = state.doc.pages.map { it.name },
@@ -263,6 +284,15 @@ fun MeScreen(
                     onSelect = { pageIndex = it },
                     onPrev = { if (pageIndex > 0) pageIndex-- },
                     onNext = { if (pageIndex < state.doc.pages.lastIndex) pageIndex++ },
+                )
+                CommentsSection(
+                    pageKey = pageKeyOf(ownKey, page.id),
+                    pageOwnerKey = ownKey,
+                    store = commentStore,
+                    ownKey = ownKey,
+                    ownName = state.doc.profileName,
+                    openMode = true,
+                    onPosted = {},
                 )
                 Spacer(Modifier.height(24.dp))
             }

@@ -28,6 +28,7 @@ fun VeilyApp() {
     val commentStore: CommentStore = remember { LocalCommentStore(context) }
     val followStore = remember { FollowStore(context) }
     val remoteCache = remember { RemoteProfileCache() }
+    val media = remember { LocalMediaStore(context) }
 
     var setupDone by remember { mutableStateOf(onboarding.completed) }
     var widgetsEnabled by remember { mutableStateOf(true) }
@@ -62,6 +63,7 @@ fun VeilyApp() {
                     commentStore = commentStore,
                     followStore = followStore,
                     remoteCache = remoteCache,
+                    media = media,
                     widgetsEnabled = widgetsEnabled,
                     onWidgetsEnabledChange = { widgetsEnabled = it },
                 )
@@ -77,6 +79,7 @@ private fun VeilyShell(
     commentStore: CommentStore,
     followStore: FollowStore,
     remoteCache: RemoteProfileCache,
+    media: LocalMediaStore,
     widgetsEnabled: Boolean,
     onWidgetsEnabledChange: (Boolean) -> Unit,
 ) {
@@ -86,9 +89,19 @@ private fun VeilyShell(
 
     BackHandler(enabled = true) { nav.pop() }
 
-    // The editor is full-bleed: no bottom bar competing with the tool strip.
+    // Both editors are full-bleed: no bottom bar competing with their own controls.
     if (destination is Destination.Editor) {
         EditorScreen(state, onBack = { nav.pop() })
+        return
+    }
+    if (destination is Destination.QuickEdit) {
+        QuickEditScreen(
+            state = state,
+            media = media,
+            pageIndex = destination.pageIndex,
+            onOpenAdvanced = { nav.replaceTop(Destination.Editor) },
+            onBack = { nav.pop() },
+        )
         return
     }
 
@@ -109,8 +122,11 @@ private fun VeilyShell(
                 Destination.Me -> MeScreen(
                     state = state,
                     controller = controller,
+                    commentStore = commentStore,
+                    media = media,
                     ownKey = ui.mainDht,
-                    onEdit = { nav.push(Destination.Editor) },
+                    onQuickEdit = { page -> nav.push(Destination.QuickEdit(page)) },
+                    onAdvancedEdit = { nav.push(Destination.Editor) },
                     onSettings = { nav.push(Destination.Settings) },
                 )
 
@@ -136,7 +152,7 @@ private fun VeilyShell(
                     onBack = { nav.pop() },
                 )
 
-                Destination.Editor -> Unit // handled above
+                Destination.Editor, is Destination.QuickEdit -> Unit // handled above
             }
         }
         VeilyBottomBar(nav)
@@ -189,7 +205,7 @@ private fun ProfileDestination(
             ownKey = ownKey,
             ownName = ownName,
             commentStore = commentStore,
-            knownAuthors = followStore.all(),
+            openComments = true,
             isFollowing = following,
             onToggleFollow = { following = followStore.toggle(mainDht) },
             onPrevProfile = if (position > 0) ({ onNavigate(queue[position - 1]) }) else null,

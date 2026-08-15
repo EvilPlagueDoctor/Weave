@@ -59,6 +59,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
@@ -142,8 +144,26 @@ private fun localizedDefaultProfile(context: Context): ProfileDocument {
     return d
 }
 
+/** Fixed filename for the profile the app is actually using, distinct from named exports. */
+const val ACTIVE_PROFILE_FILE = "active.txt"
+
+/**
+ * Restores the working profile, falling back to a fresh starter document when there is no
+ * saved one or the saved one will not parse.
+ */
+fun loadActiveProfile(context: Context): ProfileDocument {
+    val file = File(File(context.filesDir, "profiles").apply { mkdirs() }, ACTIVE_PROFILE_FILE)
+    if (!file.exists()) return localizedDefaultProfile(context)
+    return runCatching { ProfileCodec.load(file) }.getOrElse { localizedDefaultProfile(context) }
+}
+
 class EditorState(private val context: Context) {
-    var doc by mutableStateOf(localizedDefaultProfile(context))
+    /**
+     * The working document is restored from disk on construction. Without this the app came
+     * up on the built-in default every launch, so anything made in a previous session was
+     * gone and Publish would overwrite a good published profile with the placeholder.
+     */
+    var doc by mutableStateOf(loadActiveProfile(context))
     var pageIndex by mutableIntStateOf(0)
     var selectedId by mutableStateOf(doc.pages.first().root.id)
     var panelCollapsed by mutableStateOf(false)
@@ -191,6 +211,15 @@ class EditorState(private val context: Context) {
     fun ownProfileTextForPublish(): String = ProfileCodec.encodeText(doc)
     fun ownProfileNameForPublish(): String = doc.profileName
 
+    /**
+     * Writes the working document to its fixed slot. Called at every commit point rather
+     * than on a timer, so a process death between edits cannot lose more than the edit in
+     * progress. Failures are swallowed: a full disk should not take the editor down.
+     */
+    fun persistActive() {
+        runCatching { ProfileCodec.save(doc, File(profileDir, ACTIVE_PROFILE_FILE)) }
+    }
+
     /** Replaces the whole editable document. Used by first-run setup. */
     fun replaceDocument(next: ProfileDocument) {
         finishInlineTextEdit()
@@ -200,6 +229,7 @@ class EditorState(private val context: Context) {
         focusedBoxId = firstBoxId()
         mode = EditMode.Boxes
         invalidate()
+        persistActive()
     }
     fun sectionExpanded(s: PanelSection) = expanded[s] == true
     fun toggleSection(s: PanelSection) { expanded[s] = !(expanded[s] ?: false) }
@@ -734,7 +764,7 @@ fun EditorScreen(state: EditorState, onBack: () -> Unit) {
     BackHandler(enabled = true) {
         when {
             state.showWidgetStudio -> state.showWidgetStudio = false
-            else -> onBack()
+            else -> { state.persistActive(); onBack() }
         }
     }
     if (state.showWidgetStudio) {
@@ -789,7 +819,7 @@ private fun EditorHeader(state: EditorState, onBack: () -> Unit) {
     val page = state.doc.pages[state.pageIndex]
     Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 1.dp) {
         Row(Modifier.fillMaxWidth().height(54.dp).padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = onBack) { Text("\u2190 Done") }
+            TextButton(onClick = { state.persistActive(); onBack() }) { Text("\u2190 Done") }
             Column(Modifier.weight(1f)) {
                 Text(state.doc.profileName, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, maxLines = 1)
                 Text(stringResource(R.string.workspace_page, page.name), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -1071,7 +1101,8 @@ internal fun DrawScope.drawElement(
     selectChildren:Boolean=true,
     strings:RenderStrings,
     inlineEditingId:String?=null,
-    widgetLookup:(Element)->WidgetProgram? = { null }
+    widgetLookup:(Element)->WidgetProgram? = { null },
+    imageLookup:(Element)->ImageBitmap? = { null }
 ){
     if(!e.rect.visible)return
     val r=childRect(parent,e.rect)
@@ -1079,7 +1110,7 @@ internal fun DrawScope.drawElement(
         ElementType.Block->{
             drawBackground(r,e.background)
             drawBorderSpec(r,e.border,e.borderThickness)
-            e.children.sortedBy{it.rect.zIndex}.forEach{drawElement(it,r,if(selectChildren)selectedId else "",selectChildren,strings,inlineEditingId,widgetLookup)}
+            e.children.sortedBy{it.rect.zIndex}.forEach{drawElement(it,r,if(selectChildren)selectedId else "",selectChildren,strings,inlineEditingId,widgetLookup,imageLookup)}
         }
         ElementType.Stamp->drawStamp(r,e)
         ElementType.Text-> if(e.id != inlineEditingId) drawTextWrapped(e.text,r,e)
@@ -1098,6 +1129,15 @@ internal fun DrawScope.drawElement(
             })
         }
         ElementType.Media->{
+            val bitmap = if(e.mediaKind==MediaKind.Image) imageLookup(e) else null
+            if(bitmap!=null){
+                drawImage(
+                    image=bitmap,
+                    dstOffset=IntOffset(r.left.toInt(),r.top.toInt()),
+                    dstSize=IntSize(r.width.toInt().coerceAtLeast(1),r.height.toInt().coerceAtLeast(1))
+                )
+                return
+            }
             drawRect(Color(0xFFE5E7EB),r.topLeft,r.size)
             drawRect(Color(0xFF6B7280),r.topLeft,r.size,style=Stroke(1f))
             drawTextWrapped("${strings.mediaKinds[e.mediaKind.ordinal]}\n${e.mediaTitle}\n${e.intrinsicWidth} × ${e.intrinsicHeight}\n${strings.mediaSuffix}",r,e.copy(fontSize=13f,textAlign=TextAlignMode.Center),0xFF374151.toInt(),Layout.Alignment.ALIGN_CENTER)

@@ -37,6 +37,8 @@ sealed interface Destination {
     /** Someone else's book. [mainDht] identifies the profile; the page index lives in viewer state. */
     data class Profile(val mainDht: String) : Destination
 
+    /** Simple stacked editor. [pageIndex] is the page of your own book being edited. */
+    data class QuickEdit(val pageIndex: Int) : Destination
     data object Editor : Destination
     data object Settings : Destination
 }
@@ -49,6 +51,7 @@ private fun Destination.encode(): String = when (this) {
     Destination.Editor -> "editor"
     Destination.Settings -> "settings"
     is Destination.Profile -> "profile\u0000$mainDht"
+    is Destination.QuickEdit -> "quickedit\u0000$pageIndex"
 }
 
 private fun decodeDestination(raw: String): Destination = when {
@@ -59,6 +62,7 @@ private fun decodeDestination(raw: String): Destination = when {
     raw == "editor" -> Destination.Editor
     raw == "settings" -> Destination.Settings
     raw.startsWith("profile\u0000") -> Destination.Profile(raw.substringAfter('\u0000'))
+    raw.startsWith("quickedit\u0000") -> Destination.QuickEdit(raw.substringAfter('\u0000').toIntOrNull() ?: 0)
     else -> Destination.Home
 }
 

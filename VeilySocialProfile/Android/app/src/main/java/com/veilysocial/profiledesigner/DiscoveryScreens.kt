@@ -210,14 +210,14 @@ fun SearchScreen(controller: SocialNetworkController, onOpen: (String) -> Unit) 
 @Composable
 fun ActivityScreen(store: CommentStore, ownMainDht: String) {
     var revision by remember { mutableIntStateOf(0) }
-    val held = remember(revision) { store.quarantined() }
+    val held = remember(revision, ownMainDht) { store.quarantined(ownMainDht) }
 
     Column(Modifier.fillMaxSize()) {
         Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 2.dp) {
             Column(Modifier.fillMaxWidth().padding(16.dp)) {
                 Text("Activity", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                 Text(
-                    "Held comments on your pages. Nothing here is private — approving one publishes it where the comment was left.",
+                    "Comments on your pages waiting on you. Nothing here is private — keeping one publishes it where the comment was left, and anything you ignore expires on its own.",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 4.dp)
@@ -233,7 +233,7 @@ fun ActivityScreen(store: CommentStore, ownMainDht: String) {
             ) {
                 Text("Nothing waiting.", style = MaterialTheme.typography.titleSmall)
                 Text(
-                    "Comments held by light moderation show up here for you to approve or drop.",
+                    "Comments waiting on a decision show up here. Keep one to make it part of your page, or drop it.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 6.dp)
@@ -257,9 +257,9 @@ fun ActivityScreen(store: CommentStore, ownMainDht: String) {
                         }
                         Text(comment.body, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 8.dp))
                         Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.End) {
-                            TextButton(onClick = { store.setState(comment.id, CommentState.Hidden); revision++ }) { Text("Drop") }
+                            TextButton(onClick = { store.setState(comment.id, CommentState.Dropped); revision++ }) { Text("Drop") }
                             Spacer(Modifier.width(8.dp))
-                            Button(onClick = { store.setState(comment.id, CommentState.Visible); revision++ }) { Text("Approve") }
+                            Button(onClick = { store.setState(comment.id, CommentState.Accepted); revision++ }) { Text("Keep") }
                         }
                     }
                     HorizontalDivider()

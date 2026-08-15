@@ -15,12 +15,20 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+
+/**
+ * How long an open-mode comment survives if the page owner never keeps it. Matches the
+ * default service-request TTL the daemon uses, so the app's idea of expiry does not outlive
+ * the request that carried the comment.
+ */
+const val OPEN_COMMENT_TTL_MS = 15L * 60L * 1000L
 
 /**
  * Fixed-width, vertically scrolling page render.
@@ -30,7 +38,12 @@ import kotlinx.coroutines.launch
  * they design, text stays legible on a phone, and long pages simply scroll.
  */
 @Composable
-fun PageCanvas(page: Page, modifier: Modifier = Modifier, widgetLookup: (Element) -> WidgetProgram? = { null }) {
+fun PageCanvas(
+    page: Page,
+    modifier: Modifier = Modifier,
+    widgetLookup: (Element) -> WidgetProgram? = { null },
+    imageLookup: (Element) -> ImageBitmap? = { null },
+) {
     val strings = RenderStrings(
         mediaKinds = listOf(
             stringResource(R.string.media_image),
@@ -51,7 +64,8 @@ fun PageCanvas(page: Page, modifier: Modifier = Modifier, widgetLookup: (Element
                 selectChildren = false,
                 strings = strings,
                 inlineEditingId = null,
-                widgetLookup = widgetLookup
+                widgetLookup = widgetLookup,
+                imageLookup = imageLookup
             )
         }
     }
@@ -66,7 +80,7 @@ fun ProfileViewerScreen(
     ownKey: String,
     ownName: String,
     commentStore: CommentStore,
-    knownAuthors: Set<String>,
+    openComments: Boolean,
     isFollowing: Boolean,
     onToggleFollow: () -> Unit,
     onPrevProfile: (() -> Unit)?,
@@ -118,10 +132,11 @@ fun ProfileViewerScreen(
                 )
                 CommentsSection(
                     pageKey = pageKeyOf(profile.mainDht, page.id),
+                    pageOwnerKey = profile.mainDht,
                     store = commentStore,
                     ownKey = ownKey,
                     ownName = ownName,
-                    knownAuthors = knownAuthors,
+                    openMode = openComments,
                     onPosted = { scope.launch { scroll.animateScrollTo(scroll.maxValue) } },
                 )
                 Spacer(Modifier.height(24.dp))
@@ -210,15 +225,21 @@ fun PageRail(
 @Composable
 fun CommentsSection(
     pageKey: String,
+    pageOwnerKey: String,
     store: CommentStore,
     ownKey: String,
     ownName: String,
-    knownAuthors: Set<String>,
+    openMode: Boolean,
     onPosted: () -> Unit,
 ) {
     var revision by remember(pageKey) { mutableIntStateOf(0) }
     var draft by remember(pageKey) { mutableStateOf("") }
     val comments = remember(pageKey, revision) { store.forPage(pageKey) }
+    // Your own comments that this page's owner hasn't released yet. Shown to you only so
+    // the post button doesn't look broken — the decision is not yours to make.
+    val myPending = remember(pageKey, revision) {
+        store.awaitingApproval(ownKey).filter { it.pageKey == pageKey }
+    }
 
     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
         HorizontalDivider(Modifier.padding(vertical = 12.dp))
@@ -228,7 +249,8 @@ fun CommentsSection(
             fontWeight = FontWeight.Bold
         )
         Text(
-            "Comments are public and attach to this page.",
+            if (openMode) "Comments are public, attach to this page, and stay until the owner keeps them."
+            else "Comments are public and attach to this page.",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(top = 2.dp, bottom = 10.dp)
@@ -244,12 +266,40 @@ fun CommentsSection(
         }
 
         comments.forEach { comment ->
+            var expanded by remember(comment.id) { mutableStateOf(false) }
             Row(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
                 Identicon(comment.authorKey.ifBlank { comment.authorName }, size = 28.dp)
                 Spacer(Modifier.width(10.dp))
                 Column(Modifier.weight(1f)) {
-                    Text(comment.authorName, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
-                    SelectionContainer { Text(comment.body, style = MaterialTheme.typography.bodyMedium) }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(comment.authorName, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                        if (comment.state == CommentState.Provisional) {
+                            Spacer(Modifier.width(8.dp))
+                            Surface(
+                                color = MaterialTheme.colorScheme.surfaceVariant,
+                                shape = RoundedCornerShape(999.dp)
+                            ) {
+                                Text(
+                                    "Not kept yet",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 1.dp)
+                                )
+                            }
+                        }
+                    }
+                    SelectionContainer {
+                        Text(displayBody(comment, expanded), style = MaterialTheme.typography.bodyMedium)
+                    }
+                    if (comment.body.length > COMMENT_TRUNCATE_CHARS) {
+                        TextButton(
+                            onClick = { expanded = !expanded },
+                            contentPadding = PaddingValues(0.dp),
+                            modifier = Modifier.height(28.dp)
+                        ) {
+                            Text(if (expanded) "Show less" else "Show more", style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
                 }
                 TextButton(onClick = { store.hideForMe(comment.id); revision++ }, contentPadding = PaddingValues(horizontal = 6.dp)) {
                     Text("Hide", style = MaterialTheme.typography.labelSmall)
@@ -257,9 +307,27 @@ fun CommentsSection(
             }
         }
 
+        myPending.forEach { pending ->
+            Surface(
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)
+            ) {
+                Column(Modifier.padding(12.dp)) {
+                    Text(
+                        if (pending.state == CommentState.Provisional) "Visible to everyone, but the owner hasn't kept it yet"
+                        else "Waiting for this page's owner to release it",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(pending.body, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 4.dp))
+                }
+            }
+        }
+
         OutlinedTextField(
             value = draft,
-            onValueChange = { draft = it.take(4000) },
+            onValueChange = { draft = it.take(MAX_COMMENT_CHARS) },
             modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
             label = { Text("Leave a comment") },
             minLines = 2,
@@ -267,8 +335,15 @@ fun CommentsSection(
         Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.End) {
             Button(
                 onClick = {
-                    val state = triageComment(draft, ownKey, store.forPage(pageKey), knownAuthors)
-                    store.add(pageKey, ownKey, ownName, draft, state)
+                    val state = triageComment(draft, ownKey, pageOwnerKey, store.forPage(pageKey), openMode)
+                    val expiresAt =
+                        if (openMode && state == CommentState.Provisional) System.currentTimeMillis() + OPEN_COMMENT_TTL_MS
+                        else 0L
+                    store.add(
+                        pageKey, ownKey, ownName, draft, state,
+                        if (openMode) CommentOrigin.Open else CommentOrigin.Direct,
+                        expiresAt,
+                    )
                     draft = ""
                     revision++
                     onPosted()
