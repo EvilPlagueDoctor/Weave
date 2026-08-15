@@ -41,6 +41,8 @@ data class SocialUiState(
     val gossipReceived: Long = 0,
     val clusterText: String = "",
     val debugLog: String = "",
+    /** True while a publish is in flight, so the UI can disable the control. */
+    val publishing: Boolean = false,
 )
 
 class SocialNetworkController(context: Context) {
@@ -71,7 +73,11 @@ class SocialNetworkController(context: Context) {
     private var gossipReceived = 0L
 
     fun start() {
-        if (networkJob != null) return
+        // Checking isActive rather than nullness is what makes retry work: when the worker
+        // throws, the job completes but the reference stays non-null, so the old guard made
+        // every subsequent start() a silent no-op.
+        if (networkJob?.isActive == true) return
+        runCatching { daemon?.close() }
         daemon = DaemonClient(appContext)
         networkJob = scope.launch {
             try {
@@ -107,6 +113,18 @@ class SocialNetworkController(context: Context) {
         }
     }
 
+    /** Tears the connection down and dials again. Used by the retry control on the gate. */
+    fun restart() {
+        messageSubscription?.let { runCatching { daemon?.unsubscribe(it) } }
+        messageSubscription = null
+        networkJob?.cancel()
+        networkJob = null
+        runCatching { daemon?.close() }
+        daemon = null
+        _ui.value = _ui.value.copy(status = "Reconnecting to VeilKnit daemon…")
+        start()
+    }
+
     fun stop() {
         messageSubscription?.let { daemon?.unsubscribe(it) }
         messageSubscription = null
@@ -114,7 +132,9 @@ class SocialNetworkController(context: Context) {
         networkJob = null
         daemon?.close()
         daemon = null
-        scope.cancel()
+        // Cancel the work, not the scope: cancelling the scope itself would make this
+        // controller permanently unusable and break any later restart().
+        scope.coroutineContext.cancelChildren()
     }
 
     fun setDiscoveryName(value: String) { _ui.value = _ui.value.copy(discoveryName = value.take(80)) }
@@ -132,6 +152,7 @@ class SocialNetworkController(context: Context) {
     fun setNovelty(value: Float) { _ui.value = _ui.value.copy(novelty = value) }
 
     fun publishProfile(profileText: String, fallbackName: String) = scope.launch {
+        _ui.value = _ui.value.copy(publishing = true)
         try {
             require(profileText.encodeToByteArray().size <= PROFILE_MAX_BYTES) { "Profile page exceeds ${PROFILE_MAX_BYTES / 1024 / 1024} MiB prototype limit" }
             val decoded = ProfileCodec.decodeText(profileText)
@@ -185,6 +206,8 @@ class SocialNetworkController(context: Context) {
         } catch (t: Throwable) {
             log("publish failed: ${t.message}")
             updateStatus("Publish failed: ${t.message}")
+        } finally {
+            _ui.value = _ui.value.copy(publishing = false)
         }
     }
 
@@ -217,6 +240,72 @@ class SocialNetworkController(context: Context) {
     fun clearExamples() { setPositive(""); setNegative("") }
 
     fun profileText(mainDht: String): String? = profileDocuments[mainDht]
+
+    // ---------------------------------------------------------------------
+    // Media blobs
+    //
+    // Images live in their own blobs rather than inside the profile payload, so a page with
+    // five pictures is five independent fetches that can be skipped, deferred or abandoned
+    // instead of one payload that must arrive whole.
+    // ---------------------------------------------------------------------
+
+    /** Uploads image bytes and returns the blob object, or null when the daemon is not ready. */
+    suspend fun uploadMedia(contentType: String, bytes: ByteArray): JSONObject? =
+        withContext(Dispatchers.IO) {
+            val d = daemon ?: return@withContext null
+            runCatching { d.uploadBlob(contentType, bytes) }
+                .onFailure { log("media upload failed: ${it.message}") }
+                .getOrNull()
+        }
+
+    /**
+     * Fetches a media blob, verifying it before it is handed back.
+     *
+     * Reads the header first so an oversized blob costs one small round trip instead of a
+     * download, then pulls in chunks. Chunking matters twice over: it keeps each binder
+     * response well inside the transaction buffer, and it gives [keepGoing] somewhere to say
+     * no — the daemon has no cancel for reads, so between chunks is the only place a fetch
+     * can be abandoned.
+     *
+     * The SHA-256 check is the security property: blobs are content addressed, so a host that
+     * serves different bytes than the profile claims is detected rather than rendered.
+     */
+    suspend fun downloadMedia(
+        rootRecordKey: String,
+        expectedSha256Hex: String,
+        maxBytes: Int,
+        chunkBytes: Int = 128 * 1024,
+        keepGoing: () -> Boolean = { true },
+    ): ByteArray? = withContext(Dispatchers.IO) {
+        val d = daemon ?: return@withContext null
+        runCatching {
+            val header = d.readBlobRange(rootRecordKey, 0, 0, true).getJSONObject("blob")
+            val total = header.getLong("total_bytes")
+            if (total <= 0L || total > maxBytes.toLong()) {
+                log("media rejected: ${short(rootRecordKey)} is $total bytes")
+                return@runCatching null
+            }
+            val out = java.io.ByteArrayOutputStream(total.toInt())
+            var offset = 0L
+            while (offset < total) {
+                if (!keepGoing()) {
+                    log("media fetch abandoned at $offset/$total bytes")
+                    return@runCatching null
+                }
+                val length = minOf(chunkBytes.toLong(), total - offset)
+                val chunk = d.readBlobRange(rootRecordKey, offset, length, false)
+                out.write(android.util.Base64.decode(chunk.getString("data_base64"), android.util.Base64.DEFAULT))
+                offset += length
+            }
+            val bytes = out.toByteArray()
+            val actual = sha256Hex(bytes)
+            if (!actual.equals(expectedSha256Hex, ignoreCase = true)) {
+                log("media hash mismatch for ${short(rootRecordKey)}; discarded")
+                return@runCatching null
+            }
+            bytes
+        }.onFailure { log("media fetch failed: ${it.message}") }.getOrNull()
+    }
 
     fun ensureProfileAvailable(mainDht: String) = scope.launch {
         val hint = cache.get(mainDht)?.hint ?: return@launch

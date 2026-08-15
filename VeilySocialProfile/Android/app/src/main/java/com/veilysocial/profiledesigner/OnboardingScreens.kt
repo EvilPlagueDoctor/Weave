@@ -16,6 +16,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.launch
 
 /** Remembers whether setup has been completed, so first run happens exactly once. */
 class OnboardingState(context: Context) {
@@ -247,17 +248,33 @@ fun MeScreen(
     controller: SocialNetworkController,
     commentStore: CommentStore,
     media: LocalMediaStore,
+    loader: MediaLoader,
     ownKey: String,
     onQuickEdit: (Int) -> Unit,
     onAdvancedEdit: () -> Unit,
     onSettings: () -> Unit,
 ) {
     val ui by controller.ui.collectAsState()
-    val mediaLookup = remember(media) { { e: Element -> media.bitmapFor(e.mediaContentHash) } }
+    val scope = rememberCoroutineScope()
     var publishError by remember { mutableStateOf<String?>(null) }
+    var showingLive by remember { mutableStateOf(false) }
+    var uploadProgress by remember { mutableStateOf<Pair<Int, Int>?>(null) }
     var pageIndex by remember { mutableIntStateOf(0) }
-    val page = state.doc.pages.getOrNull(pageIndex) ?: state.doc.pages.first()
     val scroll = rememberScrollState()
+
+    // What everyone else currently sees, decoded from the last published payload.
+    val livePublished = remember(ui.profileRoot, ui.mainDht, showingLive) {
+        if (!showingLive) null
+        else controller.profileText(ui.mainDht)?.let { text ->
+            runCatching { ProfileCodec.decodeText(text) }.getOrNull()
+        }
+    }
+    val shownDoc = livePublished ?: state.doc
+    val shownPage = shownDoc.pages.getOrNull(pageIndex.coerceAtMost(shownDoc.pages.lastIndex))
+        ?: shownDoc.pages.first()
+    val mediaLookup = remember(loader) { { e: Element -> loader.lookup(e) } }
+
+    LaunchedEffect(shownDoc, shownPage.id) { loader.setWanted(shownDoc.imageHashes()) }
 
     Column(Modifier.fillMaxSize()) {
         Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 2.dp) {
@@ -277,28 +294,72 @@ fun MeScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                TextButton(onClick = onAdvancedEdit) { Text("Advanced") }
-                TextButton(onClick = { onQuickEdit(pageIndex) }) { Text("Edit") }
+                TextButton(onClick = onAdvancedEdit, enabled = !showingLive) { Text("Advanced") }
+                TextButton(onClick = { onQuickEdit(pageIndex) }, enabled = !showingLive) { Text("Edit") }
                 Button(
+                    enabled = !ui.publishing && uploadProgress == null,
                     onClick = {
-                        // encodeText throws on an invalid document. This runs on the main
-                        // thread from a click handler, so an uncaught throw is a crash —
-                        // check first and report rather than letting it escape.
-                        val encoded = runCatching { state.ownProfileTextForPublish() }
-                        val failure = encoded.exceptionOrNull()
-                        if (failure != null) {
-                            publishError = failure.message ?: "This profile can't be published yet."
-                        } else if (!state.persistActive()) {
-                            publishError = state.persistError ?: "Couldn't save this profile."
-                        } else {
-                            publishError = null
-                            controller.publishProfile(encoded.getOrThrow(), state.ownProfileNameForPublish())
+                        // Discovery shows the profile name, so keep the two from drifting:
+                        // renaming a profile should rename it in search too.
+                        controller.setDiscoveryName(state.doc.profileName)
+                        publishError = null
+                        scope.launch {
+                            // Images first: the payload records their record keys, so
+                            // publishing the page before its pictures exist would announce a
+                            // document full of holes.
+                            val uploaded = publishPendingMedia(state.doc, media, controller) { done, total ->
+                                uploadProgress = done to total
+                            }
+                            uploadProgress = null
+                            val uploadFailure = uploaded.exceptionOrNull()
+                            if (uploadFailure != null) {
+                                publishError = uploadFailure.message ?: "Couldn't upload the images."
+                                return@launch
+                            }
+                            // encodeText throws on an invalid document, and this would
+                            // otherwise escape as a crash rather than an error.
+                            val encoded = runCatching { state.ownProfileTextForPublish() }
+                            val failure = encoded.exceptionOrNull()
+                            when {
+                                failure != null ->
+                                    publishError = failure.message ?: "This profile can't be published yet."
+                                !state.persistActive() ->
+                                    publishError = state.persistError ?: "Couldn't save this profile."
+                                else ->
+                                    controller.publishProfile(encoded.getOrThrow(), state.ownProfileNameForPublish())
+                            }
                         }
                     },
                     contentPadding = PaddingValues(horizontal = 14.dp)
-                ) { Text("Publish") }
+                ) {
+                    val progress = uploadProgress
+                    if (progress != null) {
+                        CircularProgressIndicator(
+                            Modifier.size(15.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onPrimary,
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text("Images ${progress.first}/${progress.second}")
+                    } else if (ui.publishing) {
+                        CircularProgressIndicator(
+                            Modifier.size(15.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onPrimary,
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text("Publishing")
+                    } else {
+                        Text("Publish")
+                    }
+                }
             }
         }
+        DraftLiveSwitch(
+            showingLive = showingLive,
+            published = ui.profileRoot.isNotBlank(),
+            onSelect = { showingLive = it },
+        )
         publishError?.let { message ->
             Surface(color = MaterialTheme.colorScheme.errorContainer, modifier = Modifier.fillMaxWidth()) {
                 Row(Modifier.padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -312,20 +373,20 @@ fun MeScreen(
         }
         BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
             val canvasWidth = maxWidth
-            val canvasHeight = canvasWidth / page.aspectRatio.coerceIn(MIN_PAGE_ASPECT, MAX_PAGE_ASPECT)
+            val canvasHeight = canvasWidth / shownPage.aspectRatio.coerceIn(MIN_PAGE_ASPECT, MAX_PAGE_ASPECT)
             Column(Modifier.fillMaxSize().verticalScroll(scroll)) {
                 Surface(color = Color.White) {
-                    PageCanvas(page, Modifier.fillMaxWidth().height(canvasHeight), widgetLookup = state::widgetProgramFor, imageLookup = mediaLookup)
+                    PageCanvas(shownPage, Modifier.fillMaxWidth().height(canvasHeight), widgetLookup = state::widgetProgramFor, imageLookup = mediaLookup)
                 }
                 PageRail(
-                    pageNames = state.doc.pages.map { it.name },
-                    index = pageIndex,
+                    pageNames = shownDoc.pages.map { it.name },
+                    index = pageIndex.coerceAtMost(shownDoc.pages.lastIndex),
                     onSelect = { pageIndex = it },
                     onPrev = { if (pageIndex > 0) pageIndex-- },
-                    onNext = { if (pageIndex < state.doc.pages.lastIndex) pageIndex++ },
+                    onNext = { if (pageIndex < shownDoc.pages.lastIndex) pageIndex++ },
                 )
                 CommentsSection(
-                    pageKey = pageKeyOf(ownKey, page.id),
+                    pageKey = pageKeyOf(ownKey, shownPage.id),
                     pageOwnerKey = ownKey,
                     store = commentStore,
                     ownKey = ownKey,
@@ -335,6 +396,50 @@ fun MeScreen(
                 )
                 Spacer(Modifier.height(24.dp))
             }
+        }
+    }
+}
+
+/**
+ * Draft is the document being edited; Live is the payload other people are currently
+ * fetching. They diverge the moment an edit is made and only reconverge on publish, so the
+ * comparison needs to be one tap rather than a second device.
+ */
+@Composable
+private fun DraftLiveSwitch(showingLive: Boolean, published: Boolean, onSelect: (Boolean) -> Unit) {
+    Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 1.dp) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            listOf(false to "Draft", true to "Live").forEach { (live, label) ->
+                val selected = live == showingLive
+                val enabled = !live || published
+                Surface(
+                    color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                    shape = RoundedCornerShape(999.dp),
+                    modifier = Modifier.padding(end = 8.dp)
+                ) {
+                    Text(
+                        label,
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                        color = if (enabled) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .5f),
+                        modifier = Modifier
+                            .clickable(enabled = enabled) { onSelect(live) }
+                            .padding(horizontal = 16.dp, vertical = 6.dp)
+                    )
+                }
+            }
+            Text(
+                when {
+                    !published -> "Nothing published yet"
+                    showingLive -> "What everyone else sees"
+                    else -> "Your unpublished changes"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }
@@ -390,6 +495,22 @@ fun SettingsScreen(
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 12.dp)
+            )
+
+            HorizontalDivider(Modifier.padding(vertical = 16.dp))
+            Text("How you appear in search", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+            Text(
+                "This is the blurb other people see beside your name before they open your profile. It is published, and changes take effect the next time you publish.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp)
+            )
+            OutlinedTextField(
+                value = ui.discoveryDescription,
+                onValueChange = controller::setDiscoveryDescription,
+                modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+                label = { Text("Search blurb") },
+                minLines = 3,
             )
 
             HorizontalDivider(Modifier.padding(vertical = 16.dp))

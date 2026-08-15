@@ -30,6 +30,17 @@ import kotlinx.coroutines.launch
  */
 const val OPEN_COMMENT_TTL_MS = 15L * 60L * 1000L
 
+/** Image hashes referenced by a single page. */
+fun Page.imageHashesOnPage(): Set<String> = buildSet {
+    fun walk(e: Element) {
+        if (e.type == ElementType.Media && e.mediaKind == MediaKind.Image && e.mediaContentHash.isNotBlank()) {
+            add(e.mediaContentHash)
+        }
+        e.children.forEach(::walk)
+    }
+    walk(root)
+}
+
 /**
  * Fixed-width, vertically scrolling page render.
  *
@@ -79,6 +90,7 @@ fun ProfileViewerScreen(
     profile: RemoteProfile,
     ownKey: String,
     ownName: String,
+    loader: MediaLoader,
     commentStore: CommentStore,
     openComments: Boolean,
     isFollowing: Boolean,
@@ -93,6 +105,12 @@ fun ProfileViewerScreen(
     val scope = rememberCoroutineScope()
 
     LaunchedEffect(profile.mainDht, pageIndex) { scroll.scrollTo(0) }
+
+    // Narrow the fetch set to the page on screen. Anything queued for a page the person has
+    // already swiped past is dropped before it reaches the daemon.
+    LaunchedEffect(profile.mainDht, pageIndex) {
+        loader.setWanted(page.imageHashesOnPage())
+    }
 
     Column(Modifier.fillMaxSize()) {
         ViewerHeader(profile, isFollowing, onToggleFollow, onBack)
@@ -121,7 +139,11 @@ fun ProfileViewerScreen(
             val canvasHeight = pageHeightFor(page, canvasWidth)
             Column(Modifier.fillMaxSize().verticalScroll(scroll)) {
                 Surface(color = Color.White, tonalElevation = 0.dp) {
-                    PageCanvas(page, Modifier.fillMaxWidth().height(canvasHeight))
+                    PageCanvas(
+                        page,
+                        Modifier.fillMaxWidth().height(canvasHeight),
+                        imageLookup = loader::lookup,
+                    )
                 }
                 PageRail(
                     pageNames = profile.document.pages.map { it.name },

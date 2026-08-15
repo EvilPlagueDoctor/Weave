@@ -29,6 +29,8 @@ fun VeilyApp() {
     val followStore = remember { FollowStore(context) }
     val remoteCache = remember { RemoteProfileCache() }
     val media = remember { LocalMediaStore(context) }
+    val appScope = rememberCoroutineScope()
+    val mediaLoader = remember(media, controller) { MediaLoader(appScope, media, controller) }
 
     var setupDone by remember { mutableStateOf(onboarding.completed) }
     var widgetsEnabled by remember { mutableStateOf(true) }
@@ -47,7 +49,7 @@ fun VeilyApp() {
                 !connected -> ConnectionGate(
                     status = ui.status,
                     error = failure,
-                    onRetry = { controller.start() }
+                    onRetry = { controller.restart() }
                 )
 
                 !setupDone -> FirstRunScreen(ownKey = ui.mainDht, error = setupError) { name, argb, blurb ->
@@ -73,6 +75,7 @@ fun VeilyApp() {
                     followStore = followStore,
                     remoteCache = remoteCache,
                     media = media,
+                    mediaLoader = mediaLoader,
                     widgetsEnabled = widgetsEnabled,
                     onWidgetsEnabledChange = { widgetsEnabled = it },
                 )
@@ -89,6 +92,7 @@ private fun VeilyShell(
     followStore: FollowStore,
     remoteCache: RemoteProfileCache,
     media: LocalMediaStore,
+    mediaLoader: MediaLoader,
     widgetsEnabled: Boolean,
     onWidgetsEnabledChange: (Boolean) -> Unit,
 ) {
@@ -133,6 +137,7 @@ private fun VeilyShell(
                     controller = controller,
                     commentStore = commentStore,
                     media = media,
+                    loader = mediaLoader,
                     ownKey = ui.mainDht,
                     onQuickEdit = { page -> nav.push(Destination.QuickEdit(page)) },
                     onAdvancedEdit = { nav.push(Destination.Editor) },
@@ -155,6 +160,7 @@ private fun VeilyShell(
                     commentStore = commentStore,
                     followStore = followStore,
                     remoteCache = remoteCache,
+                    mediaLoader = mediaLoader,
                     ownKey = ui.mainDht,
                     ownName = state.doc.profileName,
                     onNavigate = { nav.replaceTop(Destination.Profile(it)) },
@@ -175,6 +181,7 @@ private fun ProfileDestination(
     commentStore: CommentStore,
     followStore: FollowStore,
     remoteCache: RemoteProfileCache,
+    mediaLoader: MediaLoader,
     ownKey: String,
     ownName: String,
     onNavigate: (String) -> Unit,
@@ -213,6 +220,7 @@ private fun ProfileDestination(
             profile = profile,
             ownKey = ownKey,
             ownName = ownName,
+            loader = mediaLoader,
             commentStore = commentStore,
             openComments = true,
             isFollowing = following,

@@ -45,6 +45,16 @@ import kotlin.math.roundToInt
  * NOTE: the bytes are local only. Publishing them still needs a daemon blob upload, and the
  * element's mediaRecordKey stays blank until that exists.
  */
+/**
+ * Longest edge of a stored image, in pixels. Sized for a phone viewport with room for a
+ * pinch-zoom, not for archival quality — these bytes get published, and every extra pixel is
+ * bandwidth for everyone who loads the page.
+ */
+const val MAX_IMAGE_EDGE_PX = 1080
+
+/** WebP lossy quality. Above roughly 80 the file grows faster than the picture improves. */
+const val IMAGE_QUALITY = 80
+
 class LocalMediaStore(context: Context) {
     private val dir = File(context.filesDir, "media").apply { mkdirs() }
     private val appContext = context.applicationContext
@@ -58,6 +68,7 @@ class LocalMediaStore(context: Context) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ImageBitmap>?) = size > 6
     }
     private val missing = mutableSetOf<String>()
+    private val blobIndexFile = File(dir, "blob-index.json")
 
     data class Stored(val contentHash: String, val width: Int, val height: Int)
 
@@ -71,10 +82,14 @@ class LocalMediaStore(context: Context) {
      * The decode-then-re-encode round trip is the sanitising step: EXIF, GPS tags, appended
      * payloads and polyglot-file tricks do not survive being rebuilt from a decoded bitmap.
      */
-    suspend fun importImage(uri: Uri, maxEdge: Int = 1600, quality: Int = 82): Stored? =
+    suspend fun importImage(uri: Uri, maxEdge: Int = MAX_IMAGE_EDGE_PX, quality: Int = IMAGE_QUALITY): Stored? =
         withContext(Dispatchers.IO) {
             runCatching {
                 val source = ImageDecoder.createSource(appContext.contentResolver, uri)
+                // setTargetSize resizes during decode, so the scaling happens BEFORE any
+                // compression and the full-resolution bitmap is never materialised. Encoding
+                // first and shrinking afterwards would both waste memory and compress detail
+                // that is about to be thrown away.
                 // Software allocation is required: hardware bitmaps cannot be compressed.
                 val decoded = ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
                     decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
@@ -87,6 +102,8 @@ class LocalMediaStore(context: Context) {
                         )
                     }
                 }
+                // WebP lossy for everything. It keeps an alpha channel, so transparency does
+                // not force a PNG, and it beats JPEG at the same perceived quality.
                 val format = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     Bitmap.CompressFormat.WEBP_LOSSY
                 } else {
@@ -128,6 +145,35 @@ class LocalMediaStore(context: Context) {
     }
 
     /**
+     * Stores bytes whose hash has already been checked against what the profile claimed.
+     * Named to make the precondition hard to ignore: writing unverified bytes here would let
+     * a host swap one person's picture for another's.
+     */
+    fun storeVerifiedBytes(contentHash: String, bytes: ByteArray) {
+        runCatching {
+            fileFor(contentHash).writeBytes(bytes)
+            synchronized(cache) { cache.remove(contentHash); missing.remove(contentHash) }
+        }
+    }
+
+    /** Remembers which blob a stored image became, so it can be released on the network later. */
+    fun recordBlob(contentHash: String, blobId: String, recordKey: String) {
+        if (contentHash.isBlank() || blobId.isBlank()) return
+        runCatching {
+            val index = org.json.JSONObject(
+                blobIndexFile.takeIf { it.exists() }?.readText() ?: "{}"
+            )
+            index.put(contentHash, org.json.JSONObject().put("blob_id", blobId).put("record_key", recordKey))
+            blobIndexFile.writeText(index.toString())
+        }
+    }
+
+    fun blobIdFor(contentHash: String): String? = runCatching {
+        if (!blobIndexFile.exists()) null
+        else org.json.JSONObject(blobIndexFile.readText()).optJSONObject(contentHash)?.optString("blob_id")
+    }.getOrNull()?.takeIf { it.isNotBlank() }
+
+    /**
      * Deletes stored images no page references any more. Without this the media directory
      * only ever grows, because deleting a block from a page never touched the file.
      */
@@ -143,6 +189,7 @@ class LocalMediaStore(context: Context) {
         }
         var removed = 0
         dir.listFiles()?.forEach { file ->
+            if (file.name == blobIndexFile.name) return@forEach
             val hash = file.nameWithoutExtension
             if (hash !in referenced && file.delete()) {
                 removed++
@@ -363,7 +410,12 @@ fun QuickEditScreen(
     var profileName by remember { mutableStateOf(state.doc.profileName) }
     var showAdvancedWarning by remember(page.id) { mutableStateOf(pageHasAdvancedContent(page)) }
     var importing by remember { mutableStateOf(false) }
+    var confirmDiscard by remember { mutableStateOf(false) }
     val scroll = rememberScrollState()
+
+    // Snapshot on entry so leaving without saving really can put everything back, including
+    // pages added or renamed during the session.
+    val entrySnapshot = remember { state.doc.deepCopy() }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
@@ -388,6 +440,11 @@ fun QuickEditScreen(
             media.pruneUnreferenced(state.doc)
         }
 
+        fun discardAll() {
+            state.replaceDocument(entrySnapshot)
+            media.pruneUnreferenced(entrySnapshot)
+        }
+
         fun switchPage(target: Int) {
             if (target == currentPage) return
             commit()
@@ -400,9 +457,11 @@ fun QuickEditScreen(
                     Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    TextButton(onClick = { commit(); onBack() }) { Text("\u2190 Done") }
+                    TextButton(onClick = { confirmDiscard = true }) { Text("Discard") }
                     Spacer(Modifier.weight(1f))
                     TextButton(onClick = { commit(); onOpenAdvanced() }) { Text("Advanced") }
+                    Spacer(Modifier.width(4.dp))
+                    Button(onClick = { commit(); onBack() }, contentPadding = PaddingValues(horizontal = 16.dp)) { Text("Done") }
                 }
             }
 
@@ -530,6 +589,18 @@ fun QuickEditScreen(
                 )
                 Spacer(Modifier.height(40.dp))
             }
+        }
+
+        if (confirmDiscard) {
+            AlertDialog(
+                onDismissRequest = { confirmDiscard = false },
+                title = { Text("Discard changes?") },
+                text = { Text("Everything you changed since opening the editor goes back to how it was. Anything already published stays published.") },
+                confirmButton = {
+                    TextButton(onClick = { confirmDiscard = false; discardAll(); onBack() }) { Text("Discard") }
+                },
+                dismissButton = { TextButton(onClick = { confirmDiscard = false }) { Text("Keep editing") } }
+            )
         }
     }
 }

@@ -788,6 +788,9 @@ internal val DesignerColorScheme = lightColorScheme(
 
 @Composable
 fun EditorScreen(state: EditorState, onBack: () -> Unit) {
+    var confirmDiscard by remember { mutableStateOf(false) }
+    val entrySnapshot = remember { state.doc.deepCopy() }
+
     BackHandler(enabled = true) {
         when {
             state.showWidgetStudio -> state.showWidgetStudio = false
@@ -807,7 +810,7 @@ fun EditorScreen(state: EditorState, onBack: () -> Unit) {
             val wide = availableWidth >= 720.dp
             val panelWidth: Dp = minOf(370.dp, availableWidth * .42f)
             Column(Modifier.fillMaxSize()) {
-                EditorHeader(state, onBack)
+                EditorHeader(state, onDiscard = { confirmDiscard = true }, onDone = { state.persistActive(); onBack() })
                 Box(Modifier.weight(1f).fillMaxWidth().clipToBounds()) {
                     PageWorkspace(state, Modifier.fillMaxSize())
                     if (!state.panelCollapsed) {
@@ -835,6 +838,21 @@ fun EditorScreen(state: EditorState, onBack: () -> Unit) {
             }
         }
     }
+    if (confirmDiscard) {
+        AlertDialog(
+            onDismissRequest = { confirmDiscard = false },
+            title = { Text("Discard changes?") },
+            text = { Text("Everything you changed since opening the editor goes back to how it was. Anything already published stays published.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmDiscard = false
+                    state.replaceDocument(entrySnapshot)
+                    onBack()
+                }) { Text("Discard") }
+            },
+            dismissButton = { TextButton(onClick = { confirmDiscard = false }) { Text("Keep editing") } }
+        )
+    }
     if (state.showSaveAs) SaveAsDialog(state)
     if (state.showOpen) OpenDialog(state)
     if (state.showWidgetPicker) WidgetPickerDialog(state)
@@ -842,16 +860,18 @@ fun EditorScreen(state: EditorState, onBack: () -> Unit) {
 }
 
 @Composable
-private fun EditorHeader(state: EditorState, onBack: () -> Unit) {
+private fun EditorHeader(state: EditorState, onDiscard: () -> Unit, onDone: () -> Unit) {
     val page = state.doc.pages[state.pageIndex]
     Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 1.dp) {
         Row(Modifier.fillMaxWidth().height(54.dp).padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = { state.persistActive(); onBack() }) { Text("\u2190 Done") }
+            TextButton(onClick = onDiscard, contentPadding = PaddingValues(horizontal = 8.dp)) { Text("Discard") }
             Column(Modifier.weight(1f)) {
                 Text(state.doc.profileName, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, maxLines = 1)
                 Text(stringResource(R.string.workspace_page, page.name), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             TextButton(onClick = { state.showWidgetStudio = true }) { Text("\u2318", style = MaterialTheme.typography.titleMedium) }
+            Button(onClick = onDone, contentPadding = PaddingValues(horizontal = 14.dp)) { Text("Done") }
+            Spacer(Modifier.width(8.dp))
             Surface(color = MaterialTheme.colorScheme.primaryContainer, shape = RoundedCornerShape(999.dp)) {
                 Text(
                     stringResource(state.mode.shortRes), modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
