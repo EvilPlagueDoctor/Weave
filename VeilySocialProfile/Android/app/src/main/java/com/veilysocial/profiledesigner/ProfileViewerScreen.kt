@@ -72,7 +72,7 @@ fun PageCanvas(
 }
 
 /** Height a page occupies at a given viewport width. aspectRatio is width/height. */
-private fun pageHeightFor(page: Page, width: Dp): Dp = width / page.aspectRatio.coerceIn(.15f, 6f)
+private fun pageHeightFor(page: Page, width: Dp): Dp = width / page.aspectRatio.coerceIn(MIN_PAGE_ASPECT, MAX_PAGE_ASPECT)
 
 @Composable
 fun ProfileViewerScreen(

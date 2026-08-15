@@ -172,6 +172,14 @@ sealed interface QuickBlock {
     ) : QuickBlock
 }
 
+/**
+ * The aspect ratio window VSPF enforces. ProfileCodec.validate rejects anything outside it,
+ * and an invalid document cannot be encoded — which means it can neither be saved nor
+ * published. Keep these in sync with VspfLimits.
+ */
+const val MIN_PAGE_ASPECT = .20f
+const val MAX_PAGE_ASPECT = 1.20f
+
 private const val MARGIN_FRAC = .07f
 private const val GAP_DP = 14f
 private const val HEADING_SP = 28f
@@ -201,6 +209,27 @@ fun blocksFromPage(page: Page): List<QuickBlock> = page.root.children
             else -> null
         }
     }
+
+/**
+ * True when the laid-out content is taller than a single page may be. The caller should tell
+ * the person to split the page rather than silently clipping the overflow.
+ */
+fun blocksOverflowPage(blocks: List<QuickBlock>, referenceWidthDp: Float, densityScale: Float): Boolean {
+    val contentWidthDp = referenceWidthDp * (1f - 2 * MARGIN_FRAC)
+    val total = referenceWidthDp * MARGIN_FRAC * 2 +
+        GAP_DP * (blocks.size - 1).coerceAtLeast(0) +
+        blocks.sumOf { block ->
+            when (block) {
+                is QuickBlock.Heading -> measureTextHeightDp(block.text, HEADING_SP, contentWidthDp, true, densityScale)
+                is QuickBlock.Body -> measureTextHeightDp(block.text, BODY_SP, contentWidthDp, false, densityScale)
+                is QuickBlock.Picture -> {
+                    val ratio = block.height.toFloat() / block.width.toFloat().coerceAtLeast(1f)
+                    contentWidthDp * ratio.coerceIn(.2f, 2.5f)
+                }
+            }.toDouble()
+        }.toFloat()
+    return total > referenceWidthDp / MIN_PAGE_ASPECT
+}
 
 /** True when the page contains things the simple editor would silently drop. */
 fun pageHasAdvancedContent(page: Page): Boolean = page.root.children.any { e ->
@@ -250,8 +279,18 @@ fun applyBlocksToPage(page: Page, blocks: List<QuickBlock>, referenceWidthDp: Fl
     }
 
     val topPadDp = referenceWidthDp * MARGIN_FRAC
-    val totalDp = topPadDp * 2 + heights.sum() + GAP_DP * (blocks.size - 1).coerceAtLeast(0)
-    page.aspectRatio = (referenceWidthDp / totalDp).coerceIn(.15f, 6f)
+    val contentDp = topPadDp * 2 + heights.sum() + GAP_DP * (blocks.size - 1).coerceAtLeast(0)
+
+    // VSPF only accepts an aspect ratio in 0.20..1.20, so the page height has a hard floor
+    // and ceiling. Clamp the HEIGHT and derive the ratio from it — clamping the ratio alone
+    // would leave the element fractions computed against a height the page no longer has,
+    // which stretches or overflows the content.
+    val layoutHeightDp = contentDp.coerceIn(
+        referenceWidthDp / MAX_PAGE_ASPECT,
+        referenceWidthDp / MIN_PAGE_ASPECT,
+    )
+    page.aspectRatio = (referenceWidthDp / layoutHeightDp).coerceIn(MIN_PAGE_ASPECT, MAX_PAGE_ASPECT)
+    val totalDp = layoutHeightDp
 
     val children = mutableListOf<Element>()
     var cursor = topPadDp

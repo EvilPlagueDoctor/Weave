@@ -152,9 +152,17 @@ const val ACTIVE_PROFILE_FILE = "active.txt"
  * saved one or the saved one will not parse.
  */
 fun loadActiveProfile(context: Context): ProfileDocument {
-    val file = File(File(context.filesDir, "profiles").apply { mkdirs() }, ACTIVE_PROFILE_FILE)
+    val dir = File(context.filesDir, "profiles").apply { mkdirs() }
+    val file = File(dir, ACTIVE_PROFILE_FILE)
     if (!file.exists()) return localizedDefaultProfile(context)
-    return runCatching { ProfileCodec.load(file) }.getOrElse { localizedDefaultProfile(context) }
+    return runCatching { ProfileCodec.load(file) }.getOrElse {
+        // Falling back to the default silently would destroy the evidence along with the work.
+        // Keep the unreadable file so it can be inspected or recovered by hand.
+        runCatching {
+            file.copyTo(File(dir, "$ACTIVE_PROFILE_FILE.unreadable-${System.currentTimeMillis()}"), overwrite = true)
+        }
+        localizedDefaultProfile(context)
+    }
 }
 
 class EditorState(private val context: Context) {
@@ -211,14 +219,33 @@ class EditorState(private val context: Context) {
     fun ownProfileTextForPublish(): String = ProfileCodec.encodeText(doc)
     fun ownProfileNameForPublish(): String = doc.profileName
 
+    /** Set when the working document could not be written. Surfaced in the UI, not swallowed. */
+    var persistError by mutableStateOf<String?>(null)
+        private set
+
     /**
-     * Writes the working document to its fixed slot. Called at every commit point rather
-     * than on a timer, so a process death between edits cannot lose more than the edit in
-     * progress. Failures are swallowed: a full disk should not take the editor down.
+     * Writes the working document to its fixed slot. Called at every commit point rather than
+     * on a timer, so a process death between edits cannot lose more than the edit in progress.
+     *
+     * A failure here used to be swallowed, which meant an unencodable document silently never
+     * reached disk and came back as the built-in default on the next launch. Silence is the
+     * wrong default for the one function whose whole job is not losing the person's work.
      */
-    fun persistActive() {
-        runCatching { ProfileCodec.save(doc, File(profileDir, ACTIVE_PROFILE_FILE)) }
+    fun persistActive(): Boolean {
+        val outcome = runCatching {
+            // Encode first. Writing a partial file over a good one is worse than not writing.
+            val encoded = ProfileCodec.encodeText(doc)
+            val target = File(profileDir, ACTIVE_PROFILE_FILE)
+            val staging = File(profileDir, "$ACTIVE_PROFILE_FILE.tmp")
+            staging.writeText(encoded, Charsets.UTF_8)
+            if (target.exists()) target.delete()
+            check(staging.renameTo(target)) { "could not replace the saved profile" }
+        }
+        persistError = outcome.exceptionOrNull()?.let { it.message ?: it::class.java.simpleName }
+        return outcome.isSuccess
     }
+
+    fun clearPersistError() { persistError = null }
 
     /** Replaces the whole editable document. Used by first-run setup. */
     fun replaceDocument(next: ProfileDocument) {

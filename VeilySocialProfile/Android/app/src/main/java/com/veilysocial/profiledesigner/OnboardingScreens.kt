@@ -76,7 +76,11 @@ private val StarterColors = listOf(
  * indistinguishable MinHash signature.
  */
 @Composable
-fun FirstRunScreen(ownKey: String, onDone: (name: String, backgroundArgb: Int, blurb: String) -> Unit) {
+fun FirstRunScreen(
+    ownKey: String,
+    error: String? = null,
+    onDone: (name: String, backgroundArgb: Int, blurb: String) -> Unit,
+) {
     var name by remember { mutableStateOf("") }
     var blurb by remember { mutableStateOf("") }
     var colorArgb by remember { mutableIntStateOf(StarterColors.first()) }
@@ -93,6 +97,18 @@ fun FirstRunScreen(ownKey: String, onDone: (name: String, backgroundArgb: Int, b
             modifier = Modifier.padding(top = 8.dp, bottom = 20.dp)
         )
 
+        error?.let { message ->
+            Surface(
+                color = MaterialTheme.colorScheme.errorContainer,
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)
+            ) {
+                Column(Modifier.padding(12.dp)) {
+                    Text("Couldn't save that profile", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                    Text(message, style = MaterialTheme.typography.labelSmall)
+                }
+            }
+        }
         Row(verticalAlignment = Alignment.CenterVertically) {
             Identicon(ownKey, size = 56.dp)
             Spacer(Modifier.width(14.dp))
@@ -238,6 +254,7 @@ fun MeScreen(
 ) {
     val ui by controller.ui.collectAsState()
     val mediaLookup = remember(media) { { e: Element -> media.bitmapFor(e.mediaContentHash) } }
+    var publishError by remember { mutableStateOf<String?>(null) }
     var pageIndex by remember { mutableIntStateOf(0) }
     val page = state.doc.pages.getOrNull(pageIndex) ?: state.doc.pages.first()
     val scroll = rememberScrollState()
@@ -264,16 +281,38 @@ fun MeScreen(
                 TextButton(onClick = { onQuickEdit(pageIndex) }) { Text("Edit") }
                 Button(
                     onClick = {
-                        state.persistActive()
-                        controller.publishProfile(state.ownProfileTextForPublish(), state.ownProfileNameForPublish())
+                        // encodeText throws on an invalid document. This runs on the main
+                        // thread from a click handler, so an uncaught throw is a crash —
+                        // check first and report rather than letting it escape.
+                        val encoded = runCatching { state.ownProfileTextForPublish() }
+                        val failure = encoded.exceptionOrNull()
+                        if (failure != null) {
+                            publishError = failure.message ?: "This profile can't be published yet."
+                        } else if (!state.persistActive()) {
+                            publishError = state.persistError ?: "Couldn't save this profile."
+                        } else {
+                            publishError = null
+                            controller.publishProfile(encoded.getOrThrow(), state.ownProfileNameForPublish())
+                        }
                     },
                     contentPadding = PaddingValues(horizontal = 14.dp)
                 ) { Text("Publish") }
             }
         }
+        publishError?.let { message ->
+            Surface(color = MaterialTheme.colorScheme.errorContainer, modifier = Modifier.fillMaxWidth()) {
+                Row(Modifier.padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Couldn't publish", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                        Text(message, style = MaterialTheme.typography.labelSmall)
+                    }
+                    TextButton(onClick = { publishError = null }) { Text("Dismiss") }
+                }
+            }
+        }
         BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
             val canvasWidth = maxWidth
-            val canvasHeight = canvasWidth / page.aspectRatio.coerceIn(.15f, 6f)
+            val canvasHeight = canvasWidth / page.aspectRatio.coerceIn(MIN_PAGE_ASPECT, MAX_PAGE_ASPECT)
             Column(Modifier.fillMaxSize().verticalScroll(scroll)) {
                 Surface(color = Color.White) {
                     PageCanvas(page, Modifier.fillMaxWidth().height(canvasHeight), widgetLookup = state::widgetProgramFor, imageLookup = mediaLookup)

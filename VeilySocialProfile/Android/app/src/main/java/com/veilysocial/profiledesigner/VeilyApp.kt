@@ -32,6 +32,7 @@ fun VeilyApp() {
 
     var setupDone by remember { mutableStateOf(onboarding.completed) }
     var widgetsEnabled by remember { mutableStateOf(true) }
+    var setupError by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(Unit) { controller.start() }
     DisposableEffect(Unit) { onDispose { controller.stop() } }
@@ -49,12 +50,20 @@ fun VeilyApp() {
                     onRetry = { controller.start() }
                 )
 
-                !setupDone -> FirstRunScreen(ownKey = ui.mainDht) { name, argb, blurb ->
+                !setupDone -> FirstRunScreen(ownKey = ui.mainDht, error = setupError) { name, argb, blurb ->
                     state.replaceDocument(starterProfile(context, name, argb, blurb))
-                    controller.setDiscoveryName(name)
-                    controller.setDiscoveryDescription(blurb)
-                    onboarding.completed = true
-                    setupDone = true
+                    // Only move past setup once the profile is actually on disk. Marking
+                    // onboarding complete after a failed write is what stranded people on
+                    // the built-in default with no way back.
+                    if (state.persistError == null) {
+                        controller.setDiscoveryName(name)
+                        controller.setDiscoveryDescription(blurb)
+                        onboarding.completed = true
+                        setupDone = true
+                        setupError = null
+                    } else {
+                        setupError = state.persistError
+                    }
                 }
 
                 else -> VeilyShell(
