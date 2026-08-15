@@ -4,6 +4,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.content.pm.PackageManager
 import android.os.IBinder
 import android.util.Base64
 import com.example.veilknit_deamon.ipc.IVeilKnitApi
@@ -30,6 +31,7 @@ class DaemonClient(private val context: Context) {
         const val APP_NAME = "VeilySocial Profiles"
         private const val DAEMON_PACKAGE = "com.example.veilknit_deamon"
         private const val DAEMON_ACTION = "com.example.veilknit_deamon.BIND_LOCAL_API"
+        private const val DAEMON_PERMISSION = "com.example.veilknit_deamon.permission.BIND_VEILKNIT_API"
         private val CAPABILITIES = listOf(
             "SendMessages", "ReceiveMessages", "ManageOwnStorage", "ReadOwnStorage",
             "ReadPublicProfiles", "SubscribeNetworkStatus", "SignAppData"
@@ -67,13 +69,63 @@ class DaemonClient(private val context: Context) {
             }
         }
         serviceConnection = connection
-        if (!context.bindService(intent, connection, Context.BIND_AUTO_CREATE)) {
-            continuation.resumeWithException(IllegalStateException("Could not bind VeilKnit daemon API. Is the daemon installed/running, and was this app signed with the same key?"))
+
+        val bound = try {
+            context.bindService(intent, connection, Context.BIND_AUTO_CREATE)
+        } catch (security: SecurityException) {
+            serviceConnection = null
+            continuation.resumeWithException(
+                IllegalStateException(
+                    "Denied $DAEMON_PERMISSION. The daemon declares this permission at " +
+                        "protectionLevel=signature, so both APKs must be signed with the same key. " +
+                        "Install the daemon first, then reinstall this app.",
+                    security
+                )
+            )
+            return@suspendCancellableCoroutine
         }
+
+        if (!bound) {
+            // Android still holds a reference even when bindService() reports failure.
+            runCatching { context.unbindService(connection) }
+            serviceConnection = null
+            continuation.resumeWithException(IllegalStateException(diagnoseBindFailure()))
+            return@suspendCancellableCoroutine
+        }
+
         continuation.invokeOnCancellation {
             runCatching { context.unbindService(connection) }
             if (serviceConnection === connection) serviceConnection = null
         }
+    }
+
+    /**
+     * bindService() returns false without an exception for several unrelated reasons.
+     * Work out which one actually applies so the log says something useful.
+     */
+    private fun diagnoseBindFailure(): String {
+        val daemonInstalled = runCatching {
+            context.packageManager.getPackageInfo(DAEMON_PACKAGE, 0)
+        }.isSuccess
+        if (!daemonInstalled) {
+            return "VeilKnit daemon package $DAEMON_PACKAGE is not installed, or is not visible to " +
+                "this app. Install the daemon, and make sure AndroidManifest.xml declares a " +
+                "<queries> entry for it (required on targetSdk 30+)."
+        }
+        val resolved = context.packageManager.queryIntentServices(
+            Intent(DAEMON_ACTION).setPackage(DAEMON_PACKAGE), 0
+        )
+        if (resolved.isEmpty()) {
+            return "The daemon is installed but exposes no service for $DAEMON_ACTION. " +
+                "Check that the installed daemon build is recent enough to ship VeilKnitApiService."
+        }
+        if (context.checkSelfPermission(DAEMON_PERMISSION) != PackageManager.PERMISSION_GRANTED) {
+            return "$DAEMON_PERMISSION was not granted. Declare it with <uses-permission> in " +
+                "AndroidManifest.xml, sign both APKs with the same key, and install the daemon " +
+                "before this app."
+        }
+        return "Could not bind the VeilKnit daemon API for an unknown reason. Is the daemon " +
+            "foreground service running?"
     }
 
     private fun rawRequest(action: String, authenticated: Boolean = true, block: JSONObject.() -> Unit = {}): JSONObject {

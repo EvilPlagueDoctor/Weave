@@ -29,6 +29,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
+import androidx.activity.compose.BackHandler
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -182,39 +183,18 @@ class EditorState(private val context: Context) {
     var showWidgetPicker by mutableStateOf(false)
     var widgetReplaceTargetId by mutableStateOf<String?>(null)
     var pendingWidgetBoxResize by mutableStateOf<PendingWidgetBoxResize?>(null)
-    var remoteView by mutableStateOf(false); private set
-    var remoteProfileName by mutableStateOf(""); private set
-    private var ownDocumentBeforeRemote: ProfileDocument? = null
     private val widgetProgramCache = mutableMapOf<String, Pair<String, WidgetProgram>>()
 
     fun text(@StringRes id: Int, vararg args: Any): String = context.getString(id, *args)
     fun toast(@StringRes id: Int, vararg args: Any) = Toast.makeText(context, text(id, *args), Toast.LENGTH_SHORT).show()
 
-    fun ownProfileTextForPublish(): String = ProfileCodec.encodeText(ownDocumentBeforeRemote ?: doc)
-    fun ownProfileNameForPublish(): String = (ownDocumentBeforeRemote ?: doc).profileName
-    fun openRemoteProfile(profileText: String, displayName: String) {
-        val remote = ProfileCodec.decodeText(profileText)
-        val validation = ProfileCodec.validate(remote)
-        require(validation.ok) { validation.message }
-        if (!remoteView) ownDocumentBeforeRemote = doc.deepCopy()
+    fun ownProfileTextForPublish(): String = ProfileCodec.encodeText(doc)
+    fun ownProfileNameForPublish(): String = doc.profileName
+
+    /** Replaces the whole editable document. Used by first-run setup. */
+    fun replaceDocument(next: ProfileDocument) {
         finishInlineTextEdit()
-        doc = remote
-        pageIndex = 0
-        selectedId = doc.pages.first().root.id
-        focusedBoxId = doc.pages.first().root.children.firstOrNull { it.type == ElementType.Block }?.id
-        mode = EditMode.Boxes
-        panelCollapsed = true
-        remoteProfileName = displayName.ifBlank { doc.profileName }
-        remoteView = true
-        invalidate()
-    }
-    fun returnToOwnProfile() {
-        val own = ownDocumentBeforeRemote ?: return
-        finishInlineTextEdit()
-        doc = own
-        ownDocumentBeforeRemote = null
-        remoteView = false
-        remoteProfileName = ""
+        doc = next
         pageIndex = 0
         selectedId = doc.pages.first().root.id
         focusedBoxId = firstBoxId()
@@ -730,7 +710,7 @@ class EditorState(private val context: Context) {
     fun publishLocal(){try{ProfileCodec.save(doc,File(profileDir,"live_profile.txt"));toast(R.string.published_local)}catch(e:Exception){toast(R.string.publish_failed,e.message?:"")}}
 }
 
-private val DesignerColorScheme = lightColorScheme(
+internal val DesignerColorScheme = lightColorScheme(
     primary = Color(0xFFB24F5C),
     onPrimary = Color.White,
     primaryContainer = Color(0xFFFBE5E8),
@@ -750,66 +730,78 @@ private val DesignerColorScheme = lightColorScheme(
 )
 
 @Composable
-fun ProfileDesignerApp(){
-    val context = LocalContext.current
-    val state = remember { EditorState(context) }
-    val social = remember { SocialNetworkController(context) }
-    var showSocial by remember { mutableStateOf(false) }
-    LaunchedEffect(Unit) { social.start() }
-    DisposableEffect(Unit) { onDispose { social.stop() } }
-    MaterialTheme(colorScheme = DesignerColorScheme) {
-        Surface(color = MaterialTheme.colorScheme.background) {
-            when {
-                showSocial -> SocialNetworkScreen(
-                    controller = social,
-                    ownProfileText = state::ownProfileTextForPublish,
-                    ownProfileName = state::ownProfileNameForPublish,
-                    onOpenRemote = { _, name, text ->
-                        runCatching { state.openRemoteProfile(text, name) }
-                            .onSuccess { showSocial = false }
-                            .onFailure { state.toast(R.string.open_failed, it.message ?: "") }
-                    },
-                    onBack = { showSocial = false }
-                )
-                state.remoteView -> RemoteProfileViewer(
-                    state = state,
-                    onReturn = state::returnToOwnProfile,
-                    onSocial = { showSocial = true }
-                )
-                state.showWidgetStudio -> Box(Modifier.fillMaxSize().safeDrawingPadding()) {
-                    WidgetStudioScreen(repo = state.widgetRepo, onBack = { state.showWidgetStudio = false })
-                }
-                else -> BoxWithConstraints(Modifier.fillMaxSize().safeDrawingPadding()) {
-                    val panelWidth: Dp = minOf(370.dp, maxWidth * .42f)
-                    Column(Modifier.fillMaxSize()) {
-                        WorkspaceHeader(state, onSocial = { showSocial = true })
-                        Box(Modifier.weight(1f).fillMaxWidth().clipToBounds()) {
-                            PageWorkspace(state, Modifier.fillMaxSize())
-                            if (!state.panelCollapsed) {
-                                PropertiesPanel(state, Modifier.align(Alignment.CenterEnd).width(panelWidth).fillMaxHeight())
-                            } else {
-                                Surface(
-                                    tonalElevation = 3.dp, shadowElevation = 3.dp,
-                                    shape = RoundedCornerShape(topStart = 14.dp, bottomStart = 14.dp),
-                                    modifier = Modifier.align(Alignment.TopEnd).width(44.dp).height(58.dp)
-                                ) {
-                                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                                        TextButton(onClick = { state.panelCollapsed = false }, contentPadding = PaddingValues(0.dp), modifier = Modifier.size(36.dp)) {
-                                            Text("‹", style = MaterialTheme.typography.titleLarge)
-                                        }
-                                    }
+fun EditorScreen(state: EditorState, onBack: () -> Unit) {
+    BackHandler(enabled = true) {
+        when {
+            state.showWidgetStudio -> state.showWidgetStudio = false
+            else -> onBack()
+        }
+    }
+    if (state.showWidgetStudio) {
+        Box(Modifier.fillMaxSize()) {
+            WidgetStudioScreen(repo = state.widgetRepo, onBack = { state.showWidgetStudio = false })
+        }
+    } else {
+        BoxWithConstraints(Modifier.fillMaxSize()) {
+            // Captured here on purpose: BoxScope and BoxWithConstraintsScope share the
+            // @LayoutScopeMarker DslMarker, so maxWidth is unreachable from inside the
+            // nested Box below.
+            val availableWidth: Dp = maxWidth
+            val wide = availableWidth >= 720.dp
+            val panelWidth: Dp = minOf(370.dp, availableWidth * .42f)
+            Column(Modifier.fillMaxSize()) {
+                EditorHeader(state, onBack)
+                Box(Modifier.weight(1f).fillMaxWidth().clipToBounds()) {
+                    PageWorkspace(state, Modifier.fillMaxSize())
+                    if (!state.panelCollapsed) {
+                        PropertiesPanel(
+                            state,
+                            Modifier.align(if (wide) Alignment.CenterEnd else Alignment.BottomEnd)
+                                .width(if (wide) panelWidth else availableWidth)
+                                .then(if (wide) Modifier.fillMaxHeight() else Modifier.fillMaxHeight(.55f))
+                        )
+                    } else {
+                        Surface(
+                            tonalElevation = 3.dp, shadowElevation = 3.dp,
+                            shape = RoundedCornerShape(topStart = 14.dp, bottomStart = 14.dp),
+                            modifier = Modifier.align(Alignment.TopEnd).width(44.dp).height(58.dp)
+                        ) {
+                            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                TextButton(onClick = { state.panelCollapsed = false }, contentPadding = PaddingValues(0.dp), modifier = Modifier.size(36.dp)) {
+                                    Text("\u2039", style = MaterialTheme.typography.titleLarge)
                                 }
                             }
                         }
-                        ToolStrip(state, Modifier.fillMaxWidth())
                     }
                 }
+                ToolStrip(state, Modifier.fillMaxWidth())
             }
         }
-        if(!state.remoteView && state.showSaveAs) SaveAsDialog(state)
-        if(!state.remoteView && state.showOpen) OpenDialog(state)
-        if(!state.remoteView && state.showWidgetPicker) WidgetPickerDialog(state)
-        if(!state.remoteView && state.pendingWidgetBoxResize != null) WidgetBoxResizeDialog(state)
+    }
+    if (state.showSaveAs) SaveAsDialog(state)
+    if (state.showOpen) OpenDialog(state)
+    if (state.showWidgetPicker) WidgetPickerDialog(state)
+    if (state.pendingWidgetBoxResize != null) WidgetBoxResizeDialog(state)
+}
+
+@Composable
+private fun EditorHeader(state: EditorState, onBack: () -> Unit) {
+    val page = state.doc.pages[state.pageIndex]
+    Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 1.dp) {
+        Row(Modifier.fillMaxWidth().height(54.dp).padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = onBack) { Text("\u2190 Done") }
+            Column(Modifier.weight(1f)) {
+                Text(state.doc.profileName, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, maxLines = 1)
+                Text(stringResource(R.string.workspace_page, page.name), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            TextButton(onClick = { state.showWidgetStudio = true }) { Text("\u2318", style = MaterialTheme.typography.titleMedium) }
+            Surface(color = MaterialTheme.colorScheme.primaryContainer, shape = RoundedCornerShape(999.dp)) {
+                Text(
+                    stringResource(state.mode.shortRes), modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                    style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onPrimaryContainer, fontWeight = FontWeight.SemiBold
+                )
+            }
+        }
     }
 }
 
@@ -832,58 +824,6 @@ private fun WorkspaceHeader(state: EditorState, onSocial: () -> Unit) {
                     style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onPrimaryContainer, fontWeight = FontWeight.SemiBold
                 )
             }
-        }
-    }
-}
-
-@Composable
-private fun RemoteProfileViewer(state: EditorState, onReturn: () -> Unit, onSocial: () -> Unit) {
-    val page = state.doc.pages[state.pageIndex]
-    Column(Modifier.fillMaxSize().safeDrawingPadding()) {
-        Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 2.dp) {
-            Row(Modifier.fillMaxWidth().height(58.dp).padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                TextButton(onClick = onReturn) { Text("← My Profile") }
-                Column(Modifier.weight(1f)) {
-                    SelectionContainer { Text(state.remoteProfileName.ifBlank { state.doc.profileName }, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold) }
-                    Text("Viewing published Profile Page • ${page.name}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-                TextButton(onClick = onSocial) { Text("◎ Social") }
-            }
-        }
-        BoxWithConstraints(Modifier.weight(1f).fillMaxWidth().background(MaterialTheme.colorScheme.background), contentAlignment = Alignment.Center) {
-            val usableW = maxWidth - 24.dp
-            val usableH = maxHeight - 24.dp
-            val widthByHeight = usableH * page.aspectRatio
-            val pageW = minOf(usableW, widthByHeight)
-            val pageH = pageW / page.aspectRatio
-            Surface(Modifier.size(pageW, pageH), shape = RoundedCornerShape(12.dp), shadowElevation = 10.dp, color = Color.White) {
-                ReadOnlyProfileCanvas(state, Modifier.fillMaxSize())
-            }
-        }
-        if (state.doc.pages.size > 1) {
-            Row(Modifier.fillMaxWidth().padding(6.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
-                TextButton(onClick = { if (state.pageIndex > 0) state.pageIndex-- }, enabled = state.pageIndex > 0) { Text("←") }
-                Text("${state.pageIndex + 1} / ${state.doc.pages.size}", modifier = Modifier.padding(horizontal = 12.dp))
-                TextButton(onClick = { if (state.pageIndex < state.doc.pages.lastIndex) state.pageIndex++ }, enabled = state.pageIndex < state.doc.pages.lastIndex) { Text("→") }
-            }
-        }
-    }
-}
-
-@Composable
-private fun ReadOnlyProfileCanvas(state: EditorState, modifier: Modifier) {
-    val renderStrings = RenderStrings(
-        mediaKinds = listOf(stringResource(R.string.media_image), stringResource(R.string.media_audio), stringResource(R.string.media_video)),
-        mediaSuffix = stringResource(R.string.media_preview_suffix),
-        widgetSuffix = stringResource(R.string.widget_preview_suffix),
-        widgetPaused = stringResource(R.string.widget_paused_short)
-    )
-    Canvas(modifier) {
-        val root = state.doc.pages[state.pageIndex].root
-        val rootRect = Rect(0f, 0f, size.width, size.height)
-        drawBackground(rootRect, root.background)
-        root.children.sortedBy { it.rect.zIndex }.forEach {
-            drawElement(it, rootRect, "", selectChildren = false, strings = renderStrings, inlineEditingId = null, widgetLookup = state::widgetProgramFor)
         }
     }
 }
@@ -1091,7 +1031,7 @@ private fun ProfileCanvas(state:EditorState,renderRevision:Int,camera:NRect,modi
     }
 }
 
-private fun DrawScope.drawBackground(r:Rect,bg:BackgroundSpec){if(bg.kind==BackgroundKind.Solid||bg.stops.size<2){drawRect(Color(bg.solidArgb),r.topLeft,r.size);return};val sorted=bg.stops.sortedBy{it.position}.map{it.position to Color(it.argb)}.toTypedArray();val start=Offset(r.left+bg.startX*r.width,r.top+bg.startY*r.height);val end=Offset(r.left+bg.endX*r.width,r.top+bg.endY*r.height);val d=end-start;if(d.x*d.x+d.y*d.y<.0001f){drawRect(sorted.last().second,r.topLeft,r.size);return};drawRect(Brush.linearGradient(colorStops=sorted,start=start,end=end),r.topLeft,r.size)}
+internal fun DrawScope.drawBackground(r:Rect,bg:BackgroundSpec){if(bg.kind==BackgroundKind.Solid||bg.stops.size<2){drawRect(Color(bg.solidArgb),r.topLeft,r.size);return};val sorted=bg.stops.sortedBy{it.position}.map{it.position to Color(it.argb)}.toTypedArray();val start=Offset(r.left+bg.startX*r.width,r.top+bg.startY*r.height);val end=Offset(r.left+bg.endX*r.width,r.top+bg.endY*r.height);val d=end-start;if(d.x*d.x+d.y*d.y<.0001f){drawRect(sorted.last().second,r.topLeft,r.size);return};drawRect(Brush.linearGradient(colorStops=sorted,start=start,end=end),r.topLeft,r.size)}
 private fun childRect(parent:Rect,q:RectSpec)=Rect(parent.left+q.x*parent.width,parent.top+q.y*parent.height,parent.left+(q.x+q.width)*parent.width,parent.top+(q.y+q.height)*parent.height)
 private fun DrawScope.drawBorderSpec(r:Rect,d:DecorationRef,thickness:Float){val n=if(d.kind==DecorationKind.DecorationPack)d.basedOnBuiltin.ifBlank{"Thin1"}else d.builtinName;if(n=="None"||n.isBlank())return;val stroke=max(1f,thickness*density);val color=if(n=="Thick1")Color(0xFF2D3340)else Color(0xFF636873);if(n=="Dotted1")drawRect(color,r.topLeft,r.size,style=Stroke(stroke,pathEffect=PathEffect.dashPathEffect(floatArrayOf(6f,6f))))else{drawRect(color,r.topLeft,r.size,style=Stroke(stroke));if(n=="Thick1")drawRect(color,Offset(r.left+4f,r.top+4f),Size(max(0f,r.width-8f),max(0f,r.height-8f)),style=Stroke(stroke))}}
 private fun DrawScope.drawStamp(r:Rect,e:Element){val n=if(e.stampDecoration.kind==DecorationKind.DecorationPack)e.stampDecoration.basedOnBuiltin.ifBlank{"Star1"}else e.stampDecoration.builtinName;val alpha=e.opacity.coerceIn(0f,1f);rotate(e.rotationDegrees,pivot=r.center){when(n){"Dot1"->drawOval(Color(0xFF7866DC).copy(alpha=alpha),r.topLeft,r.size);"Moon1"->{val outer=Path().apply{addOval(r)};val cut=Path().apply{addOval(Rect(r.left+r.width*.34f,r.top-r.height*.08f,r.right+r.width*.10f,r.bottom-r.height*.08f))};drawPath(Path.combine(PathOperation.Difference,outer,cut),Color(0xFFF6D36B).copy(alpha=alpha))};else->{val p=Path();val cx=r.center.x;val cy=r.center.y;val ro=min(r.width,r.height)*.48f;val ri=ro*.43f;repeat(10){i->val a=-PI/2+i*PI/5;val rr=if(i%2==0)ro else ri;val x=cx+cos(a).toFloat()*rr;val y=cy+sin(a).toFloat()*rr;if(i==0)p.moveTo(x,y)else p.lineTo(x,y)};p.close();drawPath(p,if(n=="Star2")Color(0xFF4EA8DE).copy(alpha=alpha)else Color(0xFF7866DC).copy(alpha=alpha))}}}}
@@ -1124,7 +1064,7 @@ private fun DrawScope.drawTextWrapped(text:String,r:Rect,e:Element,color:Int=e.t
     }
 }
 
-private fun DrawScope.drawElement(
+internal fun DrawScope.drawElement(
     e:Element,
     parent:Rect,
     selectedId:String,
