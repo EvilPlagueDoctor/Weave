@@ -41,6 +41,7 @@ fun VeilyApp() {
 
     val ui by controller.ui.collectAsState()
     val connected = ui.mainDht.isNotBlank()
+    LaunchedEffect(ui.mainDht) { state.ownerKey = ui.mainDht }
     val failure = ui.status.takeIf { it.startsWith("Error", ignoreCase = true) || it.contains("Could not bind") }
 
     MaterialTheme(colorScheme = DesignerColorScheme) {
@@ -59,7 +60,7 @@ fun VeilyApp() {
                     // the built-in default with no way back.
                     if (state.persistError == null) {
                         controller.setDiscoveryName(name)
-                        controller.setDiscoveryDescription(blurb)
+                        controller.setDiscoveryDescription(deriveSearchDescription(state.doc))
                         onboarding.completed = true
                         setupDone = true
                         setupError = null

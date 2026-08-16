@@ -30,6 +30,7 @@
     <string name="builtin_thick1">Thick 1</string>
     <string name="builtin_dotted1">Dotted 1</string>
     <string name="builtin_star1">Star 1</string>
+    <string name="builtin_self_mark">Your mark</string>
     <string name="builtin_star2">Star 2</string>
     <string name="builtin_moon1">Moon 1</string>
     <string name="builtin_dot1">Dot 1</string>

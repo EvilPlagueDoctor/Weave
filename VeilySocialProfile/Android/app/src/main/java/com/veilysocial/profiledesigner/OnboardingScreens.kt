@@ -302,6 +302,9 @@ fun MeScreen(
                         // Discovery shows the profile name, so keep the two from drifting:
                         // renaming a profile should rename it in search too.
                         controller.setDiscoveryName(state.doc.profileName)
+                        // The blurb is no longer typed anywhere: it comes off the top of the
+                        // page, so what ranks in search is what the page actually says.
+                        controller.setDiscoveryDescription(deriveSearchDescription(state.doc))
                         publishError = null
                         scope.launch {
                             // Images first: the payload records their record keys, so
@@ -376,7 +379,13 @@ fun MeScreen(
             val canvasHeight = canvasWidth / shownPage.aspectRatio.coerceIn(MIN_PAGE_ASPECT, MAX_PAGE_ASPECT)
             Column(Modifier.fillMaxSize().verticalScroll(scroll)) {
                 Surface(color = Color.White) {
-                    PageCanvas(shownPage, Modifier.fillMaxWidth().height(canvasHeight), widgetLookup = state::widgetProgramFor, imageLookup = mediaLookup)
+                    PageCanvas(
+                        shownPage,
+                        Modifier.fillMaxWidth().height(canvasHeight),
+                        widgetLookup = state::widgetProgramFor,
+                        imageLookup = mediaLookup,
+                        ownerKey = ownKey,
+                    )
                 }
                 PageRail(
                     pageNames = shownDoc.pages.map { it.name },
@@ -498,25 +507,9 @@ fun SettingsScreen(
             )
 
             HorizontalDivider(Modifier.padding(vertical = 16.dp))
-            Text("How you appear in search", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-            Text(
-                "This is the blurb other people see beside your name before they open your profile. It is published, and changes take effect the next time you publish.",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(top = 4.dp)
-            )
-            OutlinedTextField(
-                value = ui.discoveryDescription,
-                onValueChange = controller::setDiscoveryDescription,
-                modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
-                label = { Text("Search blurb") },
-                minLines = 3,
-            )
-
-            HorizontalDivider(Modifier.padding(vertical = 16.dp))
             Text("Discovery", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
             Text(
-                "What you search for and what you avoid stays on this device. It is never published.",
+                "The blurb people see beside your name in search comes from the text at the top of your home page, so it always matches what is actually there. What you search for and what you avoid stays on this device and is never published.",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 4.dp)

@@ -219,6 +219,12 @@ class EditorState(private val context: Context) {
     fun ownProfileTextForPublish(): String = ProfileCodec.encodeText(doc)
     fun ownProfileNameForPublish(): String = doc.profileName
 
+    /**
+     * The signed-in account's main DHT key. Needed at draw time so a "your mark" stamp can
+     * resolve to the current owner rather than to something baked into the document.
+     */
+    var ownerKey by mutableStateOf("")
+
     /** Set when the working document could not be written. Surfaced in the UI, not swallowed. */
     var persistError by mutableStateOf<String?>(null)
         private set
@@ -807,18 +813,18 @@ fun EditorScreen(state: EditorState, onBack: () -> Unit) {
             // @LayoutScopeMarker DslMarker, so maxWidth is unreachable from inside the
             // nested Box below.
             val availableWidth: Dp = maxWidth
-            val wide = availableWidth >= 720.dp
             val panelWidth: Dp = minOf(370.dp, availableWidth * .42f)
             Column(Modifier.fillMaxSize()) {
                 EditorHeader(state, onDiscard = { confirmDiscard = true }, onDone = { state.persistActive(); onBack() })
                 Box(Modifier.weight(1f).fillMaxWidth().clipToBounds()) {
                     PageWorkspace(state, Modifier.fillMaxSize())
                     if (!state.panelCollapsed) {
+                        // Always a narrow side panel. A bottom sheet was tried and swallowed
+                        // half the canvas; the collapse bar already covers the case where the
+                        // panel is in the way.
                         PropertiesPanel(
                             state,
-                            Modifier.align(if (wide) Alignment.CenterEnd else Alignment.BottomEnd)
-                                .width(if (wide) panelWidth else availableWidth)
-                                .then(if (wide) Modifier.fillMaxHeight() else Modifier.fillMaxHeight(.55f))
+                            Modifier.align(Alignment.CenterEnd).width(panelWidth).fillMaxHeight()
                         )
                     } else {
                         Surface(
@@ -1048,7 +1054,8 @@ private fun ProfileCanvas(state:EditorState,renderRevision:Int,camera:NRect,modi
                     if(state.mode==EditMode.Background)state.selectedId else "",
                     strings=renderStrings,
                     inlineEditingId=state.inlineTextEditId,
-                    widgetLookup=state::widgetProgramFor
+                    widgetLookup=state::widgetProgramFor,
+                    ownerKey=state.ownerKey
                 )
             }
             if(state.mode!=EditMode.Background){
@@ -1058,7 +1065,8 @@ private fun ProfileCanvas(state:EditorState,renderRevision:Int,camera:NRect,modi
                         selectChildren=state.mode==EditMode.Foreground,
                         strings=renderStrings,
                         inlineEditingId=state.inlineTextEditId,
-                        widgetLookup=state::widgetProgramFor
+                        widgetLookup=state::widgetProgramFor,
+                        ownerKey=state.ownerKey
                     )
                 }
             }
@@ -1111,7 +1119,7 @@ private fun ProfileCanvas(state:EditorState,renderRevision:Int,camera:NRect,modi
 internal fun DrawScope.drawBackground(r:Rect,bg:BackgroundSpec){if(bg.kind==BackgroundKind.Solid||bg.stops.size<2){drawRect(Color(bg.solidArgb),r.topLeft,r.size);return};val sorted=bg.stops.sortedBy{it.position}.map{it.position to Color(it.argb)}.toTypedArray();val start=Offset(r.left+bg.startX*r.width,r.top+bg.startY*r.height);val end=Offset(r.left+bg.endX*r.width,r.top+bg.endY*r.height);val d=end-start;if(d.x*d.x+d.y*d.y<.0001f){drawRect(sorted.last().second,r.topLeft,r.size);return};drawRect(Brush.linearGradient(colorStops=sorted,start=start,end=end),r.topLeft,r.size)}
 private fun childRect(parent:Rect,q:RectSpec)=Rect(parent.left+q.x*parent.width,parent.top+q.y*parent.height,parent.left+(q.x+q.width)*parent.width,parent.top+(q.y+q.height)*parent.height)
 private fun DrawScope.drawBorderSpec(r:Rect,d:DecorationRef,thickness:Float){val n=if(d.kind==DecorationKind.DecorationPack)d.basedOnBuiltin.ifBlank{"Thin1"}else d.builtinName;if(n=="None"||n.isBlank())return;val stroke=max(1f,thickness*density);val color=if(n=="Thick1")Color(0xFF2D3340)else Color(0xFF636873);if(n=="Dotted1")drawRect(color,r.topLeft,r.size,style=Stroke(stroke,pathEffect=PathEffect.dashPathEffect(floatArrayOf(6f,6f))))else{drawRect(color,r.topLeft,r.size,style=Stroke(stroke));if(n=="Thick1")drawRect(color,Offset(r.left+4f,r.top+4f),Size(max(0f,r.width-8f),max(0f,r.height-8f)),style=Stroke(stroke))}}
-private fun DrawScope.drawStamp(r:Rect,e:Element){val n=if(e.stampDecoration.kind==DecorationKind.DecorationPack)e.stampDecoration.basedOnBuiltin.ifBlank{"Star1"}else e.stampDecoration.builtinName;val alpha=e.opacity.coerceIn(0f,1f);rotate(e.rotationDegrees,pivot=r.center){when(n){"Dot1"->drawOval(Color(0xFF7866DC).copy(alpha=alpha),r.topLeft,r.size);"Moon1"->{val outer=Path().apply{addOval(r)};val cut=Path().apply{addOval(Rect(r.left+r.width*.34f,r.top-r.height*.08f,r.right+r.width*.10f,r.bottom-r.height*.08f))};drawPath(Path.combine(PathOperation.Difference,outer,cut),Color(0xFFF6D36B).copy(alpha=alpha))};else->{val p=Path();val cx=r.center.x;val cy=r.center.y;val ro=min(r.width,r.height)*.48f;val ri=ro*.43f;repeat(10){i->val a=-PI/2+i*PI/5;val rr=if(i%2==0)ro else ri;val x=cx+cos(a).toFloat()*rr;val y=cy+sin(a).toFloat()*rr;if(i==0)p.moveTo(x,y)else p.lineTo(x,y)};p.close();drawPath(p,if(n=="Star2")Color(0xFF4EA8DE).copy(alpha=alpha)else Color(0xFF7866DC).copy(alpha=alpha))}}}}
+private fun DrawScope.drawStamp(r:Rect,e:Element,ownerKey:String=""){val n=if(e.stampDecoration.kind==DecorationKind.DecorationPack)e.stampDecoration.basedOnBuiltin.ifBlank{"Star1"}else e.stampDecoration.builtinName;val alpha=e.opacity.coerceIn(0f,1f);rotate(e.rotationDegrees,pivot=r.center){when(n){SELF_IDENTICON_STAMP->drawIdenticonStamp(r,ownerKey,alpha);"Dot1"->drawOval(Color(0xFF7866DC).copy(alpha=alpha),r.topLeft,r.size);"Moon1"->{val outer=Path().apply{addOval(r)};val cut=Path().apply{addOval(Rect(r.left+r.width*.34f,r.top-r.height*.08f,r.right+r.width*.10f,r.bottom-r.height*.08f))};drawPath(Path.combine(PathOperation.Difference,outer,cut),Color(0xFFF6D36B).copy(alpha=alpha))};else->{val p=Path();val cx=r.center.x;val cy=r.center.y;val ro=min(r.width,r.height)*.48f;val ri=ro*.43f;repeat(10){i->val a=-PI/2+i*PI/5;val rr=if(i%2==0)ro else ri;val x=cx+cos(a).toFloat()*rr;val y=cy+sin(a).toFloat()*rr;if(i==0)p.moveTo(x,y)else p.lineTo(x,y)};p.close();drawPath(p,if(n=="Star2")Color(0xFF4EA8DE).copy(alpha=alpha)else Color(0xFF7866DC).copy(alpha=alpha))}}}}
 private fun DrawScope.drawTextWrapped(text:String,r:Rect,e:Element,color:Int=e.textArgb,align:Layout.Alignment?=null){
     drawIntoCanvas { canvas ->
         val paint = TextPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
@@ -1141,6 +1149,41 @@ private fun DrawScope.drawTextWrapped(text:String,r:Rect,e:Element,color:Int=e.t
     }
 }
 
+/**
+ * Stamp name for the profile owner's own identicon.
+ *
+ * Resolved at draw time from whoever owns the document being viewed, never stored. That is
+ * what makes it behave correctly on a clone: the copy renders the new owner's mark, because
+ * nothing about the original owner was ever written into the page.
+ */
+const val SELF_IDENTICON_STAMP = "SelfMark"
+
+/**
+ * Draws the key-derived identicon inside the stamp's rect. With no key — the element picker
+ * preview, or a document whose owner is unknown — it falls back to a hatched placeholder so
+ * the slot is visible rather than silently empty.
+ */
+private fun DrawScope.drawIdenticonStamp(r:Rect,ownerKey:String,alpha:Float){
+    if(ownerKey.isBlank()){
+        drawRect(Color(0xFFBFC5D2).copy(alpha=alpha*.5f),r.topLeft,r.size)
+        drawLine(Color(0xFF8B93A3).copy(alpha=alpha),r.topLeft,Offset(r.right,r.bottom),strokeWidth=2f)
+        drawLine(Color(0xFF8B93A3).copy(alpha=alpha),Offset(r.right,r.top),Offset(r.left,r.bottom),strokeWidth=2f)
+        return
+    }
+    val spec=identiconFor(ownerKey)
+    val grid=5
+    val cell=min(r.width,r.height)/grid
+    val originX=r.left+(r.width-cell*grid)/2f
+    val originY=r.top+(r.height-cell*grid)/2f
+    drawRect(spec.background.copy(alpha=alpha),Offset(originX,originY),Size(cell*grid,cell*grid))
+    for(row in 0 until grid){
+        for(col in 0 until grid){
+            if(!spec.cells[row*grid+col])continue
+            drawRect(spec.fill.copy(alpha=alpha),Offset(originX+col*cell,originY+row*cell),Size(cell,cell))
+        }
+    }
+}
+
 internal fun DrawScope.drawElement(
     e:Element,
     parent:Rect,
@@ -1149,7 +1192,8 @@ internal fun DrawScope.drawElement(
     strings:RenderStrings,
     inlineEditingId:String?=null,
     widgetLookup:(Element)->WidgetProgram? = { null },
-    imageLookup:(Element)->ImageBitmap? = { null }
+    imageLookup:(Element)->ImageBitmap? = { null },
+    ownerKey:String = ""
 ){
     if(!e.rect.visible)return
     val r=childRect(parent,e.rect)
@@ -1157,9 +1201,9 @@ internal fun DrawScope.drawElement(
         ElementType.Block->{
             drawBackground(r,e.background)
             drawBorderSpec(r,e.border,e.borderThickness)
-            e.children.sortedBy{it.rect.zIndex}.forEach{drawElement(it,r,if(selectChildren)selectedId else "",selectChildren,strings,inlineEditingId,widgetLookup,imageLookup)}
+            e.children.sortedBy{it.rect.zIndex}.forEach{drawElement(it,r,if(selectChildren)selectedId else "",selectChildren,strings,inlineEditingId,widgetLookup,imageLookup,ownerKey)}
         }
-        ElementType.Stamp->drawStamp(r,e)
+        ElementType.Stamp->drawStamp(r,e,ownerKey)
         ElementType.Text-> if(e.id != inlineEditingId) drawTextWrapped(e.text,r,e)
         ElementType.Link-> drawTextWrapped(
             e.label,r,e.copy(fontSize=16f,textAlign=TextAlignMode.Center),
@@ -1907,16 +1951,17 @@ private fun BlockAppearance(state:EditorState,e:Element){
 
 @Composable
 private fun StampAppearance(state:EditorState,e:Element){
-    val stampIds=listOf("Star1","Star2","Moon1","Dot1")
+    val stampIds=listOf("Star1","Star2","Moon1","Dot1",SELF_IDENTICON_STAMP)
     val labels=listOf(
         stringResource(R.string.builtin_star1),stringResource(R.string.builtin_star2),
         stringResource(R.string.builtin_moon1),stringResource(R.string.builtin_dot1),
+        stringResource(R.string.builtin_self_mark),
         stringResource(R.string.custom_fallback_star)
     )
-    val currentIndex=if(e.stampDecoration.kind==DecorationKind.DecorationPack)4 else stampIds.indexOf(e.stampDecoration.builtinName).coerceAtLeast(0)
+    val currentIndex=if(e.stampDecoration.kind==DecorationKind.DecorationPack)5 else stampIds.indexOf(e.stampDecoration.builtinName).coerceAtLeast(0)
     Choice(stringResource(R.string.stamp),labels[currentIndex],labels){idx->
         state.editSelected{x->
-            x.stampDecoration=if(idx==4)DecorationRef(DecorationKind.DecorationPack,"","VLD0:future-decoration-pack",2,"future-hash","Star1")
+            x.stampDecoration=if(idx==5)DecorationRef(DecorationKind.DecorationPack,"","VLD0:future-decoration-pack",2,"future-hash","Star1")
             else DecorationRef(builtinName=stampIds[idx],basedOnBuiltin=stampIds[idx])
             state.refreshAutoName(x)
         }

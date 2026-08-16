@@ -54,6 +54,8 @@ fun PageCanvas(
     modifier: Modifier = Modifier,
     widgetLookup: (Element) -> WidgetProgram? = { null },
     imageLookup: (Element) -> ImageBitmap? = { null },
+    /** Whose page this is. A "your mark" stamp resolves against it at draw time. */
+    ownerKey: String = "",
 ) {
     val strings = RenderStrings(
         mediaKinds = listOf(
@@ -76,7 +78,8 @@ fun PageCanvas(
                 strings = strings,
                 inlineEditingId = null,
                 widgetLookup = widgetLookup,
-                imageLookup = imageLookup
+                imageLookup = imageLookup,
+                ownerKey = ownerKey
             )
         }
     }
@@ -143,6 +146,7 @@ fun ProfileViewerScreen(
                         page,
                         Modifier.fillMaxWidth().height(canvasHeight),
                         imageLookup = loader::lookup,
+                        ownerKey = profile.mainDht,
                     )
                 }
                 PageRail(
