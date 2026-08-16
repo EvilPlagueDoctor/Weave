@@ -25,7 +25,7 @@ fun VeilyApp() {
     val state = remember { EditorState(context) }
     val controller = remember { SocialNetworkController(context) }
     val onboarding = remember { OnboardingState(context) }
-    val commentStore: CommentStore = remember { LocalCommentStore(context) }
+    val commentStore: CommentStore = controller.comments
     val followStore = remember { FollowStore(context) }
     val remoteCache = remember { RemoteProfileCache() }
     val media = remember { LocalMediaStore(context) }
@@ -145,7 +145,11 @@ private fun VeilyShell(
                     onSettings = { nav.push(Destination.Settings) },
                 )
 
-                Destination.Activity -> ActivityScreen(store = commentStore, ownMainDht = ui.mainDht)
+                Destination.Activity -> ActivityScreen(
+                    store = commentStore,
+                    ownMainDht = ui.mainDht,
+                    onKeep = { id -> controller.keepComment(id) },
+                )
 
                 Destination.Settings -> SettingsScreen(
                     controller = controller,
@@ -224,6 +228,8 @@ private fun ProfileDestination(
             loader = mediaLoader,
             commentStore = commentStore,
             openComments = true,
+            onPostComment = { pageKey, body, openMode -> controller.postComment(pageKey, body, openMode) },
+            onSyncComments = { pageKey -> controller.syncComments(mainDht, pageKey) },
             isFollowing = following,
             onToggleFollow = { following = followStore.toggle(mainDht) },
             onPrevProfile = if (position > 0) ({ onNavigate(queue[position - 1]) }) else null,

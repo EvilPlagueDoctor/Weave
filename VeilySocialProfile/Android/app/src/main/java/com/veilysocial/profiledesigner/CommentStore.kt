@@ -95,12 +95,31 @@ interface CommentStore {
     fun awaitingApproval(authorKey: String): List<Comment>
     /** Comments the local user has hidden for themselves. Hidden for you, still visible to others. */
     fun hideForMe(id: String)
+
+    /**
+     * Inserts or updates a comment that came from the network, keyed on its id so a comment
+     * fetched twice does not appear twice. A locally dropped comment stays dropped.
+     */
+    fun upsert(comment: Comment)
+
+    /** Everything on a page regardless of state, for reconciling against a fetch. */
+    fun allForPage(pageKey: String): List<Comment>
+
+    /** Where the pointer for a comment lives, so the owner can add it to their index. */
+    fun rememberPointer(id: String, recordKey: String, subkey: Int)
+
+    fun pointerFor(id: String): Pair<String, Int>?
+
+    fun byId(id: String): Comment?
 }
 
 class LocalCommentStore(context: Context) : CommentStore {
     private val file = File(context.filesDir, "comments.json")
     private val items = mutableListOf<Comment>()
     private val hiddenLocally = mutableSetOf<String>()
+
+    /** comment id -> (record key, subkey). Needed to build an index entry when keeping one. */
+    private val pointers = mutableMapOf<String, Pair<String, Int>>()
 
     init {
         runCatching {
@@ -110,15 +129,25 @@ class LocalCommentStore(context: Context) : CommentStore {
                 for (i in 0 until arr.length()) items.add(Comment.fromJson(arr.getJSONObject(i)))
                 val hidden = root.optJSONArray("hidden") ?: JSONArray()
                 for (i in 0 until hidden.length()) hiddenLocally.add(hidden.getString(i))
+                val saved = root.optJSONObject("pointers") ?: JSONObject()
+                saved.keys().forEach { key ->
+                    val entry = saved.optJSONObject(key) ?: return@forEach
+                    pointers[key] = entry.optString("store") to entry.optInt("i")
+                }
             }
         }
     }
 
     private fun persist() {
         runCatching {
+            val savedPointers = JSONObject()
+            pointers.forEach { (id, location) ->
+                savedPointers.put(id, JSONObject().put("store", location.first).put("i", location.second))
+            }
             val root = JSONObject()
                 .put("comments", JSONArray(items.map { it.toJson() }))
                 .put("hidden", JSONArray(hiddenLocally.toList()))
+                .put("pointers", savedPointers)
             file.writeText(root.toString())
         }
     }
@@ -179,6 +208,35 @@ class LocalCommentStore(context: Context) : CommentStore {
         hiddenLocally.add(id)
         persist()
     }
+
+    override fun upsert(comment: Comment) {
+        val index = items.indexOfFirst { it.id == comment.id }
+        if (index < 0) {
+            items.add(comment)
+        } else {
+            val existing = items[index]
+            // A local decision outranks anything the network says about the same comment:
+            // dropping something and having it reappear on the next sync would make
+            // moderation feel broken.
+            if (existing.state == CommentState.Dropped) return
+            items[index] = comment.copy(
+                state = if (existing.state == CommentState.Accepted) CommentState.Accepted else comment.state
+            )
+        }
+        persist()
+    }
+
+    override fun allForPage(pageKey: String): List<Comment> =
+        items.filter { it.pageKey == pageKey }.sortedBy { it.createdAt }
+
+    override fun rememberPointer(id: String, recordKey: String, subkey: Int) {
+        pointers[id] = recordKey to subkey
+        persist()
+    }
+
+    override fun pointerFor(id: String): Pair<String, Int>? = pointers[id]
+
+    override fun byId(id: String): Comment? = items.firstOrNull { it.id == id }
 }
 
 /**

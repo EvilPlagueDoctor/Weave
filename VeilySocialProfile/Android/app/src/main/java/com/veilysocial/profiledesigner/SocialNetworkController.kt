@@ -12,6 +12,12 @@ import java.security.MessageDigest
 
 private const val PROFILE_STORE_NAME = "veilysocial-profile-page-v1"
 private const val PROFILE_SUBKEY = 0
+
+/** How often to sweep the mailbox for notices that arrived while the app was closed. */
+private const val INBOX_DRAIN_MS = 60_000L
+
+/** Messages handled per sweep, so a large backlog cannot stall the worker loop. */
+private const val INBOX_DRAIN_LIMIT = 50
 private const val PEER_REFRESH_MS = 20_000L
 private const val GOSSIP_INTERVAL_MS = 12_000L
 private const val PROFILE_MAX_BYTES = 4 * 1024 * 1024
@@ -49,6 +55,10 @@ class SocialNetworkController(context: Context) {
     private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val prefs = appContext.getSharedPreferences("veilysocial_profile_discovery", Context.MODE_PRIVATE)
+
+    /** Local read model for comments. Owned here so the sync path and the UI share one instance. */
+    val comments: CommentStore = LocalCommentStore(appContext)
+    private var commentNetwork: CommentNetwork? = null
     private val _ui = MutableStateFlow(
         SocialUiState(
             discoveryDescription = prefs.getString("description", "") ?: "",
@@ -91,19 +101,30 @@ class SocialNetworkController(context: Context) {
                 subscribeMessages()
                 refreshPeers()
                 updateSnapshots()
+                // Startup is done. Without this the status stayed on "preparing profile-page
+                // DHT" forever, on healthy and broken nodes alike, which made a genuine
+                // outage indistinguishable from normal operation.
+                setStatusQuiet(healthLine())
+
+                drainInbox(force = true)
 
                 var lastPeerRefresh = 0L
                 var lastGossip = 0L
+                var lastInboxDrain = System.currentTimeMillis()
                 while (isActive) {
                     val nowMs = System.currentTimeMillis()
                     if (nowMs - lastPeerRefresh >= PEER_REFRESH_MS) {
                         refreshPeers(); lastPeerRefresh = nowMs
+                    }
+                    if (nowMs - lastInboxDrain >= INBOX_DRAIN_MS) {
+                        drainInbox(force = false); lastInboxDrain = nowMs
                     }
                     if (nowMs - lastGossip >= GOSSIP_INTERVAL_MS) {
                         gossipSummary(); lastGossip = nowMs
                     }
                     activeIntent?.let(::runLocalSearch)
                     updateSnapshots()
+                    setStatusQuiet(healthLine())
                     delay(1000)
                 }
             } catch (t: Throwable) {
@@ -330,9 +351,18 @@ class SocialNetworkController(context: Context) {
         if (found == null) found = d.createStore(PROFILE_STORE_NAME, 4).getJSONObject("store")
         profileStoreId = found.getString("store_id")
         val root = found.getString("record_key")
+        // The app root stays the profile store. Everything else, including the comment index,
+        // is reached through subkeys of that record rather than by claiming the root.
         d.registerAppRoot(root)
         _ui.value = _ui.value.copy(profileRoot = root)
         log("profile store ready: $root")
+
+        runCatching {
+            val network = CommentNetwork(d).also { commentNetwork = it }
+            network.ensureStores()
+            network.publishIndexPointer(found.getString("store_id"))
+            log("comment chains ready")
+        }.onFailure { log("comment chains unavailable: ${it.message}") }
     }
 
     private fun readOwnRecord() {
@@ -365,9 +395,16 @@ class SocialNetworkController(context: Context) {
     }
 
     private suspend fun processIncoming(event: JSONObject) {
-        if (event.optString("delivery_kind") != "gossip") return
         val payload = runCatching { Base64.decode(event.getString("payload_base64"), Base64.DEFAULT) }.getOrNull() ?: return
         val source = event.optString("sender_main_dht")
+
+        // Direct and mailbox deliveries authenticate the sender; gossip only claims one.
+        // Comment notices are accepted from the former and ignored from the latter, so a
+        // stranger cannot spoof a comment into someone else's moderation queue.
+        if (event.optString("delivery_kind") != "gossip") {
+            CommentNotice.fromBytes(payload)?.let { notice -> receiveCommentNotice(notice, source) }
+            return
+        }
         val message = runCatching { GossipMessage.decode(payload) }.getOrNull() ?: return
         gossipReceived++
         when (message) {
@@ -493,6 +530,7 @@ class SocialNetworkController(context: Context) {
                     .append(" rotating_samples=").append(cluster.samples.size).append('\n')
             }
         }
+        if (knownPeers.isNotEmpty()) lastPeerSeenMs = System.currentTimeMillis()
         _ui.value = _ui.value.copy(recent = recent, peers = knownPeers.size, verified = verified, gossipSent = gossipSent, gossipReceived = gossipReceived, clusterText = clusterText)
     }
 
@@ -507,7 +545,218 @@ class SocialNetworkController(context: Context) {
         prefs.edit().putString("description", state.discoveryDescription).putString("features", state.featuresText).apply()
     }
 
+    private companion object Health {
+        /** How long with no peers before the status says something is wrong rather than "looking". */
+        const val STALE_PEERS_AFTER_SECONDS = 300L
+    }
+
+    // ---------------------------------------------------------------------
+    // Comments
+    // ---------------------------------------------------------------------
+
+    /**
+     * Writes a comment to this device's own chain and tells the page owner about it.
+     *
+     * The comment is stored locally straight away so the UI shows it immediately. What state
+     * it lands in depends on who owns the page: your own page accepts your own words, and
+     * anyone else's starts unaccepted until they keep it.
+     */
+    fun postComment(pageKey: String, body: String, openMode: Boolean) = scope.launch {
+        val network = commentNetwork
+        val me = _ui.value.mainDht
+        if (network == null || me.isBlank()) {
+            log("comment not posted: comment chains are not ready")
+            return@launch
+        }
+        val owner = ownerKeyOf(pageKey)
+        val wire = WireComment(
+            id = makeId("comment"),
+            pageKey = pageKey,
+            authorKey = me,
+            authorName = _ui.value.discoveryName.ifBlank { "Someone" },
+            body = body.trim().take(MAX_COMMENT_CHARS),
+            createdAt = System.currentTimeMillis(),
+        )
+        val state = triageComment(wire.body, me, owner, comments.allForPage(pageKey), openMode)
+        runCatching {
+            val pointer = network.post(wire, owner, notify = true)
+            comments.rememberPointer(wire.id, pointer.recordKey, pointer.subkey)
+            comments.upsert(
+                wire.toComment(
+                    state = state,
+                    origin = if (openMode) CommentOrigin.Open else CommentOrigin.Direct,
+                    expiresAt = if (openMode && state == CommentState.Provisional) {
+                        System.currentTimeMillis() + OPEN_COMMENT_TTL_MS
+                    } else 0L,
+                )
+            )
+            // Commenting on your own page keeps it in one step, so it is visible to readers
+            // without a second trip through the moderation queue.
+            if (owner == me && state == CommentState.Accepted) {
+                network.keep(IndexEntry(pageKey, pointer, me, wire.id))
+            }
+            log("comment posted to ${short(owner)} (${state.name.lowercase()})")
+        }.onFailure { log("comment post failed: ${it.message}") }
+    }
+
+    /** Publishes a pointer to a comment in this device's index, making it visible to readers. */
+    fun keepComment(id: String) = scope.launch {
+        val network = commentNetwork ?: return@launch
+        val comment = comments.byId(id) ?: return@launch
+        val pointer = comments.pointerFor(id)
+        if (pointer == null) {
+            log("cannot keep ${short(id)}: no pointer recorded for it")
+            return@launch
+        }
+        runCatching {
+            network.keep(
+                IndexEntry(comment.pageKey, CommentChain.Pointer(pointer.first, pointer.second), comment.authorKey, id)
+            )
+            comments.setState(id, CommentState.Accepted)
+            log("comment kept on ${comment.pageKey.substringAfter('#')}")
+        }.onFailure { log("keeping the comment failed: ${it.message}") }
+    }
+
+    /** Pulls the comments a page owner has kept and merges them into the local store. */
+    fun syncComments(ownerMainDht: String, pageKey: String) = scope.launch {
+        val network = commentNetwork ?: return@launch
+        val root = fullRecords[ownerMainDht]?.profileRootDht?.takeIf { it.isNotBlank() } ?: return@launch
+        runCatching {
+            val fetched = network.fetchKept(root, pageKey)
+            fetched.forEach { wire ->
+                comments.upsert(wire.toComment(CommentState.Accepted, CommentOrigin.Direct))
+            }
+            if (fetched.isNotEmpty()) log("synced ${fetched.size} comment(s) for ${short(ownerMainDht)}")
+        }.onFailure { log("comment sync failed: ${it.message}") }
+    }
+
+    /**
+     * Reads messages that arrived while this app was not subscribed.
+     *
+     * The live [subscribeMessages] stream only carries what turns up while the app is open,
+     * so without this a comment posted while the phone was in a pocket is delivered to the
+     * mailbox and never seen.
+     *
+     * [force] asks the daemon to check the mailbox immediately rather than on its own
+     * schedule; used once at startup, since that is when the backlog is largest.
+     */
+    private fun drainInbox(force: Boolean) {
+        val d = daemon ?: return
+        runCatching {
+            if (force) runCatching { d.triggerMessageRetrieval() }
+            val listed = d.listInbox().optJSONArray("messages") ?: return@runCatching
+            var handled = 0
+            var skipped = 0
+            for (i in 0 until listed.length()) {
+                if (handled >= INBOX_DRAIN_LIMIT) break
+                val summary = listed.optJSONObject(i) ?: continue
+                val id = summary.optString("message_id_hex")
+                if (id.isBlank()) continue
+
+                val message = runCatching { d.readInbox(id).optJSONObject("message") }.getOrNull() ?: continue
+                val payload = runCatching {
+                    Base64.decode(message.optString("payload_base64"), Base64.DEFAULT)
+                }.getOrNull() ?: continue
+                val sender = message.optString("sender_main_dht")
+
+                val notice = CommentNotice.fromBytes(payload)
+                if (notice == null) {
+                    // Not ours. The inbox belongs to the identity rather than to this app, so
+                    // deleting something we cannot parse could destroy another app's mail.
+                    skipped++
+                    continue
+                }
+                receiveCommentNotice(notice, sender)
+                runCatching { d.deleteInbox(id) }
+                handled++
+            }
+            if (handled > 0 || skipped > 0) {
+                log("inbox: handled $handled comment notice(s), left $skipped message(s) for other apps")
+            }
+        }.onFailure { log("inbox drain failed: ${it.message}") }
+    }
+
+    /**
+     * Handles a notice that someone commented on one of this device's pages. The notice only
+     * carries a pointer, so the body is fetched from the commenter's own record.
+     */
+    private fun receiveCommentNotice(notice: CommentNotice, sender: String) {
+        val network = commentNetwork ?: return
+        val me = _ui.value.mainDht
+        if (ownerKeyOf(notice.pageKey) != me) {
+            log("ignored a comment notice for someone else's page")
+            return
+        }
+        val wire = network.fetchOne(notice.pointer)
+        if (wire == null) {
+            log("comment notice from ${short(sender)} pointed at nothing readable")
+            return
+        }
+        // The pointer is in the sender's own record, so the sender must be the author.
+        if (wire.authorKey.isNotBlank() && wire.authorKey != sender) {
+            log("comment notice from ${short(sender)} claims a different author; ignored")
+            return
+        }
+        if (wire.pageKey != notice.pageKey) {
+            log("comment notice page does not match the stored comment; ignored")
+            return
+        }
+        comments.rememberPointer(wire.id, notice.pointer.recordKey, notice.pointer.subkey)
+        val state = triageComment(wire.body, wire.authorKey, me, comments.allForPage(wire.pageKey), openMode = false)
+        comments.upsert(wire.toComment(state, CommentOrigin.Direct))
+        log("comment received from ${short(sender)} (${state.name.lowercase()})")
+    }
+
     private fun updateStatus(status: String) { _ui.value = _ui.value.copy(status = status); log(status) }
+
+    /**
+     * Sets the status without writing a log line, for the once-per-second health text.
+     * Skips the write entirely when nothing changed so the flow does not churn.
+     */
+    private fun setStatusQuiet(status: String) {
+        if (_ui.value.status == status) return
+        _ui.value = _ui.value.copy(status = status)
+    }
+
+    /**
+     * One line describing what the network is actually doing.
+     *
+     * Peers going to zero and staying there is what an offline node looks like from here —
+     * the daemon keeps answering, so "connected" alone is misleading.
+     */
+    private fun healthLine(): String {
+        val state = _ui.value
+        val since = if (lastPeerSeenMs == 0L) 0L else (System.currentTimeMillis() - lastPeerSeenMs) / 1000
+        return when {
+            state.peers > 0 -> "Connected \u00B7 ${state.peers} peer${if (state.peers == 1) "" else "s"}"
+            lastPeerSeenMs == 0L -> "Connected \u00B7 looking for peers"
+            since >= STALE_PEERS_AFTER_SECONDS ->
+                "No peers for ${since / 60} min \u00B7 the daemon may have lost its network connection"
+            else -> "Connected \u00B7 looking for peers"
+        }
+    }
+
+    /** Everything the app knows, for the Copy Log button. */
+    fun diagnosticReport(): String {
+        val state = _ui.value
+        return buildString {
+            appendLine("VeilySocial diagnostic report")
+            appendLine("generated: ${nowSeconds()}")
+            appendLine("app id: ${DaemonClient.APP_ID}")
+            appendLine("main dht: ${state.mainDht.ifBlank { "(none)" }}")
+            appendLine("profile root: ${state.profileRoot.ifBlank { "(not published)" }}")
+            appendLine("status: ${state.status}")
+            appendLine("peers: ${state.peers}  verified: ${state.verified}  hints: ${state.recent.size}")
+            appendLine("last peer seen: ${if (lastPeerSeenMs == 0L) "never" else "${(System.currentTimeMillis() - lastPeerSeenMs) / 1000}s ago"}")
+            appendLine("publishing: ${state.publishing}")
+            appendLine()
+            appendLine("--- log ---")
+            append(state.debugLog)
+        }
+    }
+    /** Wall-clock of the last snapshot that saw at least one peer. Zero means never. */
+    private var lastPeerSeenMs = 0L
+
     private fun log(message: String) {
         val line = "[${nowSeconds()}] $message"
         val old = _ui.value.debugLog
@@ -525,5 +774,5 @@ private fun deterministicPeerSample(peers: List<String>, seed: Long, limit: Int)
 
 private fun sha256Hex(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it.toInt() and 0xff) }
 private fun nowSeconds(): Long = System.currentTimeMillis() / 1000
-private fun short(value: String): String = if (value.length <= 18) value else value.take(9) + "…" + value.takeLast(6)
+internal fun short(value: String): String = if (value.length <= 18) value else value.take(9) + "…" + value.takeLast(6)
 private fun JSONObject.stringOrNull(key: String): String? = if (has(key) && !isNull(key)) getString(key).takeIf { it.isNotBlank() } else null

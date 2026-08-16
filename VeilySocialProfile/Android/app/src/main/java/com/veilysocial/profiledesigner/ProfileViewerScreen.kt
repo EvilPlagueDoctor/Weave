@@ -96,6 +96,8 @@ fun ProfileViewerScreen(
     loader: MediaLoader,
     commentStore: CommentStore,
     openComments: Boolean,
+    onPostComment: (pageKey: String, body: String, openMode: Boolean) -> Unit,
+    onSyncComments: (pageKey: String) -> Unit,
     isFollowing: Boolean,
     onToggleFollow: () -> Unit,
     onPrevProfile: (() -> Unit)?,
@@ -113,6 +115,7 @@ fun ProfileViewerScreen(
     // already swiped past is dropped before it reaches the daemon.
     LaunchedEffect(profile.mainDht, pageIndex) {
         loader.setWanted(page.imageHashesOnPage())
+        onSyncComments(pageKeyOf(profile.mainDht, page.id))
     }
 
     Column(Modifier.fillMaxSize()) {
@@ -160,6 +163,7 @@ fun ProfileViewerScreen(
                     pageKey = pageKeyOf(profile.mainDht, page.id),
                     pageOwnerKey = profile.mainDht,
                     store = commentStore,
+                    onPost = onPostComment,
                     ownKey = ownKey,
                     ownName = ownName,
                     openMode = openComments,
@@ -256,6 +260,7 @@ fun CommentsSection(
     ownKey: String,
     ownName: String,
     openMode: Boolean,
+    onPost: (pageKey: String, body: String, openMode: Boolean) -> Unit,
     onPosted: () -> Unit,
 ) {
     var revision by remember(pageKey) { mutableIntStateOf(0) }
@@ -361,15 +366,9 @@ fun CommentsSection(
         Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.End) {
             Button(
                 onClick = {
-                    val state = triageComment(draft, ownKey, pageOwnerKey, store.forPage(pageKey), openMode)
-                    val expiresAt =
-                        if (openMode && state == CommentState.Provisional) System.currentTimeMillis() + OPEN_COMMENT_TTL_MS
-                        else 0L
-                    store.add(
-                        pageKey, ownKey, ownName, draft, state,
-                        if (openMode) CommentOrigin.Open else CommentOrigin.Direct,
-                        expiresAt,
-                    )
+                    // Posting goes through the controller: it writes to this device's own
+                    // comment record, notifies the page owner, and updates the local store.
+                    onPost(pageKey, draft, openMode)
                     draft = ""
                     revision++
                     onPosted()

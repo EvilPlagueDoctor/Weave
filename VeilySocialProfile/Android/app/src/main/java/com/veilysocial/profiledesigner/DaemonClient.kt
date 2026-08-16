@@ -219,6 +219,42 @@ class DaemonClient(private val context: Context) {
     fun readPublicStore(recordKey: String, locations: List<Int>, force: Boolean = true): JSONObject = rawRequest("read_public_store") {
         put("record_key", recordKey); put("locations", JSONArray(locations)); put("force_refresh", force)
     }
+    /**
+     * Sends an application message. The daemon tries a live direct route first and falls back
+     * to persistent mailbox delivery, so the caller does not care whether the recipient is
+     * online. Unlike [sendGossip] the sender is authenticated end to end.
+     *
+     * Payloads are capped at 8 KiB by the daemon, so this carries pointers, not content.
+     */
+    fun sendMessage(
+        recipientMainDht: String,
+        payload: ByteArray,
+        conversationIdHex: String? = null,
+        preferDirect: Boolean = true,
+    ): JSONObject = rawRequest("send_message") {
+        put("recipient_main_dht", recipientMainDht)
+        put("payload_base64", Base64.encodeToString(payload, Base64.NO_WRAP))
+        conversationIdHex?.let { put("conversation_id_hex", it) }
+        put("prefer_direct", preferDirect)
+    }
+
+    /** Messages that arrived while this app was not subscribed. Summaries only. */
+    fun listInbox(): JSONObject = rawRequest("list_inbox")
+
+    /** Full message including its payload. */
+    fun readInbox(messageIdHex: String): JSONObject = rawRequest("read_inbox") {
+        put("message_id_hex", messageIdHex)
+    }
+
+    fun deleteInbox(messageIdHex: String): JSONObject = rawRequest("delete_inbox") {
+        put("message_id_hex", messageIdHex)
+    }
+
+    /** Asks the daemon to check the mailbox now rather than on its own schedule. */
+    fun triggerMessageRetrieval(): JSONObject = rawRequest("trigger_message_retrieval")
+
+    fun getMailboxStatus(): JSONObject = rawRequest("get_mailbox_status")
+
     fun sendGossip(peerMainDht: String, payload: ByteArray): JSONObject = rawRequest("send_gossip") {
         put("recipient_main_dht", peerMainDht)
         put("payload_base64", Base64.encodeToString(payload, Base64.NO_WRAP))

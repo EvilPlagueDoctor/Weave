@@ -1,5 +1,7 @@
 package com.veilysocial.profiledesigner
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -14,8 +16,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /** Remembers whether setup has been completed, so first run happens exactly once. */
@@ -398,6 +402,7 @@ fun MeScreen(
                     pageKey = pageKeyOf(ownKey, shownPage.id),
                     pageOwnerKey = ownKey,
                     store = commentStore,
+                    onPost = { key, body, open -> controller.postComment(key, body, open) },
                     ownKey = ownKey,
                     ownName = state.doc.profileName,
                     openMode = true,
@@ -463,6 +468,16 @@ fun SettingsScreen(
 ) {
     val ui by controller.ui.collectAsState()
     val scroll = rememberScrollState()
+    val context = LocalContext.current
+    val clipboard = remember(context) {
+        context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+    }
+    var copied by remember { mutableStateOf(false) }
+    // Reset the confirmation shortly after it appears, so a stale "Copied" does not imply
+    // the clipboard still holds a report from ten minutes ago.
+    LaunchedEffect(copied) {
+        if (copied) { delay(2500); copied = false }
+    }
 
     Column(Modifier.fillMaxSize()) {
         Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 2.dp) {
@@ -521,6 +536,37 @@ fun SettingsScreen(
                 label = { Text("Interests, comma separated") },
                 minLines = 2,
             )
+            HorizontalDivider(Modifier.padding(vertical = 16.dp))
+            Text("Diagnostics", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+            Text(
+                "Copies this app's own log, plus what it currently knows about the network, to the clipboard. It contains your profile keys, which are public, and nothing else identifying.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp)
+            )
+            Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = {
+                    clipboard.setPrimaryClip(
+                        ClipData.newPlainText("VeilySocial diagnostics", controller.diagnosticReport())
+                    )
+                    copied = true
+                }) { Text("Copy log") }
+                if (copied) {
+                    Text(
+                        "Copied",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.align(Alignment.CenterVertically)
+                    )
+                }
+            }
+            Text(
+                "The daemon keeps its own, more detailed log. If something is wrong with the network rather than the app, that one is the useful one.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 8.dp)
+            )
+
             Spacer(Modifier.height(32.dp))
         }
     }

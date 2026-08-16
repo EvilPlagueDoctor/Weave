@@ -208,7 +208,7 @@ fun SearchScreen(controller: SocialNetworkController, onOpen: (String) -> Unit) 
  * inbox, which is the thing this app deliberately does not have.
  */
 @Composable
-fun ActivityScreen(store: CommentStore, ownMainDht: String) {
+fun ActivityScreen(store: CommentStore, ownMainDht: String, onKeep: (String) -> Unit) {
     var revision by remember { mutableIntStateOf(0) }
     val held = remember(revision, ownMainDht) { store.quarantined(ownMainDht) }
 
@@ -259,7 +259,7 @@ fun ActivityScreen(store: CommentStore, ownMainDht: String) {
                         Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.End) {
                             TextButton(onClick = { store.setState(comment.id, CommentState.Dropped); revision++ }) { Text("Drop") }
                             Spacer(Modifier.width(8.dp))
-                            Button(onClick = { store.setState(comment.id, CommentState.Accepted); revision++ }) { Text("Keep") }
+                            Button(onClick = { onKeep(comment.id); revision++ }) { Text("Keep") }
                         }
                     }
                     HorizontalDivider()
