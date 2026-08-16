@@ -22,6 +22,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import com.veilysocial.profiledesigner.backbone.CommentPolicy
 
 /**
  * How long an open-mode comment survives if the page owner never keeps it. Matches the
@@ -29,6 +30,18 @@ import kotlinx.coroutines.launch
  * the request that carried the comment.
  */
 const val OPEN_COMMENT_TTL_MS = 15L * 60L * 1000L
+
+/**
+ * Short label describing where a comment is in its journey, or null when it is simply
+ * published and needs no explanation.
+ */
+fun commentStatusLabel(comment: Comment): String? = when (comment.state) {
+    CommentState.Sending -> "Sending"
+    CommentState.Failed -> "Not sent - tap to retry"
+    CommentState.Provisional -> "Sent, waiting to be kept"
+    CommentState.Held -> "Sent, waiting to be kept"
+    CommentState.Accepted, CommentState.Dropped -> null
+}
 
 /** Image hashes referenced by a single page. */
 fun Page.imageHashesOnPage(): Set<String> = buildSet {
@@ -96,6 +109,8 @@ fun ProfileViewerScreen(
     loader: MediaLoader,
     commentStore: CommentStore,
     openComments: Boolean,
+    commentPolicy: CommentPolicy,
+    commentRevision: Long,
     onPostComment: (pageKey: String, body: String, openMode: Boolean) -> Unit,
     onSyncComments: (pageKey: String) -> Unit,
     isFollowing: Boolean,
@@ -163,6 +178,8 @@ fun ProfileViewerScreen(
                     pageKey = pageKeyOf(profile.mainDht, page.id),
                     pageOwnerKey = profile.mainDht,
                     store = commentStore,
+                    policy = commentPolicy,
+                    externalRevision = commentRevision,
                     onPost = onPostComment,
                     ownKey = ownKey,
                     ownName = ownName,
@@ -260,15 +277,18 @@ fun CommentsSection(
     ownKey: String,
     ownName: String,
     openMode: Boolean,
+    policy: CommentPolicy,
+    /** Bumped by the controller whenever the local store changes, including from the network. */
+    externalRevision: Long,
     onPost: (pageKey: String, body: String, openMode: Boolean) -> Unit,
     onPosted: () -> Unit,
 ) {
     var revision by remember(pageKey) { mutableIntStateOf(0) }
     var draft by remember(pageKey) { mutableStateOf("") }
-    val comments = remember(pageKey, revision) { store.forPage(pageKey) }
+    val comments = remember(pageKey, revision, externalRevision) { store.forPage(pageKey) }
     // Your own comments that this page's owner hasn't released yet. Shown to you only so
     // the post button doesn't look broken — the decision is not yours to make.
-    val myPending = remember(pageKey, revision) {
+    val myPending = remember(pageKey, revision, externalRevision) {
         store.awaitingApproval(ownKey).filter { it.pageKey == pageKey }
     }
 
@@ -280,8 +300,11 @@ fun CommentsSection(
             fontWeight = FontWeight.Bold
         )
         Text(
-            if (openMode) "Comments are public, attach to this page, and stay until the owner keeps them."
-            else "Comments are public and attach to this page.",
+            when (policy) {
+                CommentPolicy.Closed -> "This profile has comments turned off."
+                CommentPolicy.Moderated -> "Comments are public and attach to this page. The owner reviews them before they appear for everyone."
+                CommentPolicy.Open -> "Comments are public and attach to this page."
+            },
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(top = 2.dp, bottom = 10.dp)
@@ -304,14 +327,18 @@ fun CommentsSection(
                 Column(Modifier.weight(1f)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(comment.authorName, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
-                        if (comment.state == CommentState.Provisional) {
+                        commentStatusLabel(comment)?.let { label ->
                             Spacer(Modifier.width(8.dp))
                             Surface(
-                                color = MaterialTheme.colorScheme.surfaceVariant,
+                                color = if (comment.state == CommentState.Failed) {
+                                    MaterialTheme.colorScheme.errorContainer
+                                } else {
+                                    MaterialTheme.colorScheme.surfaceVariant
+                                },
                                 shape = RoundedCornerShape(999.dp)
                             ) {
                                 Text(
-                                    "Not kept yet",
+                                    label,
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.padding(horizontal = 7.dp, vertical = 1.dp)
@@ -355,6 +382,8 @@ fun CommentsSection(
                 }
             }
         }
+
+        if (policy == CommentPolicy.Closed) return@Column
 
         OutlinedTextField(
             value = draft,

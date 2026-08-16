@@ -23,7 +23,18 @@ import java.io.File
  * "quarantined" would be a lie — they are public, they are just not endorsed, and they expire
  * on their own if the owner never accepts them.
  */
-enum class CommentState { Accepted, Provisional, Held, Dropped }
+enum class CommentState {
+    /** Written locally, network write not confirmed yet. Only ever your own comments. */
+    Sending,
+
+    /** The network write failed. Yours, still on this device, not published. */
+    Failed,
+
+    Accepted,
+    Provisional,
+    Held,
+    Dropped,
+}
 
 /** How a comment reached the page, which determines who could already read it. */
 enum class CommentOrigin {
@@ -156,7 +167,12 @@ class LocalCommentStore(context: Context) : CommentStore {
         val now = System.currentTimeMillis()
         return items
             .filter { it.pageKey == pageKey && it.id !in hiddenLocally && !it.isExpired(now) }
-            .filter { it.state == CommentState.Accepted || it.state == CommentState.Provisional }
+            // Sending and Failed are shown too: they are your own words, and hiding them
+            // until the network confirms makes it look like the comment vanished.
+            .filter {
+                it.state == CommentState.Accepted || it.state == CommentState.Provisional ||
+                    it.state == CommentState.Sending || it.state == CommentState.Failed
+            }
             .sortedBy { it.createdAt }
     }
 
@@ -219,6 +235,7 @@ class LocalCommentStore(context: Context) : CommentStore {
             // dropping something and having it reappear on the next sync would make
             // moderation feel broken.
             if (existing.state == CommentState.Dropped) return
+            // A confirmed state from the network always replaces a local Sending/Failed.
             items[index] = comment.copy(
                 state = if (existing.state == CommentState.Accepted) CommentState.Accepted else comment.state
             )

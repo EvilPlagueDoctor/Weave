@@ -51,6 +51,10 @@ data class SocialUiState(
     val debugLog: String = "",
     /** True while a publish is in flight, so the UI can disable the control. */
     val publishing: Boolean = false,
+    /** Bumped on every comment change so screens re-read the local store. */
+    val commentRevision: Long = 0,
+    /** This profile's own rule for its comment section. */
+    val commentPolicy: CommentPolicy = CommentPolicy.Open,
 )
 
 class SocialNetworkController(context: Context) {
@@ -64,6 +68,7 @@ class SocialNetworkController(context: Context) {
     private val _ui = MutableStateFlow(
         SocialUiState(
             discoveryDescription = prefs.getString("description", "") ?: "",
+            commentPolicy = CommentPolicy.fromWire(prefs.getString("comment_policy", null)),
             featuresText = prefs.getString("features", "") ?: "",
         )
     )
@@ -211,6 +216,7 @@ class SocialNetworkController(context: Context) {
                     profileSha256Hex = blob.optString("sha256_hex", sha),
                     profileBytes = blob.optLong("total_bytes", bytes.size.toLong()),
                     vspfVersion = 3,
+                    commentPolicy = state.commentPolicy,
                 )
                 require(record.profileSha256Hex.equals(sha, ignoreCase = true)) { "Daemon blob hash did not match local profile hash" }
                 d.writeStore(storeId, PROFILE_SUBKEY, record.toJson().toString().encodeToByteArray())
@@ -548,7 +554,11 @@ class SocialNetworkController(context: Context) {
 
     private fun persistMetadata() {
         val state = _ui.value
-        prefs.edit().putString("description", state.discoveryDescription).putString("features", state.featuresText).apply()
+        prefs.edit()
+            .putString("description", state.discoveryDescription)
+            .putString("features", state.featuresText)
+            .putString("comment_policy", state.commentPolicy.name)
+            .apply()
     }
 
     private companion object Health {
@@ -559,6 +569,20 @@ class SocialNetworkController(context: Context) {
     // ---------------------------------------------------------------------
     // Comments
     // ---------------------------------------------------------------------
+
+    fun setCommentPolicy(policy: CommentPolicy) {
+        prefs.edit().putString("comment_policy", policy.name).apply()
+        _ui.value = _ui.value.copy(commentPolicy = policy)
+    }
+
+    /** The rule a page's owner published, or Open when their record has not been read yet. */
+    fun commentPolicyFor(ownerMainDht: String): CommentPolicy =
+        if (ownerMainDht == _ui.value.mainDht) _ui.value.commentPolicy
+        else fullRecords[ownerMainDht]?.commentPolicy ?: CommentPolicy.Open
+
+    private fun bumpComments() {
+        _ui.value = _ui.value.copy(commentRevision = _ui.value.commentRevision + 1)
+    }
 
     /**
      * Writes a comment to this device's own chain and tells the page owner about it.
@@ -575,6 +599,11 @@ class SocialNetworkController(context: Context) {
             return@launch
         }
         val owner = ownerKeyOf(pageKey)
+        val policy = commentPolicyFor(owner)
+        if (policy == CommentPolicy.Closed) {
+            log("comment not posted: this profile has comments turned off")
+            return@launch
+        }
         val wire = WireComment(
             id = makeId("comment"),
             pageKey = pageKey,
@@ -583,26 +612,39 @@ class SocialNetworkController(context: Context) {
             body = body.trim().take(MAX_COMMENT_CHARS),
             createdAt = System.currentTimeMillis(),
         )
-        val state = triageComment(wire.body, me, owner, comments.allForPage(pageKey), openMode)
+
+        // Store it before touching the network. Writing to a DHT record takes seconds, and
+        // waiting for that made a posted comment look like it had simply disappeared.
+        comments.upsert(wire.toComment(CommentState.Sending, CommentOrigin.Direct))
+        bumpComments()
+
+        val settled = when {
+            owner == me -> CommentState.Accepted
+            policy == CommentPolicy.Moderated -> CommentState.Held
+            else -> triageComment(wire.body, me, owner, comments.allForPage(pageKey), openMode)
+        }
+
         runCatching {
             val pointer = network.post(wire, owner, notify = true)
             comments.rememberPointer(wire.id, pointer.recordKey, pointer.subkey)
             comments.upsert(
                 wire.toComment(
-                    state = state,
+                    state = settled,
                     origin = if (openMode) CommentOrigin.Open else CommentOrigin.Direct,
-                    expiresAt = if (openMode && state == CommentState.Provisional) {
+                    expiresAt = if (openMode && settled == CommentState.Provisional) {
                         System.currentTimeMillis() + OPEN_COMMENT_TTL_MS
                     } else 0L,
                 )
             )
-            // Commenting on your own page keeps it in one step, so it is visible to readers
-            // without a second trip through the moderation queue.
-            if (owner == me && state == CommentState.Accepted) {
+            if (owner == me && settled == CommentState.Accepted) {
                 network.keep(IndexEntry(pageKey, pointer, me, wire.id))
             }
-            log("comment posted to ${short(owner)} (${state.name.lowercase()})")
-        }.onFailure { log("comment post failed: ${it.message}") }
+            log("comment posted to ${short(owner)} (${settled.name.lowercase()})")
+        }.onFailure {
+            comments.upsert(wire.toComment(CommentState.Failed, CommentOrigin.Direct))
+            log("comment post failed: ${it.message}")
+        }
+        bumpComments()
     }
 
     /** Publishes a pointer to a comment in this device's index, making it visible to readers. */
@@ -619,6 +661,7 @@ class SocialNetworkController(context: Context) {
                 IndexEntry(comment.pageKey, CommentChain.Pointer(pointer.first, pointer.second), comment.authorKey, id)
             )
             comments.setState(id, CommentState.Accepted)
+            bumpComments()
             log("comment kept on ${comment.pageKey.substringAfter('#')}")
         }.onFailure { log("keeping the comment failed: ${it.message}") }
     }
@@ -632,7 +675,10 @@ class SocialNetworkController(context: Context) {
             fetched.forEach { wire ->
                 comments.upsert(wire.toComment(CommentState.Accepted, CommentOrigin.Direct))
             }
-            if (fetched.isNotEmpty()) log("synced ${fetched.size} comment(s) for ${short(ownerMainDht)}")
+            if (fetched.isNotEmpty()) {
+                bumpComments()
+                log("synced ${fetched.size} comment(s) for ${short(ownerMainDht)}")
+            }
         }.onFailure { log("comment sync failed: ${it.message}") }
     }
 
@@ -707,9 +753,19 @@ class SocialNetworkController(context: Context) {
             log("comment notice page does not match the stored comment; ignored")
             return
         }
+        val policy = _ui.value.commentPolicy
+        if (policy == CommentPolicy.Closed) {
+            log("comment from ${short(sender)} refused: comments are turned off")
+            return
+        }
         comments.rememberPointer(wire.id, notice.pointer.recordKey, notice.pointer.subkey)
-        val state = triageComment(wire.body, wire.authorKey, me, comments.allForPage(wire.pageKey), openMode = false)
+        val state = if (policy == CommentPolicy.Moderated) {
+            CommentState.Held
+        } else {
+            triageComment(wire.body, wire.authorKey, me, comments.allForPage(wire.pageKey), openMode = false)
+        }
         comments.upsert(wire.toComment(state, CommentOrigin.Direct))
+        bumpComments()
         log("comment received from ${short(sender)} (${state.name.lowercase()})")
     }
 

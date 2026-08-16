@@ -228,6 +228,8 @@ private fun ProfileDestination(
             loader = mediaLoader,
             commentStore = commentStore,
             openComments = true,
+            commentPolicy = controller.commentPolicyFor(mainDht),
+            commentRevision = ui.commentRevision,
             onPostComment = { pageKey, body, openMode -> controller.postComment(pageKey, body, openMode) },
             onSyncComments = { pageKey -> controller.syncComments(mainDht, pageKey) },
             isFollowing = following,

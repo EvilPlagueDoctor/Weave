@@ -21,6 +21,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import com.veilysocial.profiledesigner.backbone.CommentPolicy
 
 /** Remembers whether setup has been completed, so first run happens exactly once. */
 class OnboardingState(context: Context) {
@@ -402,6 +403,8 @@ fun MeScreen(
                     pageKey = pageKeyOf(ownKey, shownPage.id),
                     pageOwnerKey = ownKey,
                     store = commentStore,
+                    policy = ui.commentPolicy,
+                    externalRevision = ui.commentRevision,
                     onPost = { key, body, open -> controller.postComment(key, body, open) },
                     ownKey = ownKey,
                     ownName = state.doc.profileName,
@@ -536,6 +539,49 @@ fun SettingsScreen(
                 label = { Text("Interests, comma separated") },
                 minLines = 2,
             )
+            HorizontalDivider(Modifier.padding(vertical = 16.dp))
+            Text("Comments on your profile", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+            Text(
+                "Published with your profile, so other people's apps know the rule before they write anything.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp, bottom = 8.dp)
+            )
+            CommentPolicy.entries.forEach { option ->
+                Row(
+                    Modifier.fillMaxWidth().clickable { controller.setCommentPolicy(option) }.padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    RadioButton(selected = ui.commentPolicy == option, onClick = { controller.setCommentPolicy(option) })
+                    Spacer(Modifier.width(6.dp))
+                    Column {
+                        Text(
+                            when (option) {
+                                CommentPolicy.Open -> "Anyone can comment"
+                                CommentPolicy.Moderated -> "I approve comments first"
+                                CommentPolicy.Closed -> "No comments"
+                            },
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        Text(
+                            when (option) {
+                                CommentPolicy.Open -> "Comments appear as soon as they are posted."
+                                CommentPolicy.Moderated -> "Comments wait in Activity until you keep them."
+                                CommentPolicy.Closed -> "Nobody can leave a comment on your pages."
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+            Text(
+                "Changes take effect the next time you publish.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp)
+            )
+
             HorizontalDivider(Modifier.padding(vertical = 16.dp))
             Text("Diagnostics", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
             Text(

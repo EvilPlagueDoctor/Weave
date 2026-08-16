@@ -14,6 +14,27 @@ const val CACHE_LIMIT = 2000
 
 enum class VerificationState { GOSSIP_HINT, MULTI_SOURCE_HINT, APP_ROOT_CONFIRMED, DHT_VERIFIED }
 
+/**
+ * What a profile allows in its comment section. Published in the profile record so other
+ * people's clients know the rule before they write anything, rather than discovering it when
+ * their comment is silently dropped.
+ */
+enum class CommentPolicy {
+    /** Comments appear as soon as they are posted. */
+    Open,
+
+    /** Comments wait for the profile owner to keep them. */
+    Moderated,
+
+    /** No comments accepted. Clients hide the composer entirely. */
+    Closed;
+
+    companion object {
+        fun fromWire(value: String?): CommentPolicy =
+            entries.firstOrNull { it.name.equals(value, ignoreCase = true) } ?: Open
+    }
+}
+
 data class ProfilePageRecord(
     val schemaVersion: Int = 1,
     val mainDht: String,
@@ -28,6 +49,7 @@ data class ProfilePageRecord(
     val profileSha256Hex: String,
     val profileBytes: Long,
     val vspfVersion: Int = 3,
+    val commentPolicy: CommentPolicy = CommentPolicy.Open,
 ) {
     fun signature() = MinHash.fromFeatures(extractFeatures(description, features))
     fun toHint(observedAt: Long, verification: VerificationState) = ProfileHint(
@@ -41,6 +63,7 @@ data class ProfilePageRecord(
         .put("features", JSONArray(features)).put("profile_blob_id", profileBlobId)
         .put("profile_blob_root", profileBlobRoot).put("profile_sha256_hex", profileSha256Hex)
         .put("profile_bytes", profileBytes).put("vspf_version", vspfVersion)
+        .put("comment_policy", commentPolicy.name)
 
     companion object {
         fun fromJson(obj: JSONObject) = ProfilePageRecord(
@@ -52,6 +75,9 @@ data class ProfilePageRecord(
             profileBlobId = obj.optString("profile_blob_id"), profileBlobRoot = obj.getString("profile_blob_root"),
             profileSha256Hex = obj.getString("profile_sha256_hex"), profileBytes = obj.optLong("profile_bytes"),
             vspfVersion = obj.optInt("vspf_version", 3),
+            // Absent on records written before the field existed, which read as Open - the
+            // behaviour those profiles already had.
+            commentPolicy = CommentPolicy.fromWire(obj.optString("comment_policy")),
         )
     }
 }
