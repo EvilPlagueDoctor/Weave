@@ -262,15 +262,25 @@ sealed class GossipMessage {
 
 data class CachedProfile(var hint: ProfileHint, val firstSeenAt: Long, var lastSeenAt: Long, var sourceCount: Int)
 
+/**
+ * Shared discovery state.
+ *
+ * Every method is synchronized on the instance. The controller runs its worker loop, each
+ * incoming message, each profile verification and each comment operation as separate
+ * coroutines on Dispatchers.IO, which is a thread pool, so reads and writes genuinely do
+ * overlap. Only [upsert] was synchronized before, which left readers iterating the recent
+ * deque while a writer mutated it - a ConcurrentModificationException on whichever thread
+ * happened to be reading.
+ */
 class KnowledgeCache {
     private val profiles = LinkedHashMap<String, CachedProfile>()
     private val recent = ArrayDeque<String>()
     private var generation: Long = 0
 
-    fun generation() = generation
-    fun size() = profiles.size
-    fun all() = profiles.values.toList()
-    fun get(mainDht: String) = profiles[mainDht]
+    @Synchronized fun generation() = generation
+    @Synchronized fun size() = profiles.size
+    @Synchronized fun all() = profiles.values.toList()
+    @Synchronized fun get(mainDht: String) = profiles[mainDht]
 
     @Synchronized fun upsert(hint: ProfileHint, source: String?, now: Long): Boolean {
         hint.observedAt = max(hint.observedAt, now)
@@ -295,9 +305,9 @@ class KnowledgeCache {
         return changed
     }
 
-    fun recent(): List<CachedProfile> = recent.mapNotNull { profiles[it] }.take(RECENT_LIMIT)
+    @Synchronized fun recent(): List<CachedProfile> = recent.mapNotNull { profiles[it] }.take(RECENT_LIMIT)
 
-    fun search(intent: DiscoveryIntent, limit: Int = 100): List<ScoredProfile> {
+    @Synchronized fun search(intent: DiscoveryIntent, limit: Int = 100): List<ScoredProfile> {
         val stats = corpusStats()
         val positiveTerms = intent.positiveTerms.flatMap(::tokenize)
         val negativeTerms = intent.negativeTerms.flatMap(::tokenize)
@@ -341,7 +351,7 @@ class KnowledgeCache {
         return selected
     }
 
-    fun clusters(desired: Int = 10, seed: Long = generation): List<ClusterDigest> {
+    @Synchronized fun clusters(desired: Int = 10, seed: Long = generation): List<ClusterDigest> {
         val items = profiles.values.map { it.hint }
         if (items.isEmpty()) return emptyList()
         val k = desired.coerceIn(1, 32).coerceAtMost(items.size)

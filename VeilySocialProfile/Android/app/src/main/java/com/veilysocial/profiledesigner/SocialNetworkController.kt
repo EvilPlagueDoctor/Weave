@@ -8,6 +8,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONObject
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import java.security.MessageDigest
 
 private const val PROFILE_STORE_NAME = "veilysocial-profile-page-v1"
@@ -71,16 +73,20 @@ class SocialNetworkController(context: Context) {
     private var messageSubscription: Long? = null
     private var networkJob: Job? = null
     private val cache = KnowledgeCache()
-    private val fullRecords = LinkedHashMap<String, ProfilePageRecord>()
-    private val profileDocuments = LinkedHashMap<String, String>()
-    private val knownPeers = LinkedHashSet<String>()
-    private val queryReplyAt = HashMap<String, Long>()
+    // Concurrent collections rather than plain ones: the worker loop, every incoming message,
+    // each profile verification and each comment operation are separate coroutines on
+    // Dispatchers.IO, so these are genuinely touched from several threads at once. The same
+    // oversight in KnowledgeCache is what crashed the app on the Home screen.
+    private val fullRecords = ConcurrentHashMap<String, ProfilePageRecord>()
+    private val profileDocuments = ConcurrentHashMap<String, String>()
+    private val knownPeers: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    private val queryReplyAt = ConcurrentHashMap<String, Long>()
     private var profileStoreId: String? = null
     private var ownRecord: ProfilePageRecord? = null
     private var activeIntent: DiscoveryIntent? = null
     private var nextRequestId = 1L
-    private var gossipSent = 0L
-    private var gossipReceived = 0L
+    private val gossipSentCount = AtomicLong(0)
+    private val gossipReceivedCount = AtomicLong(0)
 
     fun start() {
         // Checking isActive rather than nullness is what makes retry work: when the worker
@@ -406,7 +412,7 @@ class SocialNetworkController(context: Context) {
             return
         }
         val message = runCatching { GossipMessage.decode(payload) }.getOrNull() ?: return
-        gossipReceived++
+        gossipReceivedCount.incrementAndGet()
         when (message) {
             is GossipMessage.Summary -> {
                 message.clusters.forEach { cluster ->
@@ -427,7 +433,7 @@ class SocialNetworkController(context: Context) {
                     queryReplyAt[source] = current
                     val samples = cache.search(message.intent, message.limit.coerceAtMost(6)).map { it.hint }
                     val response = GossipMessage.SimilarityResponse(message.requestId, samples).toJson().toString().encodeToByteArray()
-                    if (response.size <= 8 * 1024) runCatching { daemon?.sendGossip(source, response) }.onSuccess { gossipSent++ }
+                    if (response.size <= 8 * 1024) runCatching { daemon?.sendGossip(source, response) }.onSuccess { gossipSentCount.incrementAndGet() }
                 }
             }
             is GossipMessage.SimilarityResponse -> {
@@ -512,7 +518,7 @@ class SocialNetworkController(context: Context) {
     private fun sendGossipToSample(bytes: ByteArray, limit: Int) {
         val d = daemon ?: return
         deterministicPeerSample(knownPeers.toList(), nowSeconds(), limit).forEach { peer ->
-            runCatching { d.sendGossip(peer, bytes) }.onSuccess { gossipSent++ }.onFailure { log("gossip to ${short(peer)} failed: ${it.message}") }
+            runCatching { d.sendGossip(peer, bytes) }.onSuccess { gossipSentCount.incrementAndGet() }.onFailure { log("gossip to ${short(peer)} failed: ${it.message}") }
         }
     }
 
@@ -531,7 +537,7 @@ class SocialNetworkController(context: Context) {
             }
         }
         if (knownPeers.isNotEmpty()) lastPeerSeenMs = System.currentTimeMillis()
-        _ui.value = _ui.value.copy(recent = recent, peers = knownPeers.size, verified = verified, gossipSent = gossipSent, gossipReceived = gossipReceived, clusterText = clusterText)
+        _ui.value = _ui.value.copy(recent = recent, peers = knownPeers.size, verified = verified, gossipSent = gossipSentCount.get(), gossipReceived = gossipReceivedCount.get(), clusterText = clusterText)
     }
 
     private fun decodeRecordValue(value: JSONObject?): ProfilePageRecord? {
