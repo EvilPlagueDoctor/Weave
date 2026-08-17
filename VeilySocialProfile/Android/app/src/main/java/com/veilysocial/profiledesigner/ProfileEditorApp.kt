@@ -253,6 +253,17 @@ class EditorState(private val context: Context) {
 
     fun clearPersistError() { persistError = null }
 
+    /**
+     * Writes someone else's profile into this device's profile folder so it appears in the
+     * editor's Open dialog. Saved under a distinct name: it is a copy to look at or borrow
+     * from, never the working document.
+     */
+    fun saveImportedCopy(name: String, profileText: String): Boolean = runCatching {
+        val fileName = safeName("copy-" + name.ifBlank { "profile" }) + ".txt"
+        File(profileDir, fileName).writeText(profileText, Charsets.UTF_8)
+        true
+    }.getOrElse { false }
+
     /** Replaces the whole editable document. Used by first-run setup. */
     fun replaceDocument(next: ProfileDocument) {
         finishInlineTextEdit()
@@ -804,11 +815,14 @@ fun EditorScreen(state: EditorState, onBack: () -> Unit) {
         }
     }
     if (state.showWidgetStudio) {
-        Box(Modifier.fillMaxSize()) {
+        // Full-bleed screens draw behind the status and navigation bars, so they have to
+        // apply the insets themselves. Without this the header sat under the notch and the
+        // tool strip under the gesture bar.
+        Box(Modifier.fillMaxSize().safeDrawingPadding()) {
             WidgetStudioScreen(repo = state.widgetRepo, onBack = { state.showWidgetStudio = false })
         }
     } else {
-        BoxWithConstraints(Modifier.fillMaxSize()) {
+        BoxWithConstraints(Modifier.fillMaxSize().safeDrawingPadding()) {
             // Captured here on purpose: BoxScope and BoxWithConstraintsScope share the
             // @LayoutScopeMarker DslMarker, so maxWidth is unreachable from inside the
             // nested Box below.

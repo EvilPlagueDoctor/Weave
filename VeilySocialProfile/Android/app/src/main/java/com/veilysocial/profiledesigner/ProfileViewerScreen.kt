@@ -4,6 +4,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -15,7 +16,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -69,6 +72,7 @@ fun PageCanvas(
     imageLookup: (Element) -> ImageBitmap? = { null },
     /** Whose page this is. A "your mark" stamp resolves against it at draw time. */
     ownerKey: String = "",
+    onImageLongPress: ((Element) -> Unit)? = null,
 ) {
     val strings = RenderStrings(
         mediaKinds = listOf(
@@ -80,7 +84,13 @@ fun PageCanvas(
         widgetSuffix = stringResource(R.string.widget_preview_suffix),
         widgetPaused = stringResource(R.string.widget_paused_short)
     )
-    Canvas(modifier) {
+    val hitTest = if (onImageLongPress == null) Modifier else Modifier.pointerInput(page.id) {
+        detectTapGestures(onLongPress = { point ->
+            page.imageElementAt(point.x, point.y, size.width.toFloat(), size.height.toFloat())
+                ?.let(onImageLongPress)
+        })
+    }
+    Canvas(modifier.then(hitTest)) {
         val root = page.root
         val rootRect = Rect(0f, 0f, size.width, size.height)
         drawBackground(rootRect, root.background)
@@ -113,6 +123,11 @@ fun ProfileViewerScreen(
     commentRevision: Long,
     onPostComment: (pageKey: String, body: String, openMode: Boolean) -> Unit,
     onSyncComments: (pageKey: String) -> Unit,
+    onSaveImageToGallery: (Element) -> Unit,
+    onCopyImageLocation: (Element) -> Unit,
+    onSaveImageToEditor: (Element) -> Unit,
+    onSaveProfileCopy: (RemoteProfile) -> Unit,
+    onCopyProfileKey: (RemoteProfile) -> Unit,
     isFollowing: Boolean,
     onToggleFollow: () -> Unit,
     onPrevProfile: (() -> Unit)?,
@@ -123,6 +138,9 @@ fun ProfileViewerScreen(
     val page = profile.page(pageIndex) ?: return
     val scroll = rememberScrollState()
     val scope = rememberCoroutineScope()
+    val zoom = rememberPageZoomState(profile.mainDht to pageIndex)
+    var imageMenuFor by remember(profile.mainDht) { mutableStateOf<Element?>(null) }
+    var showProfileMenu by remember(profile.mainDht) { mutableStateOf(false) }
 
     LaunchedEffect(profile.mainDht, pageIndex) { scroll.scrollTo(0) }
 
@@ -134,7 +152,7 @@ fun ProfileViewerScreen(
     }
 
     Column(Modifier.fillMaxSize()) {
-        ViewerHeader(profile, isFollowing, onToggleFollow, onBack)
+        ViewerHeader(profile, isFollowing, onToggleFollow, onBack, onNameClick = { showProfileMenu = true })
         BoxWithConstraints(
             Modifier
                 .weight(1f)
@@ -142,7 +160,8 @@ fun ProfileViewerScreen(
                 .background(MaterialTheme.colorScheme.background)
                 // Horizontal drag moves between profiles. Vertical belongs to the scroll,
                 // and the page rail owns page turns.
-                .pointerInput(profile.mainDht) {
+                .pointerInput(profile.mainDht, zoom.zoomed) {
+                    if (zoom.zoomed) return@pointerInput
                     var travelled = 0f
                     detectHorizontalDragGestures(
                         onDragStart = { travelled = 0f },
@@ -162,10 +181,25 @@ fun ProfileViewerScreen(
                 Surface(color = Color.White, tonalElevation = 0.dp) {
                     PageCanvas(
                         page,
-                        Modifier.fillMaxWidth().height(canvasHeight),
+                        Modifier
+                            .fillMaxWidth()
+                            .height(canvasHeight)
+                            .pinchZoom(zoom)
+                            .graphicsLayer(
+                                scaleX = zoom.scale,
+                                scaleY = zoom.scale,
+                                translationX = zoom.offset.x,
+                                translationY = zoom.offset.y,
+                            ),
                         imageLookup = loader::lookup,
                         ownerKey = profile.mainDht,
+                        onImageLongPress = { element -> imageMenuFor = element },
                     )
+                }
+                if (zoom.zoomed) {
+                    TextButton(onClick = { zoom.reset() }, modifier = Modifier.padding(start = 8.dp)) {
+                        Text("Reset zoom", style = MaterialTheme.typography.labelSmall)
+                    }
                 }
                 PageRail(
                     pageNames = profile.document.pages.map { it.name },
@@ -190,19 +224,124 @@ fun ProfileViewerScreen(
             }
         }
     }
+
+    imageMenuFor?.let { element ->
+        ImageActionDialog(
+            element = element,
+            onDismiss = { imageMenuFor = null },
+            onSaveToGallery = { onSaveImageToGallery(element) },
+            onCopyLocation = { onCopyImageLocation(element) },
+            onSaveToEditor = { onSaveImageToEditor(element) },
+        )
+    }
+
+    if (showProfileMenu) {
+        ProfileActionDialog(
+            profile = profile,
+            onDismiss = { showProfileMenu = false },
+            onSaveCopy = { onSaveProfileCopy(profile) },
+            onCopyKey = { onCopyProfileKey(profile) },
+        )
+    }
+}
+
+/**
+ * Long-press menu for an image. The description the author wrote is shown underneath and
+ * scrolls, since it can be a paragraph and truncating it would lose the only alt text there is.
+ */
+@Composable
+private fun ImageActionDialog(
+    element: Element,
+    onDismiss: () -> Unit,
+    onSaveToGallery: () -> Unit,
+    onCopyLocation: () -> Unit,
+    onSaveToEditor: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(element.mediaTitle.ifBlank { "Image" }) },
+        text = {
+            Column {
+                DialogAction("Save image") { onSaveToGallery(); onDismiss() }
+                DialogAction("Copy image location") { onCopyLocation(); onDismiss() }
+                DialogAction("Save to editor") { onSaveToEditor(); onDismiss() }
+                if (element.mediaDescription.isNotBlank()) {
+                    HorizontalDivider(Modifier.padding(vertical = 10.dp))
+                    Text("Description", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold)
+                    Box(Modifier.heightIn(max = 160.dp).verticalScroll(rememberScrollState())) {
+                        SelectionContainer {
+                            Text(element.mediaDescription, style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+    )
 }
 
 @Composable
-private fun ViewerHeader(profile: RemoteProfile, isFollowing: Boolean, onToggleFollow: () -> Unit, onBack: () -> Unit) {
+private fun ProfileActionDialog(
+    profile: RemoteProfile,
+    onDismiss: () -> Unit,
+    onSaveCopy: () -> Unit,
+    onCopyKey: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(profile.displayName) },
+        text = {
+            Column {
+                DialogAction("Save a copy of this profile") { onSaveCopy(); onDismiss() }
+                DialogAction("Copy profile key") { onCopyKey(); onDismiss() }
+                HorizontalDivider(Modifier.padding(vertical = 10.dp))
+                Text("Pages: ${profile.pageCount}", style = MaterialTheme.typography.bodySmall)
+                Text(
+                    "Fetched ${(System.currentTimeMillis() - profile.fetchedAt) / 1000}s ago",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                SelectionContainer {
+                    Text(
+                        profile.mainDht,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 6.dp),
+                    )
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+    )
+}
+
+@Composable
+private fun DialogAction(label: String, onClick: () -> Unit) {
+    Text(
+        label,
+        style = MaterialTheme.typography.bodyMedium,
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 10.dp),
+    )
+}
+
+@Composable
+private fun ViewerHeader(
+    profile: RemoteProfile,
+    isFollowing: Boolean,
+    onToggleFollow: () -> Unit,
+    onBack: () -> Unit,
+    onNameClick: () -> Unit,
+) {
     Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 2.dp) {
         Row(
             Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            TextButton(onClick = onBack, contentPadding = PaddingValues(horizontal = 8.dp)) { Text("\u2190") }
+            CircleIconButton("\u25C0", "Back", onBack)
+            Spacer(Modifier.width(8.dp))
             Identicon(profile.mainDht, size = 32.dp)
             Spacer(Modifier.width(10.dp))
-            Column(Modifier.weight(1f)) {
+            Column(Modifier.weight(1f).clickable(onClick = onNameClick)) {
                 SelectionContainer {
                     Text(profile.displayName, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, maxLines = 1)
                 }
@@ -217,56 +356,6 @@ private fun ViewerHeader(profile: RemoteProfile, isFollowing: Boolean, onToggleF
             }
         }
     }
-}
-
-/**
- * Page controls belong to the page, not to the app chrome. This scrolls away with the
- * content and does not exist on screens where there is no page to turn.
- */
-@Composable
-fun PageRail(
-    pageNames: List<String>,
-    index: Int,
-    onSelect: (Int) -> Unit,
-    onPrev: () -> Unit,
-    onNext: () -> Unit,
-) {
-    if (pageNames.size <= 1) return
-    Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 1.dp) {
-        Row(
-            Modifier.fillMaxWidth().height(48.dp).padding(horizontal = 8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            TextButton(onClick = onPrev, enabled = index > 0, contentPadding = PaddingValues(horizontal = 10.dp)) { Text("\u2190") }
-            Row(
-                Modifier.weight(1f),
-                horizontalArrangement = Arrangement.Center,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                pageNames.forEachIndexed { i, name ->
-                    val selected = i == index
-                    Surface(
-                        color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
-                        shape = RoundedCornerShape(999.dp),
-                        modifier = Modifier.padding(horizontal = 3.dp)
-                    ) {
-                        Box(
-                            Modifier
-                                .size(if (selected) 22.dp else 10.dp, 10.dp)
-                                .clickable { onSelect(i) }
-                        )
-                    }
-                }
-            }
-            TextButton(onClick = onNext, enabled = index < pageNames.lastIndex, contentPadding = PaddingValues(horizontal = 10.dp)) { Text("\u2192") }
-        }
-    }
-    Text(
-        pageNames[index],
-        style = MaterialTheme.typography.labelMedium,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)
-    )
 }
 
 @Composable
@@ -288,6 +377,8 @@ fun CommentsSection(
     val comments = remember(pageKey, revision, externalRevision) { store.forPage(pageKey) }
     // Your own comments that this page's owner hasn't released yet. Shown to you only so
     // the post button doesn't look broken — the decision is not yours to make.
+    val hidden = remember(pageKey, revision, externalRevision) { store.hiddenForPage(pageKey) }
+    var showHidden by remember(pageKey) { mutableStateOf(false) }
     val myPending = remember(pageKey, revision, externalRevision) {
         store.awaitingApproval(ownKey).filter { it.pageKey == pageKey }
     }
@@ -363,6 +454,40 @@ fun CommentsSection(
                     Text("Hide", style = MaterialTheme.typography.labelSmall)
                 }
             }
+        }
+
+        if (hidden.isNotEmpty()) {
+            TextButton(onClick = { showHidden = !showHidden }, contentPadding = PaddingValues(0.dp)) {
+                Text(
+                    if (showHidden) "Hide ${hidden.size} hidden again" else "Show ${hidden.size} hidden",
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
+        }
+        if (showHidden) {
+            hidden.forEach { comment ->
+                Row(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+                    Identicon(comment.authorKey.ifBlank { comment.authorName }, size = 24.dp)
+                    Spacer(Modifier.width(10.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            comment.authorName,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            displayBody(comment, expanded = false),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    TextButton(
+                        onClick = { store.unhide(comment.id); revision++ },
+                        contentPadding = PaddingValues(horizontal = 6.dp),
+                    ) { Text("Unhide", style = MaterialTheme.typography.labelSmall) }
+                }
+            }
+            HorizontalDivider(Modifier.padding(vertical = 8.dp))
         }
 
         myPending.forEach { pending ->

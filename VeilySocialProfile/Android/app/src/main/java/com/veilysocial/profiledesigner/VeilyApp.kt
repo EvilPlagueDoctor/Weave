@@ -166,6 +166,8 @@ private fun VeilyShell(
                     followStore = followStore,
                     remoteCache = remoteCache,
                     mediaLoader = mediaLoader,
+                    media = media,
+                    state = state,
                     ownKey = ui.mainDht,
                     ownName = state.doc.profileName,
                     onNavigate = { nav.replaceTop(Destination.Profile(it)) },
@@ -187,12 +189,15 @@ private fun ProfileDestination(
     followStore: FollowStore,
     remoteCache: RemoteProfileCache,
     mediaLoader: MediaLoader,
+    media: LocalMediaStore,
+    state: EditorState,
     ownKey: String,
     ownName: String,
     onNavigate: (String) -> Unit,
     onBack: () -> Unit,
 ) {
     val ui by controller.ui.collectAsState()
+    val context = LocalContext.current
     var following by remember(mainDht) { mutableStateOf(followStore.isFollowing(mainDht)) }
 
     // The swipe queue is whatever list the user opened from, in its current order.
@@ -202,7 +207,13 @@ private fun ProfileDestination(
 
     // The blob may still be in flight when this destination opens, so poll rather than
     // resolving once during composition.
-    val loaded by produceState<Result<RemoteProfile>?>(initialValue = null, mainDht) {
+    // Seeded from the cache so returning to a tab shows the profile immediately. Starting at
+    // null meant the spinner reappeared on every visit even though nothing had to be fetched.
+    val cached = remember(mainDht) { remoteCache.get(mainDht) }
+    val loaded by produceState<Result<RemoteProfile>?>(
+        initialValue = cached?.let { Result.success(it) },
+        mainDht,
+    ) {
         remoteCache.get(mainDht)?.let { value = Result.success(it); return@produceState }
         controller.ensureProfileAvailable(mainDht)
         repeat(60) {
@@ -232,6 +243,32 @@ private fun ProfileDestination(
             commentRevision = ui.commentRevision,
             onPostComment = { pageKey, body, openMode -> controller.postComment(pageKey, body, openMode) },
             onSyncComments = { pageKey -> controller.syncComments(mainDht, pageKey) },
+            onSaveImageToGallery = { element ->
+                val ok = media.exportToGallery(context, element.mediaContentHash, element.mediaTitle.ifBlank { "image" })
+                toast(context, if (ok) "Saved to your gallery" else "Couldn't save that image")
+            },
+            onCopyImageLocation = { element ->
+                copyToClipboard(context, "Image location", element.mediaRecordKey.ifBlank { element.mediaContentHash })
+                toast(context, "Copied")
+            },
+            onSaveImageToEditor = { element ->
+                media.saveToLibrary(
+                    element.mediaContentHash,
+                    element.intrinsicWidth.toInt().coerceAtLeast(1),
+                    element.intrinsicHeight.toInt().coerceAtLeast(1),
+                    element.mediaDescription,
+                )
+                toast(context, "Saved to your editor")
+            },
+            onSaveProfileCopy = { remote ->
+                val text = runCatching { ProfileCodec.encodeText(remote.document) }.getOrNull()
+                val ok = text != null && state.saveImportedCopy(remote.displayName, text)
+                toast(context, if (ok) "Saved a copy you can open in the editor" else "Couldn't save that profile")
+            },
+            onCopyProfileKey = { remote ->
+                copyToClipboard(context, "Profile key", remote.mainDht)
+                toast(context, "Copied")
+            },
             isFollowing = following,
             onToggleFollow = { following = followStore.toggle(mainDht) },
             onPrevProfile = if (position > 0) ({ onNavigate(queue[position - 1]) }) else null,
@@ -259,6 +296,16 @@ private fun ProfileDestination(
             TextButton(onClick = onBack, modifier = Modifier.padding(top = 16.dp)) { Text("Back") }
         }
     }
+}
+
+private fun copyToClipboard(context: android.content.Context, label: String, value: String) {
+    val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+        as android.content.ClipboardManager
+    clipboard.setPrimaryClip(android.content.ClipData.newPlainText(label, value))
+}
+
+private fun toast(context: android.content.Context, message: String) {
+    android.widget.Toast.makeText(context, message, android.widget.Toast.LENGTH_SHORT).show()
 }
 
 @Composable

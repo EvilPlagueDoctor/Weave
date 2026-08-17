@@ -69,6 +69,7 @@ class LocalMediaStore(context: Context) {
     }
     private val missing = mutableSetOf<String>()
     private val blobIndexFile = File(dir, "blob-index.json")
+    private val libraryFile = File(dir, "library.json")
 
     data class Stored(val contentHash: String, val width: Int, val height: Int)
 
@@ -156,6 +157,55 @@ class LocalMediaStore(context: Context) {
         }
     }
 
+    /**
+     * Images the person chose to keep for their own use. Kept separate from whatever happens
+     * to be cached: a cached file can be pruned when no page references it, a saved one can't.
+     */
+    fun saveToLibrary(contentHash: String, width: Int, height: Int, description: String) {
+        if (contentHash.isBlank()) return
+        runCatching {
+            val library = org.json.JSONObject(
+                libraryFile.takeIf { it.exists() }?.readText() ?: "{}"
+            )
+            library.put(
+                contentHash,
+                org.json.JSONObject()
+                    .put("w", width).put("h", height)
+                    .put("desc", description).put("saved_at", System.currentTimeMillis())
+            )
+            libraryFile.writeText(library.toString())
+        }
+    }
+
+    data class SavedImage(val contentHash: String, val width: Int, val height: Int, val description: String)
+
+    fun library(): List<SavedImage> = runCatching {
+        if (!libraryFile.exists()) return emptyList()
+        val root = org.json.JSONObject(libraryFile.readText())
+        root.keys().asSequence().mapNotNull { key ->
+            val entry = root.optJSONObject(key) ?: return@mapNotNull null
+            SavedImage(key, entry.optInt("w", 1), entry.optInt("h", 1), entry.optString("desc"))
+        }.toList()
+    }.getOrElse { emptyList() }
+
+    fun isSaved(contentHash: String): Boolean = library().any { it.contentHash == contentHash }
+
+    /** Copies a stored image into the device gallery. */
+    fun exportToGallery(context: Context, contentHash: String, displayName: String): Boolean = runCatching {
+        val source = fileFor(contentHash)
+        if (!source.exists()) return false
+        val values = android.content.ContentValues().apply {
+            put(android.provider.MediaStore.Images.Media.DISPLAY_NAME, "$displayName.webp")
+            put(android.provider.MediaStore.Images.Media.MIME_TYPE, "image/webp")
+            put(android.provider.MediaStore.Images.Media.RELATIVE_PATH, "Pictures/VeilySocial")
+        }
+        val uri = context.contentResolver.insert(
+            android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values
+        ) ?: return false
+        context.contentResolver.openOutputStream(uri)?.use { out -> out.write(source.readBytes()) }
+        true
+    }.getOrElse { false }
+
     /** Remembers which blob a stored image became, so it can be released on the network later. */
     fun recordBlob(contentHash: String, blobId: String, recordKey: String) {
         if (contentHash.isBlank() || blobId.isBlank()) return
@@ -189,7 +239,9 @@ class LocalMediaStore(context: Context) {
         }
         var removed = 0
         dir.listFiles()?.forEach { file ->
-            if (file.name == blobIndexFile.name) return@forEach
+            if (file.name == blobIndexFile.name || file.name == libraryFile.name) return@forEach
+            // Saved images survive pruning even when no page uses them any more.
+            if (isSaved(file.nameWithoutExtension)) return@forEach
             val hash = file.nameWithoutExtension
             if (hash !in referenced && file.delete()) {
                 removed++
@@ -411,6 +463,8 @@ fun QuickEditScreen(
     var showAdvancedWarning by remember(page.id) { mutableStateOf(pageHasAdvancedContent(page)) }
     var importing by remember { mutableStateOf(false) }
     var confirmDiscard by remember { mutableStateOf(false) }
+    var backgroundRevision by remember { mutableIntStateOf(0) }
+    var showLibrary by remember { mutableStateOf(false) }
     val scroll = rememberScrollState()
 
     // Snapshot on entry so leaving without saving really can put everything back, including
@@ -429,7 +483,7 @@ fun QuickEditScreen(
         }
     }
 
-    BoxWithConstraints(Modifier.fillMaxSize()) {
+    BoxWithConstraints(Modifier.fillMaxSize().safeDrawingPadding()) {
         val referenceWidthDp = maxWidth.value
 
         // replaceDocument persists to the active slot, so every exit path here is durable.
@@ -540,6 +594,13 @@ fun QuickEditScreen(
 
                 Spacer(Modifier.height(16.dp))
 
+                BackgroundPicker(
+                    current = page.root.background,
+                    onChange = { page.root.background = it; backgroundRevision++ },
+                )
+
+                Spacer(Modifier.height(16.dp))
+
                 blocks.forEachIndexed { index, block ->
                     BlockEditor(
                         block = block,
@@ -570,6 +631,9 @@ fun QuickEditScreen(
                             picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
                         }
                     ) { Text("+ Image") }
+                    if (media.library().isNotEmpty()) {
+                        OutlinedButton(onClick = { showLibrary = true }) { Text("+ Saved") }
+                    }
                 }
 
                 if (blocks.isEmpty()) {
@@ -589,6 +653,43 @@ fun QuickEditScreen(
                 )
                 Spacer(Modifier.height(40.dp))
             }
+        }
+
+        if (showLibrary) {
+            val saved = remember(showLibrary) { media.library() }
+            AlertDialog(
+                onDismissRequest = { showLibrary = false },
+                title = { Text("Saved images") },
+                text = {
+                    Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
+                        saved.forEach { item ->
+                            Row(
+                                Modifier.fillMaxWidth().clickable {
+                                    blocks = blocks + QuickBlock.Picture(
+                                        makeId("img"), item.contentHash, item.width, item.height, item.description
+                                    )
+                                    showLibrary = false
+                                }.padding(vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                media.bitmapFor(item.contentHash)?.let { bitmap ->
+                                    androidx.compose.foundation.Image(
+                                        bitmap = bitmap,
+                                        contentDescription = item.description.ifBlank { "Saved image" },
+                                        modifier = Modifier.size(48.dp),
+                                    )
+                                    Spacer(Modifier.width(10.dp))
+                                }
+                                Text(
+                                    item.description.ifBlank { "Saved image" },
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                        }
+                    }
+                },
+                confirmButton = { TextButton(onClick = { showLibrary = false }) { Text("Close") } },
+            )
         }
 
         if (confirmDiscard) {
@@ -752,5 +853,85 @@ private fun PageStrip(
             },
             dismissButton = { TextButton(onClick = { renaming = false }) { Text("Cancel") } }
         )
+    }
+}
+
+/**
+ * Background chooser for the simple editor.
+ *
+ * Deliberately narrower than the advanced editor's: one colour, or two at a fixed midpoint
+ * with either a hard edge or a fade, in one of four directions. Anything past that is what
+ * the advanced editor is for.
+ */
+@Composable
+private fun BackgroundPicker(current: BackgroundSpec, onChange: (BackgroundSpec) -> Unit) {
+    val (initialStyle, initialColours, initialDirection) = remember(current) { current.toStyleChoices() }
+    var style by remember(current) { mutableStateOf(initialStyle) }
+    var first by remember(current) { mutableIntStateOf(initialColours.first) }
+    var second by remember(current) { mutableIntStateOf(initialColours.second) }
+    var direction by remember(current) { mutableStateOf(initialDirection) }
+
+    fun push() = onChange(backgroundFor(style, first, second, direction))
+
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .45f),
+        shape = RoundedCornerShape(12.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            Text("Page background", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+
+            Row(Modifier.padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                BackgroundStyle.entries.forEach { option ->
+                    FilterChip(
+                        selected = style == option,
+                        onClick = { style = option; push() },
+                        label = {
+                            Text(
+                                when (option) {
+                                    BackgroundStyle.Solid -> "One colour"
+                                    BackgroundStyle.HardSplit -> "Split"
+                                    BackgroundStyle.SmoothFade -> "Fade"
+                                }
+                            )
+                        },
+                    )
+                }
+            }
+
+            Text(
+                if (style == BackgroundStyle.Solid) "Colour" else "First colour",
+                style = MaterialTheme.typography.labelSmall,
+                modifier = Modifier.padding(top = 10.dp, bottom = 4.dp),
+            )
+            ColourRow(selected = first) { first = it; push() }
+
+            if (style != BackgroundStyle.Solid) {
+                Text(
+                    "Second colour",
+                    style = MaterialTheme.typography.labelSmall,
+                    modifier = Modifier.padding(top = 10.dp, bottom = 4.dp),
+                )
+                ColourRow(selected = second) { second = it; push() }
+
+                Text(
+                    "Direction",
+                    style = MaterialTheme.typography.labelSmall,
+                    modifier = Modifier.padding(top = 10.dp, bottom = 4.dp),
+                )
+                Row(
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    BackgroundDirection.entries.forEach { option ->
+                        FilterChip(
+                            selected = direction == option,
+                            onClick = { direction = option; push() },
+                            label = { Text(option.label) },
+                        )
+                    }
+                }
+            }
+        }
     }
 }

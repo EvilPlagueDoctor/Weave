@@ -766,6 +766,15 @@ class SocialNetworkController(context: Context) {
         }
         comments.upsert(wire.toComment(state, CommentOrigin.Direct))
         bumpComments()
+
+        // Open mode has to publish the pointer, not just mark it accepted locally. Without
+        // this the comment was visible only to the page owner: everyone else reads the
+        // published index, and the index never learned about it.
+        if (state == CommentState.Accepted) {
+            runCatching {
+                network.keep(IndexEntry(wire.pageKey, notice.pointer, wire.authorKey, wire.id))
+            }.onFailure { log("could not publish the kept comment: ${it.message}") }
+        }
         log("comment received from ${short(sender)} (${state.name.lowercase()})")
     }
 

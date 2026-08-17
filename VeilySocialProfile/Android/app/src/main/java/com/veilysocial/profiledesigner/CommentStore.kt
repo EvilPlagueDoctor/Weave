@@ -122,6 +122,12 @@ interface CommentStore {
     fun pointerFor(id: String): Pair<String, Int>?
 
     fun byId(id: String): Comment?
+
+    /** Comments on this page the local user chose to hide. Hidden for them, not for anyone else. */
+    fun hiddenForPage(pageKey: String): List<Comment>
+
+    /** Reverses [hideForMe]. */
+    fun unhide(id: String)
 }
 
 class LocalCommentStore(context: Context) : CommentStore {
@@ -254,6 +260,16 @@ class LocalCommentStore(context: Context) : CommentStore {
     override fun pointerFor(id: String): Pair<String, Int>? = pointers[id]
 
     override fun byId(id: String): Comment? = items.firstOrNull { it.id == id }
+
+    override fun hiddenForPage(pageKey: String): List<Comment> {
+        val now = System.currentTimeMillis()
+        return items.filter { it.pageKey == pageKey && it.id in hiddenLocally && !it.isExpired(now) }
+            .sortedBy { it.createdAt }
+    }
+
+    override fun unhide(id: String) {
+        if (hiddenLocally.remove(id)) persist()
+    }
 }
 
 /**
