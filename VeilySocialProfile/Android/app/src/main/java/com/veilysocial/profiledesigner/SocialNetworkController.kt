@@ -591,7 +591,7 @@ class SocialNetworkController(context: Context) {
      * it lands in depends on who owns the page: your own page accepts your own words, and
      * anyone else's starts unaccepted until they keep it.
      */
-    fun postComment(pageKey: String, body: String, openMode: Boolean) = scope.launch {
+    fun postComment(pageKey: String, body: String, openMode: Boolean, replyTo: String? = null) = scope.launch {
         val network = commentNetwork
         val me = _ui.value.mainDht
         if (network == null || me.isBlank()) {
@@ -611,6 +611,7 @@ class SocialNetworkController(context: Context) {
             authorName = _ui.value.discoveryName.ifBlank { "Someone" },
             body = body.trim().take(MAX_COMMENT_CHARS),
             createdAt = System.currentTimeMillis(),
+            replyTo = replyTo,
         )
 
         // Store it before touching the network. Writing to a DHT record takes seconds, and

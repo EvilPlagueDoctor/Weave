@@ -405,7 +405,7 @@ fun MeScreen(
                     store = commentStore,
                     policy = ui.commentPolicy,
                     externalRevision = ui.commentRevision,
-                    onPost = { key, body, open -> controller.postComment(key, body, open) },
+                    onPost = { key, body, open, replyTo -> controller.postComment(key, body, open, replyTo) },
                     ownKey = ownKey,
                     ownName = state.doc.profileName,
                     openMode = true,

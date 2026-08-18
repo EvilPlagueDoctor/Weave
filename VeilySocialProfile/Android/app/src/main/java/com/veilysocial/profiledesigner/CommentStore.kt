@@ -56,6 +56,8 @@ data class Comment(
     val origin: CommentOrigin = CommentOrigin.Direct,
     /** Open-mode only: when the underlying request lapses. Zero means no expiry. */
     val expiresAt: Long = 0L,
+    /** Id of the comment this replies to, or null for a top-level comment. */
+    val replyTo: String? = null,
 ) {
     fun isExpired(now: Long = System.currentTimeMillis()): Boolean =
         expiresAt > 0L && now >= expiresAt && state != CommentState.Accepted
@@ -65,6 +67,7 @@ data class Comment(
         .put("author_name", authorName).put("body", body)
         .put("created_at", createdAt).put("state", state.name)
         .put("origin", origin.name).put("expires_at", expiresAt)
+        .apply { replyTo?.let { put("reply_to", it) } }
 
     companion object {
         fun fromJson(o: JSONObject) = Comment(
@@ -77,6 +80,7 @@ data class Comment(
             state = runCatching { CommentState.valueOf(o.optString("state")) }.getOrDefault(CommentState.Held),
             origin = runCatching { CommentOrigin.valueOf(o.optString("origin")) }.getOrDefault(CommentOrigin.Direct),
             expiresAt = o.optLong("expires_at"),
+            replyTo = o.optString("reply_to").takeIf { it.isNotBlank() },
         )
     }
 }

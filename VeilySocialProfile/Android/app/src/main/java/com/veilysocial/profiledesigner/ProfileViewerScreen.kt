@@ -121,7 +121,7 @@ fun ProfileViewerScreen(
     openComments: Boolean,
     commentPolicy: CommentPolicy,
     commentRevision: Long,
-    onPostComment: (pageKey: String, body: String, openMode: Boolean) -> Unit,
+    onPostComment: (pageKey: String, body: String, openMode: Boolean, replyTo: String?) -> Unit,
     onSyncComments: (pageKey: String) -> Unit,
     onSaveImageToGallery: (Element) -> Unit,
     onCopyImageLocation: (Element) -> Unit,
@@ -369,11 +369,13 @@ fun CommentsSection(
     policy: CommentPolicy,
     /** Bumped by the controller whenever the local store changes, including from the network. */
     externalRevision: Long,
-    onPost: (pageKey: String, body: String, openMode: Boolean) -> Unit,
+    onPost: (pageKey: String, body: String, openMode: Boolean, replyTo: String?) -> Unit,
     onPosted: () -> Unit,
 ) {
     var revision by remember(pageKey) { mutableIntStateOf(0) }
     var draft by remember(pageKey) { mutableStateOf("") }
+    var replyDraft by remember(pageKey) { mutableStateOf("") }
+    var replyingTo by remember(pageKey) { mutableStateOf<String?>(null) }
     val comments = remember(pageKey, revision, externalRevision) { store.forPage(pageKey) }
     // Your own comments that this page's owner hasn't released yet. Shown to you only so
     // the post button doesn't look broken — the decision is not yours to make.
@@ -410,50 +412,27 @@ fun CommentsSection(
             )
         }
 
-        comments.forEach { comment ->
-            var expanded by remember(comment.id) { mutableStateOf(false) }
-            Row(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
-                Identicon(comment.authorKey.ifBlank { comment.authorName }, size = 28.dp)
-                Spacer(Modifier.width(10.dp))
-                Column(Modifier.weight(1f)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(comment.authorName, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
-                        commentStatusLabel(comment)?.let { label ->
-                            Spacer(Modifier.width(8.dp))
-                            Surface(
-                                color = if (comment.state == CommentState.Failed) {
-                                    MaterialTheme.colorScheme.errorContainer
-                                } else {
-                                    MaterialTheme.colorScheme.surfaceVariant
-                                },
-                                shape = RoundedCornerShape(999.dp)
-                            ) {
-                                Text(
-                                    label,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 1.dp)
-                                )
-                            }
-                        }
-                    }
-                    SelectionContainer {
-                        Text(displayBody(comment, expanded), style = MaterialTheme.typography.bodyMedium)
-                    }
-                    if (comment.body.length > COMMENT_TRUNCATE_CHARS) {
-                        TextButton(
-                            onClick = { expanded = !expanded },
-                            contentPadding = PaddingValues(0.dp),
-                            modifier = Modifier.height(28.dp)
-                        ) {
-                            Text(if (expanded) "Show less" else "Show more", style = MaterialTheme.typography.labelSmall)
-                        }
-                    }
-                }
-                TextButton(onClick = { store.hideForMe(comment.id); revision++ }, contentPadding = PaddingValues(horizontal = 6.dp)) {
-                    Text("Hide", style = MaterialTheme.typography.labelSmall)
-                }
-            }
+        val roots = remember(comments) { buildCommentTree(comments) }
+        val threadView = rememberThreadViewState(pageKey)
+
+        if (roots.isNotEmpty()) {
+            ThreadedComments(
+                roots = roots,
+                view = threadView,
+                replyingTo = replyingTo,
+                replyDraft = replyDraft,
+                canReply = policy != CommentPolicy.Closed,
+                onReplyDraftChange = { replyDraft = it },
+                onStartReply = { id -> replyingTo = id; replyDraft = "" },
+                onSubmitReply = { parentId ->
+                    onPost(pageKey, replyDraft, openMode, parentId)
+                    replyDraft = ""
+                    replyingTo = null
+                    revision++
+                    onPosted()
+                },
+                onHide = { id -> store.hideForMe(id); revision++ },
+            )
         }
 
         if (hidden.isNotEmpty()) {
@@ -514,7 +493,7 @@ fun CommentsSection(
             value = draft,
             onValueChange = { draft = it.take(MAX_COMMENT_CHARS) },
             modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-            label = { Text("Leave a comment") },
+            label = { Text(if (roots.isEmpty()) "Leave a comment" else "Start a new thread") },
             minLines = 2,
         )
         Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.End) {
@@ -522,7 +501,7 @@ fun CommentsSection(
                 onClick = {
                     // Posting goes through the controller: it writes to this device's own
                     // comment record, notifies the page owner, and updates the local store.
-                    onPost(pageKey, draft, openMode)
+                    onPost(pageKey, draft, openMode, null)
                     draft = ""
                     revision++
                     onPosted()

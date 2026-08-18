@@ -171,6 +171,8 @@ data class WireComment(
     val authorName: String,
     val body: String,
     val createdAt: Long,
+    /** Id of the comment being replied to. Replies are ordinary comments on the same page. */
+    val replyTo: String? = null,
 ) {
     fun toBytes(): ByteArray = JSONObject()
         .put("v", 1)
@@ -180,10 +182,12 @@ data class WireComment(
         .put("name", authorName)
         .put("body", body)
         .put("ts", createdAt)
+        .apply { replyTo?.let { put("re", it) } }
         .toString()
         .encodeToByteArray()
 
     fun toComment(state: CommentState, origin: CommentOrigin, expiresAt: Long = 0L) = Comment(
+        replyTo = replyTo,
         id = id,
         pageKey = pageKey,
         authorKey = authorKey,
@@ -205,6 +209,7 @@ data class WireComment(
                 authorName = json.optString("name").ifBlank { "Someone" }.take(60),
                 body = json.optString("body").take(MAX_COMMENT_CHARS),
                 createdAt = json.optLong("ts"),
+                replyTo = json.optString("re").takeIf { it.isNotBlank() },
             )
         }.getOrNull()
     }

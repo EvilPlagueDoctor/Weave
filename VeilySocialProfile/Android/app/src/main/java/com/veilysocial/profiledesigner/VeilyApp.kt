@@ -241,7 +241,9 @@ private fun ProfileDestination(
             openComments = true,
             commentPolicy = controller.commentPolicyFor(mainDht),
             commentRevision = ui.commentRevision,
-            onPostComment = { pageKey, body, openMode -> controller.postComment(pageKey, body, openMode) },
+            onPostComment = { pageKey, body, openMode, replyTo ->
+                controller.postComment(pageKey, body, openMode, replyTo)
+            },
             onSyncComments = { pageKey -> controller.syncComments(mainDht, pageKey) },
             onSaveImageToGallery = { element ->
                 val ok = media.exportToGallery(context, element.mediaContentHash, element.mediaTitle.ifBlank { "image" })
