@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+        Declared by the VeilKnit daemon at protectionLevel="signature".
+        It is only granted if this APK is signed with the same key as the daemon APK,
+        and only at install time - install the daemon BEFORE installing this app.
+    -->
+    <uses-permission android:name="com.example.veilknit_deamon.permission.BIND_VEILKNIT_API" />
+
+    <!--
+        Required on targetSdk 30+ (this app targets 36). Without it the daemon package is
+        invisible to this process and bindService() silently returns false, which is what
+        produced "Could not bind VeilKnit daemon API".
+        The <package> entry covers Intent.setPackage(); the <intent> entry covers
+        queryIntentServices() used by the bind diagnostics in DaemonClient.
+    -->
+    <queries>
+        <package android:name="com.example.veilknit_deamon" />
+        <intent>
+            <action android:name="com.example.veilknit_deamon.BIND_LOCAL_API" />
+        </intent>
+    </queries>
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <activity
+            android:name=".MainActivity"
+            android:screenOrientation="unspecified"
+            android:windowSoftInputMode="adjustResize"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

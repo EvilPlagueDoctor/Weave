@@ -1,0 +1,8 @@
+Weave Android identity validation (v4)
+- Canonical display name: Weave.
+- APP_ID: weave.v1.
+- Android applicationId/namespace: app.weave.
+- APK output prefix: Weave-.
+- Profile content type: application/x-weave-vspf-text;version=3.
+- No VeilKnit Weave / com.veilknit.weave / veilknit.weave.v1 identity references should remain.
+- VeilKnit references that remain refer specifically to the daemon/network/API and are intentional.
