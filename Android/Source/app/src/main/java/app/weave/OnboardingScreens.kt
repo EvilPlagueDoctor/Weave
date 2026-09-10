@@ -337,6 +337,8 @@ fun MeScreen(
     media: LocalMediaStore,
     loader: MediaLoader,
     ownKey: String,
+    moderationCount: Int,
+    onModeration: () -> Unit,
     onQuickEdit: (Int) -> Unit,
     onAdvancedEdit: () -> Unit,
     onSettings: () -> Unit,
@@ -384,6 +386,9 @@ fun MeScreen(
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                }
+                TextButton(onClick = onModeration) {
+                    Text(if (moderationCount > 0) "${tr("Activity")} $moderationCount" else tr("Activity"))
                 }
                 TextButton(onClick = onAdvancedEdit, enabled = !showingLive) { Text(tr("Advanced")) }
                 TextButton(onClick = { onQuickEdit(pageIndex) }, enabled = !showingLive) { Text(tr("Edit")) }

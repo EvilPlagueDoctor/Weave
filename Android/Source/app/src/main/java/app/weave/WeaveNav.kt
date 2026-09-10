@@ -1,5 +1,6 @@
 package app.weave
 
+import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
@@ -8,23 +9,27 @@ import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshots.SnapshotStateList
-import androidx.compose.runtime.Composable
+
+/** Which half of Weave the shared Home/Search/Me controls currently describe. */
+enum class BrowseMode(val label: String, val glyph: String) {
+    People("People", "👤"),
+    Groups("Groups", "👥"),
+}
 
 /**
- * Bottom-bar destinations. These are places you live, not actions you take.
- * Page turning belongs to the page rail; settings lives inside Me.
+ * Bottom-bar destinations. The old Activity slot is now a People/Groups mode switch, not
+ * another navigation stack. Activity remains a destination reached through Me when moderation
+ * actually needs attention.
  */
 enum class Tab(val label: String, val glyph: String) {
     Home("Home", "\u25C9"),
     Search("Search", "\u2315"),
-    Me("Me", "\u25A3"),
-    Activity("Activity", "\u25CE");
+    Me("Me", "\u25A3");
 
     fun root(): Destination = when (this) {
         Home -> Destination.Home
         Search -> Destination.Search
         Me -> Destination.Me
-        Activity -> Destination.Activity
     }
 }
 
@@ -32,15 +37,18 @@ sealed interface Destination {
     data object Home : Destination
     data object Search : Destination
     data object Me : Destination
+
+    /** Existing profile-comment moderation/history, now reached from Me instead of a permanent tab. */
     data object Activity : Destination
 
-    /** Someone else's book. [mainDht] identifies the profile; the page index lives in viewer state. */
     data class Profile(val mainDht: String) : Destination
-
-    /** Simple stacked editor. [pageIndex] is the page of your own book being edited. */
     data class QuickEdit(val pageIndex: Int) : Destination
     data object Editor : Destination
     data object Settings : Destination
+
+    data class Group(val groupId: String) : Destination
+    data class GroupEditor(val groupId: String? = null) : Destination
+    data object GroupModeration : Destination
 }
 
 private fun Destination.encode(): String = when (this) {
@@ -50,8 +58,11 @@ private fun Destination.encode(): String = when (this) {
     Destination.Activity -> "activity"
     Destination.Editor -> "editor"
     Destination.Settings -> "settings"
+    Destination.GroupModeration -> "group-moderation"
     is Destination.Profile -> "profile\u0000$mainDht"
     is Destination.QuickEdit -> "quickedit\u0000$pageIndex"
+    is Destination.Group -> "group\u0000$groupId"
+    is Destination.GroupEditor -> "groupedit\u0000${groupId.orEmpty()}"
 }
 
 private fun decodeDestination(raw: String): Destination = when {
@@ -61,44 +72,57 @@ private fun decodeDestination(raw: String): Destination = when {
     raw == "activity" -> Destination.Activity
     raw == "editor" -> Destination.Editor
     raw == "settings" -> Destination.Settings
+    raw == "group-moderation" -> Destination.GroupModeration
     raw.startsWith("profile\u0000") -> Destination.Profile(raw.substringAfter('\u0000'))
-    raw.startsWith("quickedit\u0000") -> Destination.QuickEdit(raw.substringAfter('\u0000').toIntOrNull() ?: 0)
+    raw.startsWith("quickedit\u0000") ->
+        Destination.QuickEdit(raw.substringAfter('\u0000').toIntOrNull() ?: 0)
+    raw.startsWith("group\u0000") -> Destination.Group(raw.substringAfter('\u0000'))
+    raw.startsWith("groupedit\u0000") ->
+        Destination.GroupEditor(raw.substringAfter('\u0000').takeIf { it.isNotBlank() })
     else -> Destination.Home
 }
 
+private data class NavKey(val mode: BrowseMode, val tab: Tab)
+
 /**
- * One back stack per tab, the way every well-behaved mobile app does it: switching tabs
- * preserves where you were, tapping the tab you're already on returns to its root.
+ * A separate back stack for every (mode, tab) pair. Switching People -> Groups therefore does
+ * not destroy the profile or group the user was looking at, while tapping an already-selected
+ * Home/Search/Me control still returns that section to its root.
  */
 @Stable
 class WeaveNavState(
     initialTab: Tab = Tab.Me,
-    initialStacks: Map<Tab, List<Destination>> = emptyMap(),
+    initialMode: BrowseMode = BrowseMode.People,
+    initialStacks: Map<Pair<BrowseMode, Tab>, List<Destination>> = emptyMap(),
 ) {
     var tab by mutableStateOf(initialTab)
         private set
 
-    private val stacks: Map<Tab, SnapshotStateList<Destination>> =
-        Tab.values().associateWith { t ->
-            mutableStateListOf<Destination>().apply {
-                val restored = initialStacks[t].orEmpty()
-                if (restored.isEmpty()) add(t.root()) else addAll(restored)
+    var mode by mutableStateOf(initialMode)
+        private set
+
+    private val stacks: Map<NavKey, SnapshotStateList<Destination>> =
+        BrowseMode.entries.flatMap { m -> Tab.entries.map { t -> NavKey(m, t) } }
+            .associateWith { key ->
+                mutableStateListOf<Destination>().apply {
+                    val restored = initialStacks[key.mode to key.tab].orEmpty()
+                    if (restored.isEmpty()) add(key.tab.root()) else addAll(restored)
+                }
             }
-        }
 
-    val current: Destination get() = stacks.getValue(tab).last()
+    private fun stack(): SnapshotStateList<Destination> =
+        stacks.getValue(NavKey(mode, tab))
 
-    val depth: Int get() = stacks.getValue(tab).size
+    val current: Destination get() = stack().last()
+    val depth: Int get() = stack().size
 
     fun push(destination: Destination) {
-        val stack = stacks.getValue(tab)
+        val stack = stack()
         if (stack.last() != destination) stack.add(destination)
     }
 
-    /** Swaps the top of the stack. Used when swiping profile-to-profile so back doesn't
-     *  replay every profile you flicked past. */
     fun replaceTop(destination: Destination) {
-        val stack = stacks.getValue(tab)
+        val stack = stack()
         if (stack.size == 1) stack.add(destination) else stack[stack.lastIndex] = destination
     }
 
@@ -106,14 +130,24 @@ class WeaveNavState(
         if (next == tab) popToRoot() else tab = next
     }
 
+    fun selectMode(next: BrowseMode) {
+        if (next == mode) return
+        mode = next
+    }
+
+    fun toggleMode(): BrowseMode {
+        mode = if (mode == BrowseMode.People) BrowseMode.Groups else BrowseMode.People
+        return mode
+    }
+
     fun popToRoot() {
-        val stack = stacks.getValue(tab)
+        val stack = stack()
         while (stack.size > 1) stack.removeAt(stack.lastIndex)
     }
 
-    /** Returns false when there is nowhere left to go, so the caller can let the OS close the app. */
+    /** Returns false when there is nowhere left to go. */
     fun pop(): Boolean {
-        val stack = stacks.getValue(tab)
+        val stack = stack()
         if (stack.size > 1) {
             stack.removeAt(stack.lastIndex)
             return true
@@ -126,11 +160,17 @@ class WeaveNavState(
     }
 
     internal fun snapshot(): List<String> = buildList {
+        add("weave-nav-v2")
+        add(mode.name)
         add(tab.name)
-        Tab.values().forEach { t ->
-            add(t.name)
-            add(stacks.getValue(t).size.toString())
-            stacks.getValue(t).forEach { add(it.encode()) }
+        BrowseMode.entries.forEach { m ->
+            Tab.entries.forEach { t ->
+                val s = stacks.getValue(NavKey(m, t))
+                add(m.name)
+                add(t.name)
+                add(s.size.toString())
+                s.forEach { add(it.encode()) }
+            }
         }
     }
 
@@ -139,15 +179,22 @@ class WeaveNavState(
             save = { it.snapshot() },
             restore = { raw ->
                 runCatching {
-                    var i = 0
+                    if (raw.firstOrNull() != "weave-nav-v2") {
+                        // Old snapshots had Activity as a fourth tab. Dropping a stale navigation
+                        // snapshot is safer than reviving Activity as a permanent tab.
+                        return@runCatching WeaveNavState()
+                    }
+                    var i = 1
+                    val mode = BrowseMode.valueOf(raw[i++])
                     val tab = Tab.valueOf(raw[i++])
-                    val stacks = mutableMapOf<Tab, List<Destination>>()
+                    val restored = mutableMapOf<Pair<BrowseMode, Tab>, List<Destination>>()
                     while (i < raw.size) {
+                        val m = BrowseMode.valueOf(raw[i++])
                         val t = Tab.valueOf(raw[i++])
                         val count = raw[i++].toInt()
-                        stacks[t] = (0 until count).map { decodeDestination(raw[i++]) }
+                        restored[m to t] = (0 until count).map { decodeDestination(raw[i++]) }
                     }
-                    WeaveNavState(tab, stacks)
+                    WeaveNavState(tab, mode, restored)
                 }.getOrElse { WeaveNavState() }
             }
         )
@@ -155,5 +202,9 @@ class WeaveNavState(
 }
 
 @Composable
-fun rememberWeaveNavState(initialTab: Tab = Tab.Me): WeaveNavState =
-    rememberSaveable(saver = WeaveNavState.Saver) { WeaveNavState(initialTab) }
+fun rememberWeaveNavState(
+    initialTab: Tab = Tab.Me,
+    initialMode: BrowseMode = BrowseMode.People,
+): WeaveNavState = rememberSaveable(saver = WeaveNavState.Saver) {
+    WeaveNavState(initialTab, initialMode)
+}

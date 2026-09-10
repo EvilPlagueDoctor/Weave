@@ -124,8 +124,18 @@ private fun WeaveShell(
     widgetsEnabled: Boolean,
     onWidgetsEnabledChange: (Boolean) -> Unit,
 ) {
-    val nav = rememberWeaveNavState(initialTab = Tab.Me)
+    val groupStore = controller.groups
+    val nav = rememberWeaveNavState(
+        initialTab = Tab.Me,
+        initialMode = groupStore.preferredMode,
+    )
     val ui by controller.ui.collectAsState()
+    val groupRevision = groupStore.revision
+    val profileModerationCount = remember(ui.commentRevision, ui.mainDht) {
+        commentStore.quarantined(ui.mainDht).size
+    }
+    val groupModerationCount = remember(groupRevision) { groupStore.pendingActionCount() }
+    val moderationCount = profileModerationCount + groupModerationCount
     val destination = nav.current
 
     BackHandler(enabled = true) { nav.pop() }
@@ -150,28 +160,55 @@ private fun WeaveShell(
     Column(Modifier.fillMaxSize().safeDrawingPadding()) {
         Box(Modifier.weight(1f).fillMaxWidth()) {
             when (destination) {
-                Destination.Home -> HomeScreen(
-                    controller = controller,
-                    followStore = followStore,
-                    onOpen = { nav.push(Destination.Profile(it)) }
-                )
+                Destination.Home -> if (nav.mode == BrowseMode.Groups) {
+                    GroupHomeScreen(
+                        store = groupStore,
+                        onOpen = { nav.push(Destination.Group(it)) },
+                    )
+                } else {
+                    HomeScreen(
+                        controller = controller,
+                        followStore = followStore,
+                        onOpen = { nav.push(Destination.Profile(it)) },
+                    )
+                }
 
-                Destination.Search -> SearchScreen(
-                    controller = controller,
-                    onOpen = { nav.push(Destination.Profile(it)) }
-                )
+                Destination.Search -> if (nav.mode == BrowseMode.Groups) {
+                    GroupSearchScreen(
+                        store = groupStore,
+                        onOpen = { nav.push(Destination.Group(it)) },
+                    )
+                } else {
+                    SearchScreen(
+                        controller = controller,
+                        onOpen = { nav.push(Destination.Profile(it)) },
+                    )
+                }
 
-                Destination.Me -> MeScreen(
-                    state = state,
-                    controller = controller,
-                    commentStore = commentStore,
-                    media = media,
-                    loader = mediaLoader,
-                    ownKey = ui.mainDht,
-                    onQuickEdit = { page -> nav.push(Destination.QuickEdit(page)) },
-                    onAdvancedEdit = { nav.push(Destination.Editor) },
-                    onSettings = { nav.push(Destination.Settings) },
-                )
+                Destination.Me -> if (nav.mode == BrowseMode.Groups) {
+                    GroupMeScreen(
+                        store = groupStore,
+                        ownKey = ui.mainDht,
+                        onOpen = { nav.push(Destination.Group(it)) },
+                        onCreate = { nav.push(Destination.GroupEditor(null)) },
+                        onManage = { nav.push(Destination.GroupEditor(it)) },
+                        onModeration = { nav.push(Destination.GroupModeration) },
+                    )
+                } else {
+                    MeScreen(
+                        state = state,
+                        controller = controller,
+                        commentStore = commentStore,
+                        media = media,
+                        loader = mediaLoader,
+                        ownKey = ui.mainDht,
+                        moderationCount = profileModerationCount,
+                        onModeration = { nav.push(Destination.Activity) },
+                        onQuickEdit = { page -> nav.push(Destination.QuickEdit(page)) },
+                        onAdvancedEdit = { nav.push(Destination.Editor) },
+                        onSettings = { nav.push(Destination.Settings) },
+                    )
+                }
 
                 Destination.Activity -> ActivityScreen(
                     store = commentStore,
@@ -179,6 +216,60 @@ private fun WeaveShell(
                     externalRevision = ui.commentRevision,
                     onKeep = { id -> controller.keepComment(id) },
                     onDrop = { id -> controller.dropComment(id) },
+                )
+
+                is Destination.Group -> {
+                    val group = groupStore.byId(destination.groupId)
+                    val canManage = group?.role == GroupRole.Creator || group?.ownerId == ui.mainDht
+                    GroupDetailScreen(
+                        store = groupStore,
+                        groupId = destination.groupId,
+                        ownMainDht = ui.mainDht,
+                        onBack = { nav.pop() },
+                        onManage = if (canManage) {
+                            { nav.push(Destination.GroupEditor(destination.groupId)) }
+                        } else null,
+                        onRefreshBranch = { branch ->
+                            controller.refreshGroupBranch(branch) { record, pulse ->
+                                groupStore.upsertDiscovered(record, pulse, branch.branchId)
+                            }
+                        },
+                        onClaim = {
+                            controller.claimGroup(destination.groupId) { claim ->
+                                groupStore.selectBranch(destination.groupId, claim.branchId)
+                            }
+                        },
+                        onJoin = {
+                            when (group?.policy?.join) {
+                                GroupJoinPolicy.Open -> groupStore.setJoined(destination.groupId, true)
+                                GroupJoinPolicy.Request -> controller.requestGroupJoin(destination.groupId)
+                                GroupJoinPolicy.Invite, null -> Unit
+                            }
+                        },
+                        onLeave = { groupStore.setJoined(destination.groupId, false) },
+                        onAddModerator = { moderatorMainDht ->
+                            controller.grantGroupModerator(destination.groupId, moderatorMainDht)
+                        },
+                    )
+                }
+
+                is Destination.GroupEditor -> GroupEditorScreen(
+                    store = groupStore,
+                    ownKey = ui.mainDht,
+                    groupId = destination.groupId,
+                    onPublish = { group, pulse ->
+                        controller.publishGroup(group, pulse) { published ->
+                            groupStore.updateGroup(published)
+                        }
+                    },
+                    onSaved = { id -> nav.replaceTop(Destination.Group(id)) },
+                    onBack = { nav.pop() },
+                )
+
+                Destination.GroupModeration -> GroupModerationScreen(
+                    store = groupStore,
+                    onBack = { nav.pop() },
+                    onResolve = { taskId, approve -> controller.resolveGroupModerationTask(taskId, approve) },
                 )
 
                 Destination.Settings -> SettingsScreen(
@@ -202,6 +293,8 @@ private fun WeaveShell(
                     state = state,
                     ownKey = ui.mainDht,
                     ownName = state.doc.profileName,
+                    groupStore = groupStore,
+                    onOpenGroup = { nav.push(Destination.Group(it)) },
                     onNavigate = { nav.replaceTop(Destination.Profile(it)) },
                     onBack = { nav.pop() },
                 )
@@ -209,7 +302,11 @@ private fun WeaveShell(
                 Destination.Editor, is Destination.QuickEdit -> Unit // handled above
             }
         }
-        WeaveBottomBar(nav)
+        WeaveBottomBar(
+            nav = nav,
+            moderationCount = moderationCount,
+            onModeChanged = { groupStore.preferredMode = it },
+        )
     }
 }
 
@@ -225,12 +322,16 @@ private fun ProfileDestination(
     state: EditorState,
     ownKey: String,
     ownName: String,
+    groupStore: GroupStore,
+    onOpenGroup: (String) -> Unit,
     onNavigate: (String) -> Unit,
     onBack: () -> Unit,
 ) {
     val ui by controller.ui.collectAsState()
     val context = LocalContext.current
     val appLanguage = LocalAppLanguage.current
+    val groupRevision = groupStore.revision
+    val profileGroups = remember(groupRevision, mainDht) { groupStore.directoryFor(mainDht) }
     var following by remember(mainDht) { mutableStateOf(followStore.isFollowing(mainDht)) }
 
     // The swipe queue is whatever list the user opened from, in its current order.
@@ -310,6 +411,8 @@ private fun ProfileDestination(
                 copyToClipboard(context, "Profile key", remote.mainDht)
                 toast(context, translateUi("Copied", appLanguage))
             },
+            profileGroups = profileGroups,
+            onOpenGroup = onOpenGroup,
             isFollowing = following,
             onToggleFollow = { following = followStore.toggle(mainDht) },
             onPrevProfile = if (position > 0) ({ onNavigate(queue[position - 1]) }) else null,
@@ -350,32 +453,63 @@ private fun toast(context: android.content.Context, message: String) {
 }
 
 @Composable
-private fun WeaveBottomBar(nav: WeaveNavState) {
+private fun WeaveBottomBar(
+    nav: WeaveNavState,
+    moderationCount: Int,
+    onModeChanged: (BrowseMode) -> Unit,
+) {
     Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 3.dp) {
-        Row(Modifier.fillMaxWidth().height(58.dp), verticalAlignment = Alignment.CenterVertically) {
-            Tab.values().forEach { tab ->
-                val selected = nav.tab == tab
-                Column(
-                    Modifier
-                        .weight(1f)
-                        .fillMaxHeight()
-                        .clickable { nav.selectTab(tab) },
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center
-                ) {
-                    Text(
-                        tab.glyph,
-                        style = MaterialTheme.typography.titleMedium,
-                        color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Text(
-                        tr(tab.label),
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-                        color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
+        Row(Modifier.fillMaxWidth().height(62.dp), verticalAlignment = Alignment.CenterVertically) {
+            BottomTabButton(nav, Tab.Home)
+            BottomTabButton(nav, Tab.Search)
+
+            Column(
+                Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .clickable {
+                        val next = nav.toggleMode()
+                        onModeChanged(next)
+                    },
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
+            ) {
+                Text(nav.mode.glyph, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
+                Text(
+                    tr(nav.mode.label),
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.primary,
+                )
             }
+
+            BottomTabButton(nav, Tab.Me, moderationCount)
         }
+    }
+}
+
+@Composable
+private fun RowScope.BottomTabButton(
+    nav: WeaveNavState,
+    tab: Tab,
+    badge: Int = 0,
+) {
+    val selected = nav.tab == tab
+    Column(
+        Modifier.weight(1f).fillMaxHeight().clickable { nav.selectTab(tab) },
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Text(
+            if (badge > 0) "${tab.glyph} ${if (badge > 99) "99+" else badge}" else tab.glyph,
+            style = MaterialTheme.typography.titleMedium,
+            color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            tr(tab.label),
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }

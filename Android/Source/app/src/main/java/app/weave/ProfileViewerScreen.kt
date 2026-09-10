@@ -130,6 +130,8 @@ fun ProfileViewerScreen(
     onSaveImageToEditor: (Element) -> Unit,
     onSaveProfileCopy: (RemoteProfile) -> Unit,
     onCopyProfileKey: (RemoteProfile) -> Unit,
+    profileGroups: List<GroupDirectoryEntry> = emptyList(),
+    onOpenGroup: (String) -> Unit = {},
     isFollowing: Boolean,
     onToggleFollow: () -> Unit,
     onPrevProfile: (() -> Unit)?,
@@ -214,6 +216,9 @@ fun ProfileViewerScreen(
                     onPrev = { if (pageIndex > 0) pageIndex-- },
                     onNext = { if (pageIndex < profile.pageCount - 1) pageIndex++ },
                 )
+                if (profileGroups.isNotEmpty()) {
+                    ProfileGroupsSection(profileGroups, onOpenGroup)
+                }
                 CommentsSection(
                     pageKey = pageKeyOf(profile.mainDht, page.id),
                     pageOwnerKey = profile.mainDht,
@@ -249,6 +254,36 @@ fun ProfileViewerScreen(
             onSaveCopy = { onSaveProfileCopy(profile) },
             onCopyKey = { onCopyProfileKey(profile) },
         )
+    }
+}
+
+
+@Composable
+private fun ProfileGroupsSection(
+    groups: List<GroupDirectoryEntry>,
+    onOpenGroup: (String) -> Unit,
+) {
+    Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
+        Text("Groups", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+        groups.take(12).forEach { group ->
+            Surface(
+                modifier = Modifier.fillMaxWidth().padding(top = 6.dp).clickable { onOpenGroup(group.groupId) },
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                shape = RoundedCornerShape(10.dp),
+            ) {
+                Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(group.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            if (group.kind == GroupBranchKind.Original) "Created" else "Claimed moderation",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Text("→")
+                }
+            }
+        }
     }
 }
 

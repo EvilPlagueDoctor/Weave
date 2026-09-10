@@ -67,12 +67,15 @@ class SocialNetworkController(context: Context) {
 
     /** Local read model for comments. Owned here so the sync path and the UI share one instance. */
     val comments: CommentStore = LocalCommentStore(appContext)
+    val groups: GroupStore = GroupStore(appContext)
     private var commentNetwork: CommentNetwork? = null
+    private var groupRuntime: GroupRuntime? = null
     private val _ui = MutableStateFlow(SocialUiState())
     val ui: StateFlow<SocialUiState> = _ui.asStateFlow()
 
     private var daemon: DaemonClient? = null
     private var messageSubscription: Long? = null
+    private var groupServiceSubscription: Long? = null
     private var networkJob: Job? = null
     private val cache = KnowledgeCache()
     // Concurrent collections rather than plain ones: the worker loop, every incoming message,
@@ -114,6 +117,14 @@ class SocialNetworkController(context: Context) {
                     val mainDht = identity.getString("main_dht")
                     _ui.value = _ui.value.copy(mainDht = mainDht, status = "Connected; preparing profile-page DHT…")
                     ensureProfileStore()
+                    groupRuntime = GroupRuntime(
+                        client = daemon!!,
+                        store = groups,
+                        profileStoreId = { profileStoreId },
+                        ownMainDht = { _ui.value.mainDht },
+                    )
+                    subscribeGroupOpenIntake()
+                    groupRuntime?.publishMyDirectory()
                     readOwnRecord()
                     subscribeMessages()
                     refreshPeers()
@@ -157,7 +168,10 @@ class SocialNetworkController(context: Context) {
                     updateStatus("Connection lost; retrying…")
                 } finally {
                     messageSubscription?.let { id -> runCatching { daemon?.unsubscribe(id) } }
+                    groupServiceSubscription?.let { id -> runCatching { daemon?.unsubscribe(id) } }
                     messageSubscription = null
+                    groupServiceSubscription = null
+                    groupRuntime = null
                     runCatching { daemon?.close() }
                     daemon = null
                 }
@@ -176,7 +190,9 @@ class SocialNetworkController(context: Context) {
      */
     private fun resetNetworkIdentityState() {
         messageSubscription = null
+        groupServiceSubscription = null
         commentNetwork = null
+        groupRuntime = null
         profileStoreId = null
         ownRecord = null
         activeIntent = null
@@ -210,7 +226,10 @@ class SocialNetworkController(context: Context) {
     /** Tears the connection down and dials again. Used by the retry control on the gate. */
     fun restart() {
         messageSubscription?.let { runCatching { daemon?.unsubscribe(it) } }
+        groupServiceSubscription?.let { runCatching { daemon?.unsubscribe(it) } }
         messageSubscription = null
+        groupServiceSubscription = null
+        groupRuntime = null
         networkJob?.cancel()
         networkJob = null
         runCatching { daemon?.close() }
@@ -221,7 +240,10 @@ class SocialNetworkController(context: Context) {
 
     fun stop() {
         messageSubscription?.let { daemon?.unsubscribe(it) }
+        groupServiceSubscription?.let { daemon?.unsubscribe(it) }
         messageSubscription = null
+        groupServiceSubscription = null
+        groupRuntime = null
         networkJob?.cancel()
         networkJob = null
         daemon?.close()
@@ -405,6 +427,108 @@ class SocialNetworkController(context: Context) {
 
     fun profileText(mainDht: String): String? = profileDocuments[mainDht]
 
+
+    // ---------------------------------------------------------------------
+    // Groups / moderation branches
+    // ---------------------------------------------------------------------
+
+    fun publishGroup(
+        group: GroupRecord,
+        pulse: GroupPulse,
+        onPublished: (GroupRecord) -> Unit = {},
+    ) = scope.launch {
+        try {
+            val runtime = groupRuntime ?: error("Group runtime is not ready")
+            val published = runtime.publishOriginal(group, pulse)
+            withContext(Dispatchers.Main.immediate) { onPublished(published) }
+            log("published group ${published.name}: ${short(published.rootRecordKey)}")
+        } catch (t: Throwable) {
+            log("group publish failed: ${t.message}")
+        }
+    }
+
+    fun refreshGroupBranch(
+        branch: GroupBranchPointer,
+        onLoaded: (GroupRecord, GroupPulse?) -> Unit = { _, _ -> },
+    ) = scope.launch {
+        try {
+            val loaded = groupRuntime?.refreshBranch(branch) ?: error("Group branch unavailable")
+            withContext(Dispatchers.Main.immediate) { onLoaded(loaded.first, loaded.second) }
+        } catch (t: Throwable) {
+            log("group branch refresh failed: ${t.message}")
+        }
+    }
+
+    fun claimGroup(groupId: String, onClaimed: (GroupBranchHeader) -> Unit = {}) = scope.launch {
+        try {
+            val claim = groupRuntime?.claim(groupId) ?: error("Group runtime is not ready")
+            withContext(Dispatchers.Main.immediate) { onClaimed(claim) }
+            log("claimed group ${short(groupId)} as branch ${short(claim.branchId)}")
+        } catch (t: Throwable) {
+            log("group claim failed: ${t.message}")
+        }
+    }
+
+    fun submitGroupConversation(groupId: String, conversation: WeaveObjectRef, title: String) = scope.launch {
+        runCatching {
+            groupRuntime?.submitConversation(groupId, conversation, title) ?: error("Group runtime is not ready")
+        }.onFailure { log("group conversation submit failed: ${it.message}") }
+    }
+
+    fun submitGroupPost(
+        groupId: String,
+        conversationId: String,
+        message: WeaveMessage,
+        messageRef: WeaveObjectRef,
+    ) = scope.launch {
+        runCatching {
+            groupRuntime?.submitPost(groupId, conversationId, message, messageRef) ?: error("Group runtime is not ready")
+        }.onFailure { log("group post submit failed: ${it.message}") }
+    }
+
+    fun reportGroupPost(groupId: String, postId: String, postHash: String, reason: String) = scope.launch {
+        runCatching {
+            groupRuntime?.submitReport(groupId, postId, postHash, reason) ?: error("Group runtime is not ready")
+        }.onFailure { log("group report failed: ${it.message}") }
+    }
+
+    fun requestGroupJoin(groupId: String, message: String = "") = scope.launch {
+        runCatching {
+            groupRuntime?.requestJoin(groupId, message) ?: error("Group runtime is not ready")
+        }.onFailure { log("group join request failed: ${it.message}") }
+    }
+
+    fun moderateGroupPost(
+        groupId: String,
+        postId: String,
+        conversationId: String,
+        postHash: String,
+        state: GroupPostState,
+        messageRef: WeaveObjectRef?,
+        reason: String = "",
+    ) = scope.launch {
+        runCatching {
+            groupRuntime?.moderatePost(groupId, postId, conversationId, postHash, state, messageRef, reason)
+                ?: error("Group runtime is not ready")
+        }.onFailure { log("group moderation action failed: ${it.message}") }
+    }
+
+    fun grantGroupModerator(groupId: String, moderatorMainDht: String) = scope.launch {
+        runCatching {
+            groupRuntime?.grantModerator(groupId, moderatorMainDht) ?: error("Group runtime is not ready")
+        }.onFailure { log("group moderator grant failed: ${it.message}") }
+    }
+
+    fun resolveGroupModerationTask(taskId: String, approve: Boolean) = scope.launch {
+        runCatching {
+            groupRuntime?.resolveModerationTask(taskId, approve) ?: error("Group runtime is not ready")
+        }.onFailure { log("group moderation resolution failed: ${it.message}") }
+    }
+
+    fun installPrivateGroupIntakeKey(groupId: String, key: ByteArray) {
+        groupRuntime?.installPrivateGroupIntakeKey(groupId, key)
+    }
+
     // ---------------------------------------------------------------------
     // Media blobs
     //
@@ -529,6 +653,15 @@ class SocialNetworkController(context: Context) {
         }.onFailure { log("own profile read: ${it.message}") }
     }
 
+    private fun subscribeGroupOpenIntake() {
+        val runtime = groupRuntime ?: return
+        groupServiceSubscription?.let { runCatching { daemon?.unsubscribe(it) } }
+        groupServiceSubscription = runtime.subscribeOpenIntake { reason ->
+            log("group intake stream closed: $reason")
+        }
+        log("subscribed to group spectator intake")
+    }
+
     private fun subscribeMessages() {
         val d = daemon ?: return
         messageSubscription = d.subscribeMessages(
@@ -546,6 +679,10 @@ class SocialNetworkController(context: Context) {
         // Comment notices are accepted from the former and ignored from the latter, so a
         // stranger cannot spoof a comment into someone else's moderation queue.
         if (event.optString("delivery_kind") != "gossip") {
+            GroupWireEnvelope.fromBytes(payload)?.let { envelope ->
+                groupRuntime?.receivePrivate(envelope, source)
+                return
+            }
             CommentAck.fromBytes(payload)?.let { ack ->
                 receiveCommentAck(ack, source)
                 return
@@ -630,6 +767,7 @@ class SocialNetworkController(context: Context) {
             fetchVerifiedDocument(record)
             fullRecords[record.mainDht] = record
             cache.upsert(record.toHint(nowSeconds(), VerificationState.DHT_VERIFIED), "dht", nowSeconds())
+            groupRuntime?.discoverUserGroups(record.mainDht, record.profileRootDht)
         }.onFailure { log("verify ${short(expectedMainDht)}: ${it.message}") }
     }
 
@@ -901,6 +1039,14 @@ class SocialNetworkController(context: Context) {
                     Base64.decode(message.optString("payload_base64"), Base64.DEFAULT)
                 }.getOrNull() ?: continue
                 val sender = message.optString("sender_main_dht")
+
+                val groupEnvelope = GroupWireEnvelope.fromBytes(payload)
+                if (groupEnvelope != null) {
+                    groupRuntime?.receivePrivate(groupEnvelope, sender)
+                    runCatching { d.deleteInbox(id) }
+                    handled++
+                    continue
+                }
 
                 val ack = CommentAck.fromBytes(payload)
                 if (ack != null) {
