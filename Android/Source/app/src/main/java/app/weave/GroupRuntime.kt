@@ -475,11 +475,13 @@ class GroupRuntime(
         store.installPrivateIntakeKey(groupId, key)
     }
 
-    fun publishMyDirectory() {
-        val storeId = profileStoreId() ?: return
+    fun publishMyDirectory(): Int {
+        val storeId = profileStoreId() ?: return 0
         val me = ownMainDht()
-        if (me.isBlank()) return
-        directory.publish(storeId, me, store.directoryEntriesForSelf(me))
+        if (me.isBlank()) return 0
+        val entries = store.directoryEntriesForSelf(me)
+        directory.publish(storeId, me, entries)
+        return entries.size
     }
 
     private fun deliverSubmission(group: GroupRecord, envelope: GroupWireEnvelope) {

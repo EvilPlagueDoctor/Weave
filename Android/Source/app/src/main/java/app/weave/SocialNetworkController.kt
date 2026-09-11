@@ -441,7 +441,8 @@ class SocialNetworkController(context: Context) {
             val runtime = groupRuntime ?: error("Group runtime is not ready")
             val published = runtime.publishOriginal(group, pulse)
             withContext(Dispatchers.Main.immediate) { onPublished(published) }
-            log("published group ${published.name}: ${short(published.rootRecordKey)}")
+            val advertised = groups.directoryEntriesForSelf(_ui.value.mainDht).size
+            log("published group ${published.name}: ${short(published.rootRecordKey)}; profile group directory=$advertised")
         } catch (t: Throwable) {
             log("group publish failed: ${t.message}")
         }
@@ -597,9 +598,39 @@ class SocialNetworkController(context: Context) {
 
     fun ensureProfileAvailable(mainDht: String) = scope.launch {
         val hint = cache.get(mainDht)?.hint ?: return@launch
-        if (profileDocuments.containsKey(mainDht)) return@launch
-        verifyProfile(mainDht, hint.profileRootDht)
+
+        // Group discovery is independent of the decorated-profile blob cache. A profile may have
+        // been cached before its owner created/claimed a group, so always refresh subkey 2.
+        runCatching {
+            val entries = groupRuntime?.discoverUserGroups(mainDht, hint.profileRootDht).orEmpty()
+            log("group directory refresh ${short(mainDht)}: ${entries.size} advertised")
+        }.onFailure {
+            log("group directory refresh ${short(mainDht)} failed: ${it.message}")
+        }
+
+        if (!profileDocuments.containsKey(mainDht)) {
+            verifyProfile(mainDht, hint.profileRootDht)
+        }
         updateSnapshots()
+    }
+
+    /** Refresh only the lightweight group directory for a known user. Safe even if their profile
+     * document is already cached and therefore does not need to be downloaded again. */
+    fun refreshUserGroups(mainDht: String) = scope.launch {
+        val d = daemon ?: return@launch
+        val root = fullRecords[mainDht]?.profileRootDht
+            ?.takeIf { it.isNotBlank() }
+            ?: cache.get(mainDht)?.hint?.profileRootDht?.takeIf { it.isNotBlank() }
+            ?: runCatching { d.getAppRoot(mainDht).stringOrNull("root_dht") }.getOrNull()
+            ?: return@launch
+
+        runCatching {
+            val entries = groupRuntime?.discoverUserGroups(mainDht, root).orEmpty()
+            log("group directory refresh ${short(mainDht)}: ${entries.size} advertised")
+            updateSnapshots()
+        }.onFailure {
+            log("group directory refresh ${short(mainDht)} failed: ${it.message}")
+        }
     }
 
     private fun runLocalSearch(intent: DiscoveryIntent) {

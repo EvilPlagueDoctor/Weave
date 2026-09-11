@@ -334,6 +334,12 @@ private fun ProfileDestination(
     val profileGroups = remember(groupRevision, mainDht) { groupStore.directoryFor(mainDht) }
     var following by remember(mainDht) { mutableStateOf(followStore.isFollowing(mainDht)) }
 
+    // The decorated profile can come entirely from RemoteProfileCache. Group ownership/claims are
+    // separate lightweight DHT metadata and must still be refreshed whenever this profile opens.
+    LaunchedEffect(mainDht) {
+        controller.refreshUserGroups(mainDht)
+    }
+
     // The swipe queue is whatever list the user opened from, in its current order.
     val queue = remember(ui.recent) { ui.recent.map { it.hint.mainDht } }
     val position = queue.indexOf(mainDht)
