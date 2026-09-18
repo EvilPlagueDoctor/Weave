@@ -1,0 +1,9 @@
+.gradle/
+**/build/
+local.properties
+*.iml
+.idea/
+
+# Optional local classifier assets: fetched by download_content_filter_models.*
+app/src/main/assets/content_filter/*.onnx
+app/src/main/assets/content_filter/vocab.txt

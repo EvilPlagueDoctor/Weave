@@ -29,44 +29,47 @@ fun HomeScreen(
     onOpen: (String) -> Unit,
 ) {
     val state by controller.ui.collectAsState()
-    var followingOnly by remember { mutableStateOf(false) }
-    val following = remember(followingOnly) { followStore.all() }
-
-    val rows = remember(state.recent, followingOnly, following) {
-        state.recent.filter { !followingOnly || it.hint.mainDht in following }
+    val following = followStore.all()
+    val rows = remember(state.recent, following) {
+        state.recent.filter { it.hint.mainDht in following }
+    }
+    val suggested = remember(state.recent, state.discoveryDescription, state.featuresText, following) {
+        controller.suggestedPeople(excluding = following, limit = 3)
     }
 
     Column(Modifier.fillMaxSize()) {
         Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 2.dp) {
-            Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp)) {
-                Text(tr("Recently found"), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                Text(
-                    state.status,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                Row(Modifier.padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(
-                        selected = !followingOnly,
-                        onClick = { followingOnly = false },
-                        label = { Text(tr("Everyone")) }
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(tr("Following"), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                    Text(
+                        state.status,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    FilterChip(
-                        selected = followingOnly,
-                        onClick = { followingOnly = true },
-                        label = { Text(tr("Following")) }
-                    )
-                    Spacer(Modifier.weight(1f))
-                    TextButton(onClick = { controller.refreshNow() }) { Text(tr("Refresh")) }
                 }
+                TextButton(onClick = { controller.refreshNow() }) { Text(tr("Refresh")) }
             }
         }
 
-        if (rows.isEmpty()) {
-            EmptyDiscovery(followingOnly)
-        } else {
-            LazyColumn(Modifier.fillMaxSize()) {
-                items(rows, key = { it.hint.mainDht }) { row ->
+        LazyColumn(Modifier.fillMaxSize()) {
+            if (rows.isEmpty()) {
+                item {
+                    Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 22.dp)) {
+                        Text(tr("You aren't following anyone yet."), style = MaterialTheme.typography.titleSmall)
+                        Text(
+                            tr("Follow people from their page and they'll show up here."),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 6.dp),
+                        )
+                    }
+                }
+            } else {
+                items(rows, key = { "following:${it.hint.mainDht}" }) { row ->
                     ProfileRow(
                         hint = row.hint,
                         enabled = true,
@@ -74,6 +77,34 @@ fun HomeScreen(
                             controller.ensureProfileAvailable(row.hint.mainDht)
                             onOpen(row.hint.mainDht)
                         }
+                    )
+                    HorizontalDivider()
+                }
+            }
+
+            if (suggested.isNotEmpty()) {
+                item {
+                    Text(
+                        "Suggested people",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+                    )
+                    Text(
+                        "A small mix of people whose MinHash interests look similar to yours, with some rotation so the list is not always identical.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 4.dp),
+                    )
+                }
+                items(suggested, key = { "suggested:${it.mainDht}" }) { hint ->
+                    ProfileRow(
+                        hint = hint,
+                        enabled = true,
+                        onClick = {
+                            controller.ensureProfileAvailable(hint.mainDht)
+                            onOpen(hint.mainDht)
+                        },
                     )
                     HorizontalDivider()
                 }
@@ -184,26 +215,52 @@ fun SearchScreen(controller: SocialNetworkController, onOpen: (String) -> Unit) 
             }
         }
 
-        LazyColumn(Modifier.fillMaxSize()) {
-            items(state.searchResults, key = { it.hint.mainDht }) { scored ->
-                Column {
-                    ProfileRow(
-                        hint = scored.hint,
-                        enabled = true,
-                        onClick = {
-                            controller.ensureProfileAvailable(scored.hint.mainDht)
-                            onOpen(scored.hint.mainDht)
-                        }
-                    )
-                    Row(Modifier.padding(start = 72.dp, bottom = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        TextButton(onClick = { controller.moreLike(scored.hint.mainDht) }) {
-                            Text(tr("More like this"), style = MaterialTheme.typography.labelSmall)
-                        }
-                        TextButton(onClick = { controller.avoidLike(scored.hint.mainDht) }) {
-                            Text(tr("Less like this"), style = MaterialTheme.typography.labelSmall)
-                        }
+        if (state.query.isBlank()) {
+            Text(
+                tr("Recently found"),
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+            )
+            if (state.recent.isEmpty()) {
+                EmptyDiscovery(false)
+            } else {
+                LazyColumn(Modifier.fillMaxSize()) {
+                    items(state.recent, key = { it.hint.mainDht }) { row ->
+                        ProfileRow(
+                            hint = row.hint,
+                            enabled = true,
+                            onClick = {
+                                controller.ensureProfileAvailable(row.hint.mainDht)
+                                onOpen(row.hint.mainDht)
+                            }
+                        )
+                        HorizontalDivider()
                     }
-                    HorizontalDivider()
+                }
+            }
+        } else {
+            LazyColumn(Modifier.fillMaxSize()) {
+                items(state.searchResults, key = { it.hint.mainDht }) { scored ->
+                    Column {
+                        ProfileRow(
+                            hint = scored.hint,
+                            enabled = true,
+                            onClick = {
+                                controller.ensureProfileAvailable(scored.hint.mainDht)
+                                onOpen(scored.hint.mainDht)
+                            }
+                        )
+                        Row(Modifier.padding(start = 72.dp, bottom = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            TextButton(onClick = { controller.moreLike(scored.hint.mainDht) }) {
+                                Text(tr("More like this"), style = MaterialTheme.typography.labelSmall)
+                            }
+                            TextButton(onClick = { controller.avoidLike(scored.hint.mainDht) }) {
+                                Text(tr("Less like this"), style = MaterialTheme.typography.labelSmall)
+                            }
+                        }
+                        HorizontalDivider()
+                    }
                 }
             }
         }

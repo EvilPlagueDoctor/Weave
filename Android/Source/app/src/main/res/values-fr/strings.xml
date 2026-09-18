@@ -23,7 +23,7 @@
     <string name="new_image">Image</string>
     <string name="new_widget">Widget</string>
     <string name="copy_suffix"> Copie</string>
-    <string name="widget_preview_suffix">emplacement de widget vide</string>
+    <string name="widget_preview_suffix">Touchez pour charger le widget</string>
     <string name="media_preview_suffix">emplacement jusqu’au chargement de l’enregistrement média</string>
     <string name="builtin_none">Aucun</string>
     <string name="builtin_thin1">Fin 1</string>
@@ -210,12 +210,8 @@
     <string name="widget_text">Texte</string>
     <string name="widget_button">Bouton</string>
     <string name="widget_box">Boîte</string>
-    <string name="widget_stream">Flux de l’hôte</string>
     <string name="widget_selected">Sélectionné</string>
     <string name="widget_text_value">Texte</string>
-    <string name="widget_stream_label">Libellé du flux</string>
-    <string name="widget_stream_source">Nom du flux de l’hôte</string>
-    <string name="widget_stream_safety">Les flux de l’hôte sont uniquement destinés à l’affichage. Ils ne peuvent pas accéder à la caméra ou au microphone du visiteur et démarrent toujours en pause.</string>
     <string name="widget_box_hint">Les boîtes sont de simples conteneurs visuels dans VeilWidget v1. Davantage de styles pourront être ajoutés lorsque le modèle d’exécution sera stabilisé.</string>
     <string name="widget_visual_event_note">L’éditeur visuel modifie le même modèle source que celui affiché dans Code. VeilWidget v1 conserve pour l’instant l’édition des événements dans Code.</string>
     <string name="widget_edit_events_code">Modifier les événements dans Code</string>
@@ -238,14 +234,11 @@
     <string name="widget_keep_backup">Garder l’ancienne copie</string>
     <string name="widget_make_link">Copie liée</string>
     <string name="widget_make_fork">Copie dérivée</string>
-    <string name="widget_mock_stream_playing">Flux local simulé en lecture · TODO(réseau)</string>
-    <string name="widget_stream_paused">En pause · touchez pour simuler la lecture</string>
     <string name="widget_library_row">%1$d × %2$d · %3$s</string>
     <string name="widget_new">Nouveau widget</string>
     <string name="widget_new_name">Nouveau widget</string>
     <string name="widget_new_text">Nouveau texte</string>
     <string name="widget_new_button">Bouton</string>
-    <string name="widget_live_stream">Flux en direct</string>
     <string name="widget_ready">Widget prêt.</string>
     <string name="widget_unsaved">Nouveau widget — pas encore enregistré.</string>
     <string name="widget_compiled_saved">Widget compilé et enregistré localement.</string>
@@ -311,7 +304,6 @@
     <string name="widget_issue_missing_action">La cible de l’action n’existe pas : %1$s</string>
     <string name="widget_paused_short">En pause</string>
     <string name="widget_cap_time">Heure</string>
-    <string name="widget_cap_host_stream">Flux de l’hôte</string>
     <string name="widget_relation_own">Propre</string>
     <string name="widget_relation_link">Lien</string>
     <string name="widget_relation_fork">Dérivation</string>

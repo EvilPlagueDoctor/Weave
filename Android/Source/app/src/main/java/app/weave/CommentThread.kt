@@ -165,6 +165,7 @@ fun ThreadedComments(
     onSubmitReply: (parentId: String) -> Unit,
     onHide: (String) -> Unit,
     onRetry: (String) -> Unit,
+    onLink: (DetectedLink) -> Unit,
 ) {
     val items = remember(roots, view.expanded.toList(), view.collapsed.toList()) {
         flattenThreads(roots, view)
@@ -195,6 +196,7 @@ fun ThreadedComments(
                         onSubmitReply = onSubmitReply,
                         onHide = onHide,
                         onRetry = onRetry,
+                        onLink = onLink,
                     )
 
                     is ThreadItem.More -> Text(
@@ -245,6 +247,7 @@ private fun CommentEntry(
     onSubmitReply: (parentId: String) -> Unit,
     onHide: (String) -> Unit,
     onRetry: (String) -> Unit,
+    onLink: (DetectedLink) -> Unit,
 ) {
     val comment = item.node.comment
     var bodyExpanded by remember(comment.id) { mutableStateOf(false) }
@@ -295,13 +298,14 @@ private fun CommentEntry(
 
         if (item.collapsed) return@Column
 
-        SelectionContainer {
-            Text(
-                displayBody(comment, bodyExpanded),
-                style = MaterialTheme.typography.bodyMedium,
-                modifier = Modifier.padding(top = 4.dp, start = 34.dp),
-            )
-        }
+        FilteredAutoLinkText(
+            contentId = "profile-comment:${comment.id}",
+            text = displayBody(comment, bodyExpanded),
+            classificationText = comment.body,
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.padding(top = 4.dp, start = 34.dp),
+            onLink = onLink,
+        )
         if (comment.body.length > COMMENT_TRUNCATE_CHARS) {
             Text(
                 if (bodyExpanded) tr("Show less") else tr("Show more"),

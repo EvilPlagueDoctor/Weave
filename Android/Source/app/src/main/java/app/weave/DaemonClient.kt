@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.IBinder
+import android.os.SystemClock
 import android.util.Base64
 import com.example.veilknit_deamon.ipc.IVeilKnitApi
 import com.example.veilknit_deamon.ipc.IVeilKnitStreamCallback
@@ -37,6 +38,7 @@ class DaemonClient(private val context: Context) {
             "ReadPublicProfiles", "SubscribeNetworkStatus", "SignAppData"
         )
         private val PROOF_DOMAIN = "veilknit/app-auth/v2".toByteArray(Charsets.UTF_8)
+        private const val BLOB_IPC_CHUNK_BYTES = 256 * 1024
     }
 
     data class DaemonIdentity(
@@ -59,8 +61,15 @@ class DaemonClient(private val context: Context) {
     suspend fun connect(onStatus: (String) -> Unit) {
         sessionToken = null
         connectedIdentity = null
+        WeaveDiagnostics.event(context, "DAEMON_CONNECT", "stage=bind_begin")
         api = bindApi()
+        WeaveDiagnostics.event(context, "DAEMON_CONNECT", "stage=bound")
         val identity = awaitReadyDaemonIdentity(onStatus)
+        WeaveDiagnostics.event(
+            context,
+            "DAEMON_CONNECT",
+            "stage=identity_ready profile=${short(identity.profileId)} instance=${short(identity.daemonInstanceId)}"
+        )
         ensureCredential(identity.profileId, onStatus)
         try {
             authenticate(identity.profileId)
@@ -76,6 +85,7 @@ class DaemonClient(private val context: Context) {
             authenticate(identity.profileId)
         }
         connectedIdentity = identity
+        WeaveDiagnostics.event(context, "DAEMON_CONNECT", "stage=authenticated profile=${short(identity.profileId)}")
         PrivateVault.get(context).attach(this, identity.profileId)
     }
 
@@ -96,8 +106,13 @@ class DaemonClient(private val context: Context) {
             profile != expected.profileId || instance != expected.daemonInstanceId
     }
 
-    fun close() {
-        PrivateVault.get(context).detach()
+    fun close(reason: String = "client close") {
+        WeaveDiagnostics.event(
+            context,
+            "DAEMON_CLOSE",
+            "profile=${connectedIdentity?.profileId?.let(::short) ?: "(none)"} reason=${reason.take(180)}"
+        )
+        PrivateVault.get(context).detach(reason)
         sessionToken = null
         connectedIdentity = null
         serviceConnection?.let { runCatching { context.unbindService(it) } }
@@ -111,7 +126,10 @@ class DaemonClient(private val context: Context) {
             override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
                 if (continuation.isActive) continuation.resume(IVeilKnitApi.Stub.asInterface(service))
             }
-            override fun onServiceDisconnected(name: ComponentName?) { api = null }
+            override fun onServiceDisconnected(name: ComponentName?) {
+                WeaveDiagnostics.event(context, "BINDER_DISCONNECTED", "component=${name?.flattenToShortString() ?: "(unknown)"}")
+                api = null
+            }
             override fun onNullBinding(name: ComponentName?) {
                 if (continuation.isActive) continuation.resumeWithException(IllegalStateException("VeilKnit API service returned a null binding"))
             }
@@ -176,9 +194,25 @@ class DaemonClient(private val context: Context) {
             "foreground service running?"
     }
 
-    private fun daemonState(): JSONObject = JSONObject(
-        api?.getDaemonStateJson() ?: error("VeilKnit API is not bound")
-    )
+    private fun daemonState(): JSONObject {
+        val started = SystemClock.elapsedRealtime()
+        var responseBytes = 0
+        try {
+            val text = api?.getDaemonStateJson() ?: error("VeilKnit API is not bound")
+            responseBytes = text.toByteArray(Charsets.UTF_8).size
+            WeaveDiagnostics.rpc(
+                context, "getDaemonStateJson", 0, responseBytes,
+                SystemClock.elapsedRealtime() - started, true
+            )
+            return JSONObject(text)
+        } catch (t: Throwable) {
+            WeaveDiagnostics.rpc(
+                context, "getDaemonStateJson", 0, responseBytes,
+                SystemClock.elapsedRealtime() - started, false, t
+            )
+            throw t
+        }
+    }
 
     private suspend fun awaitReadyDaemonIdentity(onStatus: (String) -> Unit): DaemonIdentity =
         withContext(Dispatchers.IO) {
@@ -218,12 +252,42 @@ class DaemonClient(private val context: Context) {
             .put("action", action)
         if (authenticated) request.put("session_token", sessionToken ?: error("Not authenticated"))
         request.block()
-        val response = JSONObject(api?.transact(request.toString()) ?: error("Daemon API is not bound"))
-        if (!response.optBoolean("ok", false)) {
-            val error = response.optJSONObject("error")
-            throw IllegalStateException("${error?.optString("code", "daemon_error")}: ${error?.optString("message", "unknown daemon error")}")
+        val requestText = request.toString()
+        val requestBytes = requestText.toByteArray(Charsets.UTF_8).size
+        val started = SystemClock.elapsedRealtime()
+        var responseBytes = 0
+        var recorded = false
+        try {
+            val responseText = api?.transact(requestText) ?: error("Daemon API is not bound")
+            responseBytes = responseText.toByteArray(Charsets.UTF_8).size
+            val response = JSONObject(responseText)
+            if (!response.optBoolean("ok", false)) {
+                val error = response.optJSONObject("error")
+                val failure = IllegalStateException(
+                    "${error?.optString("code", "daemon_error")}: ${error?.optString("message", "unknown daemon error")}"
+                )
+                WeaveDiagnostics.rpc(
+                    context, action, requestBytes, responseBytes,
+                    SystemClock.elapsedRealtime() - started, false, failure
+                )
+                recorded = true
+                throw failure
+            }
+            WeaveDiagnostics.rpc(
+                context, action, requestBytes, responseBytes,
+                SystemClock.elapsedRealtime() - started, true
+            )
+            recorded = true
+            return response.optJSONObject("result") ?: JSONObject()
+        } catch (t: Throwable) {
+            if (!recorded) {
+                WeaveDiagnostics.rpc(
+                    context, action, requestBytes, responseBytes,
+                    SystemClock.elapsedRealtime() - started, false, t
+                )
+            }
+            throw t
         }
-        return response.optJSONObject("result") ?: JSONObject()
     }
 
     private suspend fun ensureCredential(profileId: String, onStatus: (String) -> Unit) = withContext(Dispatchers.IO) {
@@ -291,6 +355,61 @@ class DaemonClient(private val context: Context) {
         sessionToken = finish.getString("session_token_hex")
     }
 
+    data class AppSigningIdentity(
+        val applicationId: String,
+        val mainDht: String,
+        val keyGeneration: Long,
+        val publicKeyHex: String,
+        val createdAt: Long,
+        val binding: String,
+    )
+
+    data class AppSignature(
+        val applicationId: String,
+        val keyGeneration: Long,
+        val publicKeyHex: String,
+        val domain: String,
+        val signatureHex: String,
+    )
+
+    fun appSigningIdentity(): AppSigningIdentity {
+        val o = rawRequest("get_app_signing_identity").getJSONObject("identity")
+        return AppSigningIdentity(
+            applicationId = o.getString("application_id"),
+            mainDht = o.getString("main_dht"),
+            keyGeneration = o.getLong("key_generation"),
+            publicKeyHex = o.getString("public_key_hex"),
+            createdAt = o.getLong("created_at"),
+            binding = o.optString("binding"),
+        )
+    }
+
+    fun signAppPayload(domain: String, payload: ByteArray): AppSignature {
+        val o = rawRequest("sign_app_payload") {
+            put("domain", domain)
+            put("payload_base64", Base64.encodeToString(payload, Base64.NO_WRAP))
+        }.getJSONObject("signature")
+        return AppSignature(
+            applicationId = o.getString("application_id"),
+            keyGeneration = o.getLong("key_generation"),
+            publicKeyHex = o.getString("public_key_hex"),
+            domain = o.getString("domain"),
+            signatureHex = o.getString("signature_hex"),
+        )
+    }
+
+    fun verifyAppSignature(
+        publicKeyHex: String,
+        domain: String,
+        payload: ByteArray,
+        signatureHex: String,
+    ): Boolean = rawRequest("verify_app_signature") {
+        put("public_key_hex", publicKeyHex)
+        put("domain", domain)
+        put("payload_base64", Base64.encodeToString(payload, Base64.NO_WRAP))
+        put("signature_hex", signatureHex)
+    }.optBoolean("valid", false)
+
     fun identity(): JSONObject = rawRequest("get_identity")
     fun listAppPeers(): JSONObject = rawRequest("list_app_peers") { put("limit", 1000); put("start_search", true) }
     fun getAppRoot(peerMainDht: String): JSONObject = rawRequest("get_app_root") { put("peer_main_dht", peerMainDht); put("start_lookup", true) }
@@ -320,11 +439,15 @@ class DaemonClient(private val context: Context) {
         recipientMainDht: String,
         payload: ByteArray,
         conversationIdHex: String? = null,
+        expiresAtSeconds: Long? = null,
+        awaitResponse: Boolean = false,
         preferDirect: Boolean = true,
     ): JSONObject = rawRequest("send_message") {
         put("recipient_main_dht", recipientMainDht)
         put("payload_base64", Base64.encodeToString(payload, Base64.NO_WRAP))
         conversationIdHex?.let { put("conversation_id_hex", it) }
+        expiresAtSeconds?.let { put("expires_at", it) }
+        put("await_response", awaitResponse)
         put("prefer_direct", preferDirect)
     }
 
@@ -421,7 +544,7 @@ class DaemonClient(private val context: Context) {
         try {
             var offset = 0
             while (offset < data.size) {
-                val end = minOf(data.size, offset + 256 * 1024)
+                val end = minOf(data.size, offset + BLOB_IPC_CHUNK_BYTES)
                 appendPrivateBlob(blobId, data.copyOfRange(offset, end))
                 offset = end
             }
@@ -439,12 +562,21 @@ class DaemonClient(private val context: Context) {
         val out = java.io.ByteArrayOutputStream(total.toInt())
         var offset = 0L
         while (offset < total) {
-            val length = minOf(512L * 1024L, total - offset)
-            val range = readPrivateBlobRange(blobId, offset, length)
-            out.write(Base64.decode(range.getString("data_base64"), Base64.DEFAULT))
-            offset += length
+            val requested = minOf(BLOB_IPC_CHUNK_BYTES.toLong(), total - offset)
+            val range = readPrivateBlobRange(blobId, offset, requested)
+            val chunk = Base64.decode(range.getString("data_base64"), Base64.DEFAULT)
+            check(chunk.isNotEmpty()) { "Private blob read returned an empty chunk at offset $offset of $total" }
+            check(chunk.size.toLong() <= requested) {
+                "Private blob read exceeded requested range at offset $offset: ${chunk.size} > $requested"
+            }
+            out.write(chunk)
+            offset += chunk.size
         }
-        return out.toByteArray()
+        val data = out.toByteArray()
+        check(data.size.toLong() == total) {
+            "Private blob read length mismatch: expected $total bytes, got ${data.size}"
+        }
+        return data
     }
 
     fun privateStorageUsage(): JSONObject = rawRequest("get_private_storage_usage").getJSONObject("usage")
@@ -468,7 +600,7 @@ class DaemonClient(private val context: Context) {
         try {
             var offset = 0
             while (offset < data.size) {
-                val end = minOf(data.size, offset + 256 * 1024)
+                val end = minOf(data.size, offset + BLOB_IPC_CHUNK_BYTES)
                 appendBlobUpload(uploadId, data.copyOfRange(offset, end))
                 offset = end
             }
@@ -484,9 +616,24 @@ class DaemonClient(private val context: Context) {
         val blob = meta.getJSONObject("blob")
         val total = blob.getLong("total_bytes")
         require(total in 0..maxBytes.toLong()) { "Profile blob is too large: $total bytes" }
-        val full = readBlobRange(rootRecordKey, 0, total, false)
-        val data = Base64.decode(full.getString("data_base64"), Base64.DEFAULT)
-        return full.getJSONObject("blob") to data
+        val out = java.io.ByteArrayOutputStream(total.toInt())
+        var offset = 0L
+        while (offset < total) {
+            val requested = minOf(BLOB_IPC_CHUNK_BYTES.toLong(), total - offset)
+            val range = readBlobRange(rootRecordKey, offset, requested, false)
+            val chunk = Base64.decode(range.getString("data_base64"), Base64.DEFAULT)
+            check(chunk.isNotEmpty()) { "Public blob read returned an empty chunk at offset $offset of $total" }
+            check(chunk.size.toLong() <= requested) {
+                "Public blob read exceeded requested range at offset $offset: ${chunk.size} > $requested"
+            }
+            out.write(chunk)
+            offset += chunk.size
+        }
+        val data = out.toByteArray()
+        check(data.size.toLong() == total) {
+            "Public blob read length mismatch: expected $total bytes, got ${data.size}"
+        }
+        return blob to data
     }
 
     fun publishServiceRequest(intendedHostMainDht: String, serviceIdHex: String, manifestHashHex: String, instanceIdHex: String, payload: ByteArray, delegationAllowed: Boolean = true, spectatorsAllowed: Boolean = false, ttlSeconds: Long = 900): JSONObject = rawRequest("publish_service_request") {

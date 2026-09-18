@@ -11,6 +11,10 @@ import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import java.security.MessageDigest
+import java.io.File
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 
 private const val PROFILE_STORE_NAME = "weave-profile-page-v1"
 private const val PROFILE_SUBKEY = 0
@@ -22,12 +26,20 @@ private const val INBOX_DRAIN_MS = 60_000L
 private const val INBOX_DRAIN_LIMIT = 50
 private const val PEER_REFRESH_MS = 20_000L
 private const val GOSSIP_INTERVAL_MS = 12_000L
+private const val GROUP_GOSSIP_INTERVAL_MS = 8_000L
+private val RECONNECT_BACKOFF_MS = longArrayOf(1_500L, 3_000L, 6_000L, 15_000L, 30_000L)
+private const val GOSSIP_SUMMARY_LOG_REPEAT_MS = 60_000L
+private const val DIAGNOSTIC_LOG_MAX_BYTES = 1024 * 1024
+private const val DIAGNOSTIC_LOG_KEEP_BYTES = 700 * 1024
 private const val PROFILE_MAX_BYTES = 4 * 1024 * 1024
+private val LOG_TIMESTAMP_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS z")
 
 data class SocialProfileRow(val hint: ProfileHint, val openable: Boolean)
 
 data class SocialUiState(
     val status: String = "Starting…",
+    /** Transport/auth session is currently usable. mainDht may remain populated during a reconnect. */
+    val connected: Boolean = false,
     val mainDht: String = "",
     val profileRoot: String = "",
     /** True only when subkey 0 contains this identity's current published profile record. */
@@ -61,6 +73,7 @@ data class SocialUiState(
 
 class SocialNetworkController(context: Context) {
     private val appContext = context.applicationContext
+    private val diagnosticLogFile = File(appContext.filesDir, "weave-diagnostics.log")
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val legacyPrefs = appContext.getSharedPreferences("weave_discovery", Context.MODE_PRIVATE)
     private val vault = PrivateVault.get(appContext)
@@ -72,10 +85,15 @@ class SocialNetworkController(context: Context) {
     private var groupRuntime: GroupRuntime? = null
     private val _ui = MutableStateFlow(SocialUiState())
     val ui: StateFlow<SocialUiState> = _ui.asStateFlow()
+    val groupEventsV2: GroupEventStoreV2 = GroupEventStoreV2(appContext) { message -> log(message) }
+    val groupCustodyV2: GroupCustodyStoreV2 = GroupCustodyStoreV2(appContext) { message -> log(message) }
+    val groupTrustV2: GroupTrustContinuityStoreV2 = GroupTrustContinuityStoreV2(appContext) { message -> log(message) }
 
     private var daemon: DaemonClient? = null
     private var messageSubscription: Long? = null
     private var groupServiceSubscription: Long? = null
+    private var widgetServiceSubscription: Long? = null
+    private var widgetNetwork: WidgetNetworkManager? = null
     private var networkJob: Job? = null
     private val cache = KnowledgeCache()
     // Concurrent collections rather than plain ones: the worker loop, every incoming message,
@@ -92,6 +110,18 @@ class SocialNetworkController(context: Context) {
     private var nextRequestId = 1L
     private val gossipSentCount = AtomicLong(0)
     private val gossipReceivedCount = AtomicLong(0)
+    private val groupHintStamp = ConcurrentHashMap<String, Long>()
+    private val gossipSummaryDigestBySource = ConcurrentHashMap<String, String>()
+    private val gossipSummaryLogAtBySource = ConcurrentHashMap<String, Long>()
+    private val groupHintInFlight = ConcurrentHashMap.newKeySet<String>()
+    private val loggedGroupGeneration = ConcurrentHashMap<String, Long>()
+    @Volatile private var lastGroupGossipSendLogMs = 0L
+    @Volatile private var lastDebugUiRefreshMs = 0L
+
+    init {
+        val tail = readPersistentLogTail()
+        if (tail.isNotBlank()) _ui.value = _ui.value.copy(debugLog = tail)
+    }
 
     fun start() {
         // The worker is a reconnect loop rather than a one-shot connection. Android's Binder
@@ -99,10 +129,12 @@ class SocialNetworkController(context: Context) {
         // different VeilKnit profile, so a running Weave must notice that change itself.
         if (networkJob?.isActive == true) return
         networkJob = scope.launch {
+            var reconnectFailures = 0
+            var reconnectDelayMs = 0L
             while (isActive) {
                 try {
                     resetNetworkIdentityState()
-                    runCatching { daemon?.close() }
+                    runCatching { daemon?.close("reconnect loop replacing previous client") }
                     daemon = DaemonClient(appContext)
 
                     updateStatus("Connecting to VeilKnit daemon…")
@@ -115,25 +147,51 @@ class SocialNetworkController(context: Context) {
 
                     val identity = daemon!!.identity()
                     val mainDht = identity.getString("main_dht")
-                    _ui.value = _ui.value.copy(mainDht = mainDht, status = "Connected; preparing profile-page DHT…")
+                    _ui.value = _ui.value.copy(
+                        connected = true,
+                        mainDht = mainDht,
+                        status = "Connected; preparing profile-page DHT…"
+                    )
+                    WeaveDiagnostics.event(appContext, "NETWORK_CONNECTED", "main_dht=${short(mainDht)}")
+                    log("Weave account active: main_dht=$mainDht")
+                    groupEventsV2.bind(daemon!!, mainDht)
+                    groupEventsV2.cleanup()
                     ensureProfileStore()
                     groupRuntime = GroupRuntime(
                         client = daemon!!,
                         store = groups,
                         profileStoreId = { profileStoreId },
                         ownMainDht = { _ui.value.mainDht },
+                        eventStoreV2 = groupEventsV2,
+                        custodyStoreV2 = groupCustodyV2,
+                        trustStoreV2 = groupTrustV2,
+                        custodyCandidates = { knownPeers.toList() },
+                        logger = ::log,
                     )
+                    // Queue durable event recovery before any slower directory/profile DHT work.
+                    // It runs on its own bounded workers and cannot stall normal startup.
+                    groupRuntime?.recoverPendingContentV2()
+                    widgetNetwork = WidgetNetworkManager(appContext, daemon!!, { _ui.value.mainDht }, ::log)
                     subscribeGroupOpenIntake()
-                    groupRuntime?.publishMyDirectory()
+                    subscribeWidgetPublicNetwork()
+                    scope.launch { runCatching { widgetNetwork?.cleanupExpiredSessions() }.onFailure { log("widget session cleanup: ${it.message}") } }
+                    val advertisedGroups = groupRuntime?.publishMyDirectory() ?: 0
+                    log("group directory ready: $advertisedGroups owned/claimed branch advertisement(s)")
+                    logGroupResponsibilities("startup")
                     readOwnRecord()
                     subscribeMessages()
                     refreshPeers()
+                    groupRuntime?.recoverCustodyV2()
+                    gossipGroups()
                     updateSnapshots()
                     setStatusQuiet(healthLine())
                     drainInbox(force = true)
+                    reconnectFailures = 0
+                    reconnectDelayMs = 0L
 
                     var lastPeerRefresh = 0L
                     var lastGossip = 0L
+                    var lastGroupGossip = 0L
                     var lastInboxDrain = System.currentTimeMillis()
                     while (isActive) {
                         // A different daemon_instance_id means every old session token is dead.
@@ -145,13 +203,18 @@ class SocialNetworkController(context: Context) {
 
                         val nowMs = System.currentTimeMillis()
                         if (nowMs - lastPeerRefresh >= PEER_REFRESH_MS) {
-                            refreshPeers(); lastPeerRefresh = nowMs
+                            refreshPeers()
+                            groupRuntime?.recoverCustodyV2()
+                            lastPeerRefresh = nowMs
                         }
                         if (nowMs - lastInboxDrain >= INBOX_DRAIN_MS) {
                             drainInbox(force = false); lastInboxDrain = nowMs
                         }
                         if (nowMs - lastGossip >= GOSSIP_INTERVAL_MS) {
                             gossipSummary(); lastGossip = nowMs
+                        }
+                        if (nowMs - lastGroupGossip >= GROUP_GOSSIP_INTERVAL_MS) {
+                            gossipGroups(); lastGroupGossip = nowMs
                         }
                         activeIntent?.let(::runLocalSearch)
                         updateSnapshots()
@@ -160,23 +223,41 @@ class SocialNetworkController(context: Context) {
                     }
                 } catch (changed: DaemonSessionChangedException) {
                     if (!isActive) break
+                    reconnectFailures = 0
+                    reconnectDelayMs = 1_000L
+                    _ui.value = _ui.value.copy(connected = false)
                     log("VeilKnit daemon account or process changed; reconnecting as the active account")
+                    WeaveDiagnostics.event(appContext, "NETWORK_RECONNECT", "reason=daemon_identity_changed")
                     updateStatus("VeilKnit account changed; reconnecting…")
                 } catch (t: Throwable) {
                     if (!isActive) break
-                    log("network connection lost: ${t.message}")
+                    reconnectFailures++
+                    reconnectDelayMs = RECONNECT_BACKOFF_MS[minOf(reconnectFailures - 1, RECONNECT_BACKOFF_MS.lastIndex)]
+                    val detail = t.message.orEmpty()
+                    _ui.value = _ui.value.copy(connected = false)
+                    WeaveDiagnostics.event(
+                        appContext,
+                        "NETWORK_RECONNECT",
+                        "reason=${t::class.java.simpleName}:${detail.replace('\n', ' ').take(180)} attempt=$reconnectFailures"
+                    )
+                    log("network connection lost: $detail")
+                    log("reconnect backoff: attempt=$reconnectFailures delay=${reconnectDelayMs}ms")
                     updateStatus("Connection lost; retrying…")
                 } finally {
                     messageSubscription?.let { id -> runCatching { daemon?.unsubscribe(id) } }
                     groupServiceSubscription?.let { id -> runCatching { daemon?.unsubscribe(id) } }
+                    widgetServiceSubscription?.let { id -> runCatching { daemon?.unsubscribe(id) } }
                     messageSubscription = null
                     groupServiceSubscription = null
+                    widgetServiceSubscription = null
+                    widgetNetwork = null
+                    groupRuntime?.shutdown()
                     groupRuntime = null
-                    runCatching { daemon?.close() }
+                    runCatching { daemon?.close("network loop cleanup/reconnect") }
                     daemon = null
                 }
 
-                if (isActive) delay(1500)
+                if (isActive) delay(reconnectDelayMs.coerceAtLeast(1_000L))
             }
         }
     }
@@ -191,7 +272,10 @@ class SocialNetworkController(context: Context) {
     private fun resetNetworkIdentityState() {
         messageSubscription = null
         groupServiceSubscription = null
+        widgetServiceSubscription = null
+        widgetNetwork = null
         commentNetwork = null
+        groupRuntime?.shutdown()
         groupRuntime = null
         profileStoreId = null
         ownRecord = null
@@ -200,26 +284,27 @@ class SocialNetworkController(context: Context) {
         profileDocuments.clear()
         knownPeers.clear()
         queryReplyAt.clear()
+        groupHintStamp.clear()
+        groupHintInFlight.clear()
+        loggedGroupGeneration.clear()
+        gossipSummaryDigestBySource.clear()
+        gossipSummaryLogAtBySource.clear()
+        lastGroupGossipSendLogMs = 0L
         cache.clear()
-        _ui.value = SocialUiState(
-            status = _ui.value.status,
-            mainDht = "",
-            profileRoot = "",
-            discoveryName = "",
-            discoveryDescription = "",
-            featuresText = "",
+        val previous = _ui.value
+        // Keep the last confirmed account identity and local UI metadata through a transient
+        // reconnect. Clearing mainDht here used to destroy WeaveShell and its navigation stack,
+        // which is why the editor could suddenly disappear back to Me.
+        _ui.value = previous.copy(
+            connected = false,
             recent = emptyList(),
             searchResults = emptyList(),
-            nameQuery = "",
-            query = "",
-            positiveMainDht = "",
-            negativeMainDht = "",
             peers = 0,
             verified = 0,
             gossipSent = 0,
             gossipReceived = 0,
             clusterText = "",
-            debugLog = "",
+            publishing = false,
         )
     }
 
@@ -227,27 +312,37 @@ class SocialNetworkController(context: Context) {
     fun restart() {
         messageSubscription?.let { runCatching { daemon?.unsubscribe(it) } }
         groupServiceSubscription?.let { runCatching { daemon?.unsubscribe(it) } }
+        widgetServiceSubscription?.let { runCatching { daemon?.unsubscribe(it) } }
         messageSubscription = null
         groupServiceSubscription = null
+        widgetServiceSubscription = null
+        widgetNetwork = null
+        groupRuntime?.shutdown()
         groupRuntime = null
         networkJob?.cancel()
         networkJob = null
-        runCatching { daemon?.close() }
+        runCatching { daemon?.close("manual retry") }
         daemon = null
-        _ui.value = _ui.value.copy(status = "Reconnecting to VeilKnit daemon…")
+        _ui.value = _ui.value.copy(connected = false, status = "Reconnecting to VeilKnit daemon…")
+        WeaveDiagnostics.event(appContext, "NETWORK_RESTART", "manual retry requested")
         start()
     }
 
     fun stop() {
         messageSubscription?.let { daemon?.unsubscribe(it) }
         groupServiceSubscription?.let { daemon?.unsubscribe(it) }
+        widgetServiceSubscription?.let { daemon?.unsubscribe(it) }
         messageSubscription = null
         groupServiceSubscription = null
+        widgetServiceSubscription = null
+        widgetNetwork = null
+        groupRuntime?.shutdown()
         groupRuntime = null
         networkJob?.cancel()
         networkJob = null
-        daemon?.close()
+        daemon?.close("controller stop")
         daemon = null
+        _ui.value = _ui.value.copy(connected = false)
         // Cancel the work, not the scope: cancelling the scope itself would make this
         // controller permanently unusable and break any later restart().
         scope.coroutineContext.cancelChildren()
@@ -282,7 +377,7 @@ class SocialNetworkController(context: Context) {
             val bytes = profileText.encodeToByteArray()
             val sha = sha256Hex(bytes)
             updateStatus("Uploading decorated profile page…")
-            val blob = d.uploadBlob("application/x-weave-vspf-text;version=3", bytes)
+            val blob = d.uploadBlob("application/x-weave-vspf-text;version=4", bytes)
             val blobId = blob.getString("blob_id")
             try {
                 val features = state.featuresText.split(',', ';', '\n').map { it.trim() }.filter { it.isNotBlank() }.distinct().take(64)
@@ -299,7 +394,7 @@ class SocialNetworkController(context: Context) {
                     profileBlobRoot = blob.getString("root_record_key"),
                     profileSha256Hex = blob.optString("sha256_hex", sha),
                     profileBytes = blob.optLong("total_bytes", bytes.size.toLong()),
-                    vspfVersion = 3,
+                    vspfVersion = 4,
                     commentPolicy = state.commentPolicy,
                 )
                 require(record.profileSha256Hex.equals(sha, ignoreCase = true)) { "Daemon blob hash did not match local profile hash" }
@@ -394,8 +489,35 @@ class SocialNetworkController(context: Context) {
         }.onFailure { log("DHT image import failed: ${it.message}") }.getOrNull()
     }
 
-    fun refreshNow() = scope.launch { refreshPeers(); updateSnapshots() }
+    fun refreshNow() = scope.launch { refreshPeers(); groupRuntime?.recoverCustodyV2(); updateSnapshots() }
     fun gossipNow() = scope.launch { gossipSummary(); ownRecord?.let(::gossipProfileAnnounce); updateSnapshots() }
+
+    /**
+     * Small home-page discovery sample: mostly MinHash similarity, with a stable half-hour jitter
+     * so Home does not become a rigid ranking. Following/self identities are excluded by the caller.
+     */
+    fun suggestedPeople(excluding: Set<String> = emptySet(), limit: Int = 3): List<ProfileHint> {
+        val state = _ui.value
+        val ownSignature = ownRecord?.signature() ?: MinHash.fromFeatures(
+            extractFeatures(
+                state.discoveryDescription,
+                state.featuresText.split(',', ';', '\n').map { it.trim() }.filter { it.isNotBlank() },
+            )
+        )
+        val epoch = System.currentTimeMillis() / (30L * 60L * 1000L)
+        val candidates = cache.all().asSequence()
+            .map { it.hint }
+            .filter { it.mainDht.isNotBlank() && it.mainDht != state.mainDht && it.mainDht !in excluding }
+            .map { hint ->
+                val similarity = ownSignature.similarity(hint.minhash)
+                val mixed = hint.mainDht.hashCode().toLong() xor (epoch * -7046029254386353131L)
+                val jitter = ((mixed xor (mixed ushr 33)) and 0xffffL).toFloat() / 65535f
+                Triple(hint, similarity, similarity * 0.84f + jitter * 0.16f)
+            }
+            .sortedByDescending { it.third }
+            .toList()
+        return candidates.take(limit.coerceIn(0, 12)).map { it.first }
+    }
 
     fun search() = scope.launch {
         val state = _ui.value
@@ -428,9 +550,25 @@ class SocialNetworkController(context: Context) {
     fun profileText(mainDht: String): String? = profileDocuments[mainDht]
 
 
+    /** Published/profile name for a group authority. Falls back to the caller's key in UI. */
+    fun groupAuthorityName(mainDht: String): String? {
+        if (mainDht.isBlank()) return null
+        if (mainDht == _ui.value.mainDht) {
+            return ownRecord?.name?.takeIf { it.isNotBlank() }
+                ?: _ui.value.discoveryName.takeIf { it.isNotBlank() }
+        }
+        return fullRecords[mainDht]?.name?.takeIf { it.isNotBlank() }
+            ?: cache.get(mainDht)?.hint?.name?.takeIf { it.isNotBlank() }
+    }
+
     // ---------------------------------------------------------------------
     // Groups / moderation branches
     // ---------------------------------------------------------------------
+
+    fun noteGroupBranchSelected(branch: GroupBranchPointer) {
+        val owner = groupAuthorityName(branch.ownerMainDht) ?: short(branch.ownerMainDht)
+        log("group branch selected: group=${short(branch.groupId)} kind=${branch.kind.name} owner=$owner branch=${short(branch.branchId)}")
+    }
 
     fun publishGroup(
         group: GroupRecord,
@@ -443,6 +581,8 @@ class SocialNetworkController(context: Context) {
             withContext(Dispatchers.Main.immediate) { onPublished(published) }
             val advertised = groups.directoryEntriesForSelf(_ui.value.mainDht).size
             log("published group ${published.name}: ${short(published.rootRecordKey)}; profile group directory=$advertised")
+            logGroupResponsibilities("group-published")
+            gossipGroups()
         } catch (t: Throwable) {
             log("group publish failed: ${t.message}")
         }
@@ -454,20 +594,212 @@ class SocialNetworkController(context: Context) {
     ) = scope.launch {
         try {
             val loaded = groupRuntime?.refreshBranch(branch) ?: error("Group branch unavailable")
+            groupTrustV2.ensureWatch(branch.groupId, branch.branchId)
+            val generation = loaded.second?.generation ?: -1L
+            val key = "${branch.groupId}|${branch.branchId}"
+            val previous = loggedGroupGeneration.put(key, generation)
+            if (previous == null) {
+                log("group branch loaded: ${loaded.first.name} ${branch.kind.name} owner=${groupAuthorityName(branch.ownerMainDht) ?: short(branch.ownerMainDht)} pulse_generation=$generation")
+            } else if (generation > previous) {
+                log("group branch updated: ${loaded.first.name} ${branch.kind.name} pulse_generation=$previous->$generation")
+            }
             withContext(Dispatchers.Main.immediate) { onLoaded(loaded.first, loaded.second) }
         } catch (t: Throwable) {
             log("group branch refresh failed: ${t.message}")
         }
     }
 
-    fun claimGroup(groupId: String, onClaimed: (GroupBranchHeader) -> Unit = {}) = scope.launch {
+    fun claimGroup(
+        groupId: String,
+        onClaimed: (GroupBranchHeader) -> Unit = {},
+        onResult: (Boolean, String) -> Unit = { _, _ -> },
+    ) = scope.launch {
         try {
             val claim = groupRuntime?.claim(groupId) ?: error("Group runtime is not ready")
-            withContext(Dispatchers.Main.immediate) { onClaimed(claim) }
-            log("claimed group ${short(groupId)} as branch ${short(claim.branchId)}")
+            withContext(Dispatchers.Main.immediate) {
+                onClaimed(claim)
+                onResult(true, "Claim moderation branch created. The Original branch remains unchanged.")
+            }
+            log("claimed group ${claim.group.name} (${short(groupId)}) as branch ${short(claim.branchId)}; selected locally")
+            logGroupResponsibilities("group-claimed")
+            gossipGroups()
         } catch (t: Throwable) {
             log("group claim failed: ${t.message}")
+            withContext(Dispatchers.Main.immediate) {
+                onResult(false, t.message ?: "Could not create Claim moderation branch")
+            }
         }
+    }
+
+    fun groupAuthorityContinuity(groupId: String): GroupAuthorityContinuityV2? {
+        val group = groups.byId(groupId) ?: return null
+        val selected = groups.selectedBranch(groupId) ?: group.rootRecordKey.takeIf { it.isNotBlank() }?.let {
+            GroupBranchPointer(
+                groupId = groupId,
+                branchId = GroupBranchNetwork.originalBranchId(groupId),
+                branchRoot = it,
+                ownerMainDht = group.ownerId,
+                kind = GroupBranchKind.Original,
+                creatorRoot = it,
+                updatedAt = group.updatedAt,
+            )
+        } ?: return null
+        val header = groups.selectedHeader(groupId)
+        val authorities = linkedSetOf(selected.ownerMainDht).apply {
+            header?.moderators?.mapTo(this) { it.moderatorMainDht }
+        }
+        val now = System.currentTimeMillis()
+        val pulse = groups.pulse(groupId, selected.branchId)
+        val recentConversationActivity = pulse.conversations.any { conversation ->
+            conversation.lastActivity > 0L && now - conversation.lastActivity <= 48L * 60L * 60L * 1000L
+        }
+        val hasActivity = groups.pendingFor(groupId).isNotEmpty() || recentConversationActivity
+        return groupTrustV2.continuity(
+            groupId = groupId,
+            branchId = selected.branchId,
+            authorityPeers = authorities,
+            ownMainDht = _ui.value.mainDht,
+            hasPendingOrRecentActivity = hasActivity,
+            now = now,
+        )
+    }
+
+    fun resolveGroupLink(raw: String, onResolved: (GroupRecord?) -> Unit = {}) = scope.launch {
+        val result = runCatching {
+            groupRuntime?.resolveGroupLink(raw) ?: error("Group runtime is not ready")
+        }
+        result.onFailure { log("group link resolve failed: ${it.message}") }
+        withContext(Dispatchers.Main.immediate) { onResolved(result.getOrNull()) }
+    }
+
+    fun claimGroupLink(raw: String, onResult: (String) -> Unit = {}) = scope.launch {
+        val result = runCatching {
+            groupRuntime?.claimLink(raw) ?: error("Group runtime is not ready")
+        }
+        result.onSuccess { claim ->
+            val advertised = groupRuntime?.publishMyDirectory() ?: 0
+            log("claimed group ${claim.group.name} as branch ${short(claim.branchId)}; directory entries=$advertised; profile_published=${_ui.value.published}")
+            logGroupResponsibilities("group-claimed")
+            gossipGroups()
+            val message = if (_ui.value.published) {
+                "Group is now claimed. Your moderation branch is advertised on your published profile."
+            } else {
+                "Group is now claimed locally. Publish your profile so other people can discover your moderation branch."
+            }
+            withContext(Dispatchers.Main.immediate) { onResult(message) }
+        }.onFailure { error ->
+            log("group link claim failed: ${error.message}")
+            withContext(Dispatchers.Main.immediate) {
+                onResult(error.message ?: "Could not claim that group")
+            }
+        }
+    }
+
+    fun createGroupPost(
+        groupId: String,
+        title: String,
+        body: String,
+        authorName: String,
+        media: LocalMediaStore,
+        image: LocalMediaStore.Stored? = null,
+        audio: LocalMediaStore.AudioStored? = null,
+        onDone: (Boolean, String?) -> Unit = { _, _ -> },
+    ) = scope.launch {
+        log("group post upload started: group=${short(groupId)} image=${image != null} audio=${audio != null} title=${title.take(48)}")
+        val result = runCatching {
+            var thumbnailBase64: String? = null
+            val fullMedia = mutableListOf<WeaveObjectRef>()
+            if (image != null) {
+                val bytes = media.bytesFor(image.contentHash)
+                    ?: error("Selected image is no longer available")
+                val blob = uploadMedia("image/webp", bytes)
+                    ?: error("Could not upload the post image")
+                val recordKey = blob.optString("root_record_key")
+                if (recordKey.isBlank()) error("The daemon uploaded an image but returned no record key")
+                val remoteHash = blob.optString("sha256_hex").ifBlank { sha256Hex(bytes) }
+                log("group post image uploaded: bytes=${bytes.size} record=${short(recordKey)}")
+                blob.optString("blob_id").takeIf { it.isNotBlank() }?.let { blobId ->
+                    media.recordBlob(image.contentHash, blobId, recordKey)
+                }
+                thumbnailBase64 = media.thumbnailBase64For(image.contentHash)
+                fullMedia += WeaveObjectRef(
+                    objectId = remoteHash,
+                    recordKey = recordKey,
+                    subkey = 0,
+                    type = WeaveObjectType.Image,
+                )
+            }
+            if (audio != null) {
+                val bytes = media.audioBytesFor(audio.contentHash)
+                    ?: error("Selected audio is no longer available")
+                val blob = uploadMedia("audio/mp4", bytes)
+                    ?: error("Could not upload the post audio")
+                val recordKey = blob.optString("root_record_key")
+                if (recordKey.isBlank()) error("The daemon uploaded audio but returned no record key")
+                val remoteHash = blob.optString("sha256_hex").ifBlank { sha256Hex(bytes) }
+                log("group post audio uploaded: bytes=${bytes.size} record=${short(recordKey)}")
+                blob.optString("blob_id").takeIf { it.isNotBlank() }?.let { blobId ->
+                    media.recordBlob(audio.contentHash, blobId, recordKey)
+                }
+                fullMedia += WeaveObjectRef(
+                    objectId = remoteHash,
+                    recordKey = recordKey,
+                    subkey = 0,
+                    type = WeaveObjectType.Audio,
+                )
+            }
+            val conversationId = groupRuntime?.createGroupPost(
+                groupId = groupId,
+                title = title,
+                body = body,
+                authorName = authorName,
+                thumbnailBase64 = thumbnailBase64,
+                fullMedia = fullMedia,
+            ) ?: error("Group runtime is not ready")
+            log("group post submitted: group=${short(groupId)} conversation=${short(conversationId)}")
+            gossipGroups()
+            conversationId
+        }.onFailure { log("group post creation failed: ${it.message}") }
+        withContext(Dispatchers.Main.immediate) {
+            onDone(result.isSuccess, result.getOrNull())
+        }
+    }
+
+    fun postGroupComment(
+        groupId: String,
+        conversationId: String,
+        body: String,
+        authorName: String,
+        onDone: (Boolean) -> Unit = {},
+    ) = scope.launch {
+        val ok = runCatching {
+            groupRuntime?.postComment(groupId, conversationId, body, authorName)
+                ?: error("Group runtime is not ready")
+        }.onFailure { log("group comment failed: ${it.message}") }.isSuccess
+        withContext(Dispatchers.Main.immediate) { onDone(ok) }
+    }
+
+    fun refreshGroupPost(
+        groupId: String,
+        conversationId: String,
+        onLoaded: (GroupPostDetail?) -> Unit = {},
+    ) = scope.launch {
+        val post = runCatching {
+            groupRuntime?.hydratePost(groupId, conversationId)
+        }.onFailure { log("group post refresh failed: ${it.message}") }.getOrNull()
+        withContext(Dispatchers.Main.immediate) { onLoaded(post) }
+    }
+
+    fun pinGroupComment(groupId: String, postId: String, pinned: Boolean) = scope.launch {
+        runCatching {
+            groupRuntime?.setPinned(groupId, postId, pinned) ?: error("Group runtime is not ready")
+        }.onFailure { log("group pin failed: ${it.message}") }
+    }
+
+    fun setGroupFeatured(groupId: String, slot: FeaturedSlot) = scope.launch {
+        runCatching {
+            groupRuntime?.setFeatured(groupId, slot) ?: error("Group runtime is not ready")
+        }.onFailure { log("group featured update failed: ${it.message}") }
     }
 
     fun submitGroupConversation(groupId: String, conversation: WeaveObjectRef, title: String) = scope.launch {
@@ -514,9 +846,90 @@ class SocialNetworkController(context: Context) {
         }.onFailure { log("group moderation action failed: ${it.message}") }
     }
 
-    fun grantGroupModerator(groupId: String, moderatorMainDht: String) = scope.launch {
+    fun loadGroupMessage(
+        ref: WeaveObjectRef,
+        onLoaded: (WeaveMessage?) -> Unit,
+    ) = scope.launch {
+        val message = runCatching {
+            groupRuntime?.loadMessage(ref) ?: error("Group runtime is not ready")
+        }.onFailure { log("group post load failed: ${it.message}") }.getOrNull()
+        withContext(Dispatchers.Main.immediate) { onLoaded(message) }
+    }
+
+    fun modifyGroupPost(
+        groupId: String,
+        conversationId: String,
+        sourceRef: WeaveObjectRef,
+        title: String,
+        body: String,
+        onDone: (Boolean, String) -> Unit = { _, _ -> },
+    ) = scope.launch {
+        val result = runCatching {
+            groupRuntime?.modifyPostForBranch(groupId, conversationId, sourceRef, title, body)
+                ?: error("Group runtime is not ready")
+        }
+        result.onFailure { log("group curated-post edit failed: ${it.message}") }
+        if (result.isSuccess) gossipGroups()
+        withContext(Dispatchers.Main.immediate) {
+            onDone(
+                result.isSuccess,
+                result.exceptionOrNull()?.message ?: "Curated branch copy updated; the source post was not changed.",
+            )
+        }
+    }
+
+    fun deleteGroupPost(
+        groupId: String,
+        conversationId: String,
+        sourceRef: WeaveObjectRef,
+        reason: String,
+        onDone: (Boolean, String) -> Unit = { _, _ -> },
+    ) = scope.launch {
+        val result = runCatching {
+            groupRuntime?.removePostForBranch(groupId, conversationId, sourceRef, reason)
+                ?: error("Group runtime is not ready")
+        }
+        result.onFailure { log("group post removal failed: ${it.message}") }
+        if (result.isSuccess) gossipGroups()
+        withContext(Dispatchers.Main.immediate) {
+            onDone(
+                result.isSuccess,
+                result.exceptionOrNull()?.message ?: "Post removed from this moderation branch.",
+            )
+        }
+    }
+
+    fun banGroupAuthor(
+        groupId: String,
+        authorMainDht: String,
+        onDone: (Boolean, String) -> Unit = { _, _ -> },
+    ) = scope.launch {
+        val result = runCatching {
+            groupRuntime?.banAuthor(groupId, authorMainDht) ?: error("Group runtime is not ready")
+        }
+        result.onFailure { log("group author ban failed: ${it.message}") }
+        if (result.isSuccess) gossipGroups()
+        withContext(Dispatchers.Main.immediate) {
+            onDone(
+                result.isSuccess,
+                result.exceptionOrNull()?.message ?: "Author banned on this moderation branch.",
+            )
+        }
+    }
+
+    fun loadGroupCuratorPosts(
+        groupId: String,
+        onLoaded: (List<GroupCuratorPost>) -> Unit,
+    ) = scope.launch {
+        val posts = runCatching {
+            groupRuntime?.curatorPosts(groupId).orEmpty()
+        }.onFailure { log("group curator view failed: ${it.message}") }.getOrDefault(emptyList())
+        withContext(Dispatchers.Main.immediate) { onLoaded(posts) }
+    }
+
+    fun grantGroupModerator(groupId: String, grant: GroupModeratorGrant) = scope.launch {
         runCatching {
-            groupRuntime?.grantModerator(groupId, moderatorMainDht) ?: error("Group runtime is not ready")
+            groupRuntime?.grantModerator(groupId, grant) ?: error("Group runtime is not ready")
         }.onFailure { log("group moderator grant failed: ${it.message}") }
     }
 
@@ -537,6 +950,431 @@ class SocialNetworkController(context: Context) {
     // five pictures is five independent fetches that can be skipped, deferred or abandoned
     // instead of one payload that must arrive whole.
     // ---------------------------------------------------------------------
+
+    /** Ensures this published widget instance has its long-lived publisher-owned Data DHT. */
+    suspend fun ensureWidgetDataDht(elementId: String, sourceHash: String, program: WidgetProgram): String? =
+        withContext(Dispatchers.IO) {
+            runCatching { widgetNetwork?.ensurePublisherDataDht(elementId, sourceHash, program) }
+                .onFailure { log("widget Data DHT: ${it.message}") }
+                .getOrNull()
+        }
+
+    /** Narrow host passed to an activated online widget. It exposes no raw DHT/mailbox operations. */
+    fun widgetNetworkHost(ownerMainDht: String, element: Element, program: WidgetProgram): WidgetNetworkHost? {
+        if (program.onlineMode != WidgetOnlineMode.Public) return null
+        val sourceHash = element.widgetSourceHash.lowercase()
+        if (ownerMainDht.isBlank() || sourceHash.isBlank()) return null
+        val instanceId = widgetInstanceIdHex(ownerMainDht, element.id, sourceHash)
+
+        data class PendingAction(
+            val hashes: MutableSet<String>,
+            val event: WidgetHostEvent,
+        )
+
+        return object : WidgetNetworkHost {
+            private val seenSignals = ConcurrentHashMap.newKeySet<String>()
+            private val pendingInputs = ConcurrentHashMap<String, Pair<WidgetPublicSignal, WidgetNetworkEvent>>()
+            private val pendingActions = ConcurrentHashMap<String, List<Pair<WidgetPublicSignal, WidgetNetworkEvent>>>()
+            private val incomingActionPieces = ConcurrentHashMap<String, ConcurrentHashMap<Int, Pair<WidgetPublicSignal, WidgetNetworkEvent>>>()
+            private val pendingInvites = ConcurrentHashMap<String, Pair<WidgetPublicSignal, WidgetNetworkEvent>>()
+            private val outgoingByHash = ConcurrentHashMap<String, WidgetHostEvent>()
+            private val outgoingActions = ConcurrentHashMap<String, PendingAction>()
+            private val hashToAction = ConcurrentHashMap<String, String>()
+            private val openInviteSessions = ConcurrentHashMap<String, String>()
+            private val queue = java.util.concurrent.ConcurrentLinkedQueue<WidgetHostEvent>()
+            private val secureRandom = java.security.SecureRandom()
+
+            @Volatile private var waitingInviteId: String = ""
+            @Volatile private var waitingOwnSessionDht: String = ""
+            @Volatile private var activePeerSessionDht: String = ""
+            @Volatile private var activeOwnSessionDht: String = ""
+            @Volatile private var pairInviteId: String = ""
+            @Volatile private var myPlayer: Int = 0
+            @Volatile private var closed: Boolean = false
+
+            private val actionLock = Any()
+            private var actionOpen = false
+            private val actionBuffer = mutableListOf<List<WidgetInputValue>>()
+            private var actionInputIds: Set<String> = emptySet()
+
+            private val randomLock = Any()
+            private var ownRandomSecret = ""
+            private var ownRandomCommit = ""
+            private var peerRandomCommit = ""
+            private var peerRandomReveal = ""
+            private var ownRevealPublished = false
+            private var ownCommitPublished = false
+            private var sharedRandomSeed = ""
+            private var randomFirstPlayer = 0
+            private var randomReadyEmitted = false
+            private var nextRollIndex = 1
+
+            private fun signalKey(signal: WidgetPublicSignal): String =
+                "${signal.sessionDht}|${signal.sequence}|${signal.eventHashHex}"
+
+            private fun opaqueToken(signal: WidgetPublicSignal): String =
+                sha256Hex("widget-runtime|${signalKey(signal)}".toByteArray()).take(32)
+
+            private fun otherPlayer(): Int = if (myPlayer == 1) 2 else if (myPlayer == 2) 1 else 0
+
+            private fun randomOrderFor(ownDht: String, peerDht: String): Int {
+                val ownHash = sha256Hex(ownDht.toByteArray(Charsets.UTF_8))
+                val peerHash = sha256Hex(peerDht.toByteArray(Charsets.UTF_8))
+                val ownKey = ownHash.take(4)
+                val peerKey = peerHash.take(4)
+                return if (ownKey < peerKey || (ownKey == peerKey && ownHash < peerHash)) myPlayer else otherPlayer()
+            }
+
+            private fun randomCommit(secretHex: String): String = sha256Hex(
+                "weave-widget-random-commit-v1\u0000$pairInviteId\u0000$secretHex".toByteArray(Charsets.UTF_8)
+            )
+
+            private fun rollValue(seedHex: String, index: Int, sides: Int): Int {
+                val h = sha256Hex("weave-widget-roll-v1\u0000$seedHex\u0000$index\u0000$sides".toByteArray(Charsets.UTF_8))
+                val n = h.take(8).toLong(16)
+                return (n % sides.toLong()).toInt() + 1
+            }
+
+            private fun startRandomNegotiation() {
+                if (closed || myPlayer !in 1..2 || activeOwnSessionDht.isBlank() || activePeerSessionDht.isBlank() || pairInviteId.isBlank()) return
+                synchronized(randomLock) {
+                    if (ownRandomSecret.isNotBlank()) return
+                    val bytes = ByteArray(32).also(secureRandom::nextBytes)
+                    ownRandomSecret = bytes.joinToString("") { "%02x".format(it.toInt() and 0xff) }
+                    ownRandomCommit = randomCommit(ownRandomSecret)
+                    randomFirstPlayer = randomOrderFor(activeOwnSessionDht, activePeerSessionDht)
+                }
+                scope.launch {
+                    val manager = widgetNetwork ?: return@launch
+                    manager.publishRandomCommit(ownerMainDht, element.id, sourceHash, program, ownRandomCommit)
+                        .onSuccess { synchronized(randomLock) { ownCommitPublished = true }; maybePublishReveal() }
+                        .onFailure { log("widget random commitment failed: ${it.message}") }
+                }
+            }
+
+            private fun maybePublishReveal() {
+                val shouldReveal = synchronized(randomLock) {
+                    if (ownRevealPublished || !ownCommitPublished || peerRandomCommit.isBlank()) false
+                    else if (myPlayer == randomFirstPlayer) true
+                    else peerRandomReveal.isNotBlank()
+                }
+                if (!shouldReveal) return
+                synchronized(randomLock) { ownRevealPublished = true }
+                scope.launch {
+                    val manager = widgetNetwork ?: return@launch
+                    manager.publishRandomReveal(ownerMainDht, element.id, sourceHash, program, ownRandomSecret)
+                        .onFailure { synchronized(randomLock) { ownRevealPublished = false }; log("widget random reveal failed: ${it.message}") }
+                }
+            }
+
+            private fun maybeFinishRandom() {
+                val event = synchronized(randomLock) {
+                    if (randomReadyEmitted || !ownRevealPublished || peerRandomReveal.isBlank() || peerRandomCommit.isBlank()) return@synchronized null
+                    if (randomCommit(peerRandomReveal) != peerRandomCommit) {
+                        log("widget random reveal rejected: commitment mismatch")
+                        return@synchronized null
+                    }
+                    val p1 = if (myPlayer == 1) ownRandomSecret else peerRandomReveal
+                    val p2 = if (myPlayer == 2) ownRandomSecret else peerRandomReveal
+                    sharedRandomSeed = sha256Hex("weave-widget-random-seed-v1\u0000$pairInviteId\u0000$p1\u0000$p2".toByteArray(Charsets.UTF_8))
+                    randomReadyEmitted = true
+                    WidgetHostEvent(WidgetHostEventKind.RandomReady, myPlayer = myPlayer, randomFirstPlayer = randomFirstPlayer)
+                }
+                if (event != null) queue.add(event)
+            }
+
+            private fun establishPair(player: Int, ownSessionDht: String, peerSessionDht: String, inviteId: String) {
+                myPlayer = player
+                activeOwnSessionDht = ownSessionDht
+                activePeerSessionDht = peerSessionDht
+                pairInviteId = inviteId
+                queue.add(WidgetHostEvent(WidgetHostEventKind.SessionReady, myPlayer = myPlayer))
+                startRandomNegotiation()
+            }
+
+            override fun send(values: List<WidgetInputValue>, text: String) {
+                if (closed) return
+                synchronized(actionLock) {
+                    if (actionOpen) {
+                        if (text.isNotEmpty() || values.isEmpty()) {
+                            log("widget action: only declared input steps may be buffered")
+                            return
+                        }
+                        if (actionBuffer.size >= VeilWidgetLimits.MAX_NETWORK_ACTION_STEPS) {
+                            log("widget action: step limit reached")
+                            return
+                        }
+                        val ids = values.map { it.inputId }.toSet()
+                        if (actionBuffer.isEmpty()) actionInputIds = ids
+                        if (ids != actionInputIds) {
+                            log("widget action: all steps must use the same input names")
+                            return
+                        }
+                        actionBuffer += values.map { it.copy(numberExpression = "") }
+                        return
+                    }
+                }
+                scope.launch {
+                    if (closed) return@launch
+                    val manager = widgetNetwork ?: return@launch
+                    manager.submit(ownerMainDht, element.id, sourceHash, program, inputs = values, text = text)
+                        .onSuccess { signal ->
+                            if (closed) return@onSuccess
+                            if (values.isNotEmpty()) outgoingByHash[signal.eventHashHex] = WidgetHostEvent(
+                                kind = WidgetHostEventKind.Committed,
+                                inputs = values.map { it.copy(numberExpression = "") }, text = text,
+                                myPlayer = myPlayer, eventPlayer = myPlayer,
+                            )
+                        }
+                        .onFailure { log("widget network submission rejected: ${it.message}") }
+                }
+            }
+
+            override fun beginAction() {
+                if (closed || activePeerSessionDht.isBlank()) return
+                synchronized(actionLock) {
+                    if (actionOpen) return
+                    actionOpen = true
+                    actionBuffer.clear(); actionInputIds = emptySet()
+                }
+            }
+
+            override fun endAction() {
+                if (closed) return
+                val steps = synchronized(actionLock) {
+                    if (!actionOpen) return
+                    actionOpen = false
+                    val copy = actionBuffer.map { step -> step.map { it.copy() } }
+                    actionBuffer.clear(); actionInputIds = emptySet(); copy
+                }
+                if (steps.isEmpty()) return
+                scope.launch {
+                    val manager = widgetNetwork ?: return@launch
+                    manager.submitAction(ownerMainDht, element.id, sourceHash, program, steps)
+                        .onSuccess { publication ->
+                            val hashes = publication.signals.map { it.eventHashHex }.toMutableSet()
+                            val event = WidgetHostEvent(WidgetHostEventKind.ActionCommitted, actionSteps = steps, myPlayer = myPlayer, eventPlayer = myPlayer)
+                            outgoingActions[publication.actionIdHex] = PendingAction(hashes, event)
+                            hashes.forEach { hashToAction[it] = publication.actionIdHex }
+                        }
+                        .onFailure { log("widget grouped action rejected: ${it.message}") }
+                }
+            }
+
+            override fun roll(sides: Int) {
+                if (closed || sides !in 2..VeilWidgetLimits.MAX_DICE_SIDES) return
+                val index: Int
+                val first: Int
+                val seed: String
+                synchronized(randomLock) {
+                    if (sharedRandomSeed.isBlank()) return
+                    index = nextRollIndex
+                    first = randomFirstPlayer
+                    val expected = if (index % 2 == 1) first else if (first == 1) 2 else 1
+                    if (myPlayer != expected) return
+                    seed = sharedRandomSeed
+                }
+                scope.launch {
+                    val manager = widgetNetwork ?: return@launch
+                    manager.publishRandomRoll(ownerMainDht, element.id, sourceHash, program, index, sides)
+                        .onSuccess {
+                            synchronized(randomLock) { if (nextRollIndex == index) nextRollIndex++ }
+                            queue.add(WidgetHostEvent(WidgetHostEventKind.Roll, myPlayer = myPlayer, eventPlayer = myPlayer, randomFirstPlayer = first, rollIndex = index, rollSides = sides, rollValue = rollValue(seed, index, sides)))
+                        }
+                        .onFailure { log("widget dice roll failed: ${it.message}") }
+                }
+            }
+
+            override fun openInvitation() {
+                if (closed) return
+                scope.launch {
+                    val manager = widgetNetwork ?: return@launch
+                    manager.openInvitation(ownerMainDht, element.id, sourceHash, program)
+                        .onSuccess { (inviteId, signal) -> openInviteSessions[inviteId] = signal.sessionDht }
+                        .onFailure { log("widget invitation rejected: ${it.message}") }
+                }
+            }
+
+            override fun accept(token: String) {
+                if (closed) return
+                pendingActions.remove(token)?.let { parts ->
+                    scope.launch {
+                        val manager = widgetNetwork ?: return@launch
+                        var ok = true
+                        parts.forEach { pair -> if (manager.acknowledgeRead(ownerMainDht, element.id, sourceHash, program, pair.first.eventHashHex).isFailure) ok = false }
+                        if (ok) queue.add(WidgetHostEvent(WidgetHostEventKind.ActionCommitted, actionSteps = parts.sortedBy { it.second.actionStep }.map { it.second.inputs.map { v -> v.copy(numberExpression = "") } }, myPlayer = myPlayer, eventPlayer = otherPlayer()))
+                    }
+                    return
+                }
+                val pending = pendingInputs.remove(token) ?: return
+                scope.launch {
+                    val manager = widgetNetwork ?: return@launch
+                    manager.acknowledgeRead(ownerMainDht, element.id, sourceHash, program, pending.first.eventHashHex)
+                        .onSuccess { queue.add(WidgetHostEvent(WidgetHostEventKind.Committed, inputs = pending.second.inputs.map { v -> v.copy(numberExpression = "") }, text = pending.second.text, myPlayer = myPlayer, eventPlayer = otherPlayer())) }
+                        .onFailure { log("widget event acknowledgement failed: ${it.message}") }
+                }
+            }
+
+            override fun reject(token: String) { if (!closed) { pendingInputs.remove(token); pendingActions.remove(token) } }
+
+            override fun acceptInvite(token: String) {
+                if (closed) return
+                val pending = pendingInvites.remove(token) ?: return
+                scope.launch {
+                    val manager = widgetNetwork ?: return@launch
+                    manager.acceptInvitation(ownerMainDht, element.id, sourceHash, program, pending.second.inviteIdHex, pending.first.sessionDht)
+                        .onSuccess { acceptSignal -> waitingInviteId = pending.second.inviteIdHex; waitingOwnSessionDht = acceptSignal.sessionDht }
+                        .onFailure { log("widget invitation acceptance failed: ${it.message}") }
+                }
+            }
+
+            override fun declineInvite(token: String) { if (!closed) pendingInvites.remove(token) }
+
+            override fun close() {
+                closed = true
+                pendingInputs.clear(); pendingActions.clear(); incomingActionPieces.clear(); pendingInvites.clear()
+                outgoingByHash.clear(); outgoingActions.clear(); hashToAction.clear(); openInviteSessions.clear(); queue.clear()
+                synchronized(actionLock) { actionOpen = false; actionBuffer.clear(); actionInputIds = emptySet() }
+                waitingInviteId = ""; waitingOwnSessionDht = ""; activePeerSessionDht = ""; activeOwnSessionDht = ""; pairInviteId = ""; myPlayer = 0
+                synchronized(randomLock) {
+                    ownRandomSecret = ""; ownRandomCommit = ""; peerRandomCommit = ""; peerRandomReveal = ""
+                    ownRevealPublished = false; ownCommitPublished = false; sharedRandomSeed = ""; randomFirstPlayer = 0; randomReadyEmitted = false; nextRollIndex = 1
+                }
+                log("widget network: runtime closed/reset instance=${instanceId.take(12)}")
+            }
+
+            override suspend fun poll(): List<WidgetHostEvent> = withContext(Dispatchers.IO) {
+                if (closed) return@withContext emptyList()
+                val manager = widgetNetwork ?: return@withContext emptyList()
+                manager.recentSignals(instanceId).forEach { signal ->
+                    val key = signalKey(signal)
+                    if (key in seenSignals) return@forEach
+                    if (manager.isOwnSessionDht(signal.sessionDht)) { seenSignals += key; return@forEach }
+                    if (activePeerSessionDht.isNotBlank() && signal.kind in setOf(
+                            WidgetNetworkEventKind.Inputs, WidgetNetworkEventKind.Text, WidgetNetworkEventKind.ReadAck,
+                            WidgetNetworkEventKind.RandomCommit, WidgetNetworkEventKind.RandomReveal, WidgetNetworkEventKind.RandomRoll,
+                        ) && signal.sessionDht != activePeerSessionDht) { seenSignals += key; return@forEach }
+                    val event = manager.readSignalledEvent(signal) ?: return@forEach
+                    if (!manager.validateRuntimeEvent(program, sourceHash, instanceId, signal, event)) { seenSignals += key; return@forEach }
+                    seenSignals += key
+
+                    when (event.kind) {
+                        WidgetNetworkEventKind.Inputs -> {
+                            if (event.actionIdHex.isNotBlank()) {
+                                val actionKey = "${signal.sessionDht}|${event.actionIdHex}"
+                                val pieces = incomingActionPieces.computeIfAbsent(actionKey) { ConcurrentHashMap() }
+                                pieces[event.actionStep] = signal to event
+                                if (pieces.size == event.actionCount && (1..event.actionCount).all { pieces.containsKey(it) }) {
+                                    val ordered = (1..event.actionCount).mapNotNull { pieces[it] }
+                                    val signatures = ordered.map { it.second.inputs.map { v -> v.inputId }.toSet() }
+                                    if (signatures.distinct().size == 1) {
+                                        val token = sha256Hex(ordered.joinToString("|") { it.first.eventHashHex }.toByteArray()).take(32)
+                                        pendingActions[token] = ordered
+                                        queue.add(WidgetHostEvent(WidgetHostEventKind.Action, token = token, actionSteps = ordered.map { it.second.inputs.map { v -> v.copy(numberExpression = "") } }, myPlayer = myPlayer, eventPlayer = otherPlayer()))
+                                    }
+                                    incomingActionPieces.remove(actionKey)
+                                }
+                            } else {
+                                val token = opaqueToken(signal)
+                                pendingInputs[token] = signal to event
+                                queue.add(WidgetHostEvent(WidgetHostEventKind.Input, token = token, inputs = event.inputs.map { it.copy(numberExpression = "") }, text = event.text, myPlayer = myPlayer, eventPlayer = otherPlayer()))
+                                if (event.text.isNotEmpty()) queue.add(WidgetHostEvent(WidgetHostEventKind.Text, text = event.text, myPlayer = myPlayer, eventPlayer = otherPlayer()))
+                            }
+                        }
+                        WidgetNetworkEventKind.Text -> queue.add(WidgetHostEvent(WidgetHostEventKind.Text, text = event.text, myPlayer = myPlayer, eventPlayer = otherPlayer()))
+                        WidgetNetworkEventKind.Invite -> {
+                            val token = opaqueToken(signal); pendingInvites[token] = signal to event
+                            queue.add(WidgetHostEvent(WidgetHostEventKind.Invite, token = token))
+                        }
+                        WidgetNetworkEventKind.Accept -> {
+                            val ownInviteSession = openInviteSessions[event.inviteIdHex]
+                            if (ownInviteSession != null && event.peerSessionDht == ownInviteSession) {
+                                manager.acknowledgeAcceptance(ownerMainDht, element.id, sourceHash, program, event.inviteIdHex, signal.sessionDht)
+                                    .onSuccess {
+                                        openInviteSessions.remove(event.inviteIdHex)
+                                        queue.add(WidgetHostEvent(WidgetHostEventKind.InviteAccepted, myPlayer = 1))
+                                        establishPair(1, ownInviteSession, signal.sessionDht, event.inviteIdHex)
+                                    }.onFailure { log("widget final invitation acknowledgement failed: ${it.message}") }
+                            }
+                        }
+                        WidgetNetworkEventKind.AcceptAck -> {
+                            if (waitingInviteId.isNotBlank() && event.inviteIdHex == waitingInviteId && event.peerSessionDht == waitingOwnSessionDht) {
+                                val invite = waitingInviteId; val own = waitingOwnSessionDht
+                                waitingInviteId = ""; waitingOwnSessionDht = ""
+                                establishPair(2, own, signal.sessionDht, invite)
+                            }
+                        }
+                        WidgetNetworkEventKind.ReadAck -> {
+                            outgoingByHash.remove(event.acceptedEventHashHex)?.let(queue::add)
+                            hashToAction.remove(event.acceptedEventHashHex)?.let { actionId ->
+                                val pending = outgoingActions[actionId]
+                                if (pending != null) {
+                                    pending.hashes.remove(event.acceptedEventHashHex)
+                                    if (pending.hashes.isEmpty()) { outgoingActions.remove(actionId); queue.add(pending.event) }
+                                }
+                            }
+                        }
+                        WidgetNetworkEventKind.RandomCommit -> {
+                            if (myPlayer in 1..2) {
+                                synchronized(randomLock) { peerRandomCommit = event.randomCommitHashHex }
+                                maybePublishReveal()
+                            }
+                        }
+                        WidgetNetworkEventKind.RandomReveal -> {
+                            if (myPlayer in 1..2) {
+                                val valid = synchronized(randomLock) { peerRandomCommit.isNotBlank() && randomCommit(event.randomRevealHex) == peerRandomCommit }
+                                if (valid) {
+                                    synchronized(randomLock) { peerRandomReveal = event.randomRevealHex }
+                                    maybePublishReveal(); maybeFinishRandom()
+                                } else log("widget random reveal rejected")
+                            }
+                        }
+                        WidgetNetworkEventKind.RandomRoll -> {
+                            val seed: String; val expected: Int; val first: Int
+                            synchronized(randomLock) {
+                                seed = sharedRandomSeed; first = randomFirstPlayer
+                                expected = if (event.rollIndex % 2 == 1) first else if (first == 1) 2 else 1
+                                if (seed.isBlank() || event.rollIndex != nextRollIndex || otherPlayer() != expected) return@forEach
+                                nextRollIndex++
+                            }
+                            queue.add(WidgetHostEvent(WidgetHostEventKind.Roll, myPlayer = myPlayer, eventPlayer = otherPlayer(), randomFirstPlayer = first, rollIndex = event.rollIndex, rollSides = event.rollSides, rollValue = rollValue(seed, event.rollIndex, event.rollSides)))
+                        }
+                        WidgetNetworkEventKind.Tombstone -> Unit
+                    }
+                }
+                buildList { while (true) { val next = queue.poll() ?: break; add(next) } }
+            }
+        }
+    }
+
+    suspend fun readWidgetDataDht(recordKey: String): WidgetDataSummary? = withContext(Dispatchers.IO) {
+        if (recordKey.isBlank()) null else widgetNetwork?.readPublisherDataDht(recordKey)
+    }
+
+    suspend fun uploadWidgetPackage(contentType: String, bytes: ByteArray): JSONObject? =
+        withContext(Dispatchers.IO) {
+            val d = daemon ?: return@withContext null
+            runCatching { d.uploadBlob(contentType, bytes) }
+                .onFailure { log("widget package upload failed: ${it.message}") }
+                .getOrNull()
+        }
+
+    /**
+     * Fetches a source-only widget package after explicit viewer activation.
+     * Opening a profile never calls this method on its own.
+     */
+    suspend fun downloadWidgetPackage(rootRecordKey: String, maxBytes: Int): ByteArray? =
+        withContext(Dispatchers.IO) {
+            val d = daemon ?: return@withContext null
+            runCatching {
+                val (meta, bytes) = d.downloadBlob(rootRecordKey, maxBytes)
+                val expected = meta.optString("sha256_hex")
+                if (expected.isNotBlank() && !sha256Hex(bytes).equals(expected, ignoreCase = true)) {
+                    error("widget package blob hash mismatch")
+                }
+                bytes
+            }.onFailure { log("widget package fetch failed: ${it.message}") }.getOrNull()
+        }
 
     /** Uploads image bytes and returns the blob object, or null when the daemon is not ready. */
     suspend fun uploadMedia(contentType: String, bytes: ByteArray): JSONObject? =
@@ -693,6 +1531,17 @@ class SocialNetworkController(context: Context) {
         log("subscribed to group spectator intake")
     }
 
+    private fun subscribeWidgetPublicNetwork() {
+        val d = daemon ?: return
+        widgetServiceSubscription?.let { runCatching { d.unsubscribe(it) } }
+        widgetServiceSubscription = d.subscribeServiceRequests(
+            serviceIdsHex = listOf(WidgetNetworkManager.PUBLIC_SERVICE_ID),
+            onRequest = { raw -> scope.launch { runCatching { widgetNetwork?.receivePublicServiceRequest(raw) }.onFailure { log("widget public request rejected: ${it.message}") } } },
+            onClosed = { reason -> log("widget public-network request stream closed: $reason") },
+        )
+        log("subscribed to public widget requests")
+    }
+
     private fun subscribeMessages() {
         val d = daemon ?: return
         messageSubscription = d.subscribeMessages(
@@ -710,6 +1559,28 @@ class SocialNetworkController(context: Context) {
         // Comment notices are accepted from the former and ignored from the latter, so a
         // stranger cannot spoof a comment into someone else's moderation queue.
         if (event.optString("delivery_kind") != "gossip") {
+            when (widgetNetwork?.receiveMailboxPointer(payload, source)) {
+                WidgetMailboxDisposition.Consumed, WidgetMailboxDisposition.RetryLater -> return
+                WidgetMailboxDisposition.NotWidget, null -> Unit
+            }
+            if (GroupCustodyWireCodecV2.looksLikeCustody(payload)) {
+                val custodyMessage = GroupCustodyWireCodecV2.decode(payload)
+                if (custodyMessage == null) {
+                    log("[groups-v2] CUSTODY_WIRE_REJECT source=${short(source)} reason=malformed")
+                } else {
+                    groupRuntime?.receiveCustodyWireV2(custodyMessage, source)
+                }
+                return
+            }
+            GroupEventTransportPacketV2.fromBytes(payload)?.let { packet ->
+                val transport = if (event.optString("delivery_kind") == "mailbox") {
+                    GroupEventTransportV2.PrivateMailbox
+                } else {
+                    GroupEventTransportV2.Direct
+                }
+                groupRuntime?.receiveCanonicalEventV2(packet, source, transport)
+                return
+            }
             GroupWireEnvelope.fromBytes(payload)?.let { envelope ->
                 groupRuntime?.receivePrivate(envelope, source)
                 return
@@ -725,6 +1596,13 @@ class SocialNetworkController(context: Context) {
             }
             return
         }
+        GroupGossipPacket.fromBytes(payload)?.let { packet ->
+            gossipReceivedCount.incrementAndGet()
+            receiveGroupGossip(packet, source)
+            updateSnapshots()
+            return
+        }
+
         val message = runCatching { GossipMessage.decode(payload) }.getOrNull() ?: return
         gossipReceivedCount.incrementAndGet()
         when (message) {
@@ -733,7 +1611,18 @@ class SocialNetworkController(context: Context) {
                     val representative = cluster.exemplars.firstOrNull() ?: MinHash(IntArray(MINHASH_SIZE) { 0xffff })
                     cluster.samples.forEach { sample -> cache.upsert(sample.approximateHint(nowSeconds(), representative), source, nowSeconds()) }
                 }
-                log("gossip summary from ${short(source)}: ${message.clusters.size} clusters")
+                val digest = MessageDigest.getInstance("SHA-256")
+                    .digest(message.toJson().toString().encodeToByteArray())
+                    .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+                    .take(12)
+                val nowMs = System.currentTimeMillis()
+                val previousDigest = gossipSummaryDigestBySource[source]
+                val previousLogAt = gossipSummaryLogAtBySource[source] ?: 0L
+                if (digest != previousDigest || nowMs - previousLogAt >= GOSSIP_SUMMARY_LOG_REPEAT_MS) {
+                    gossipSummaryDigestBySource[source] = digest
+                    gossipSummaryLogAtBySource[source] = nowMs
+                    log("gossip summary from ${short(source)}: ${message.clusters.size} clusters digest=$digest")
+                }
             }
             is GossipMessage.ProfileAnnounce -> {
                 message.profile.verification = VerificationState.GOSSIP_HINT
@@ -818,6 +1707,96 @@ class SocialNetworkController(context: Context) {
         profileDocuments[record.mainDht] = text
     }
 
+    private fun gossipGroups() {
+        val ownMainDht = _ui.value.mainDht
+        val hints = groups.gossipHints(GroupGossipPacket.MAX_HINTS)
+            .filterNot { hint ->
+                // Preserve profile-first discovery: a locally owned Original/Claim is not announced
+                // through gossip until this account's profile is published. Once another peer has
+                // legitimately learned the branch, that peer may relay the verified hint.
+                !_ui.value.published && hint.pointer.ownerMainDht == ownMainDht
+            }
+        if (hints.isEmpty() || knownPeers.isEmpty()) return
+        val packet = GroupGossipPacket(System.currentTimeMillis(), hints)
+        val bytes = packet.toBytes()
+        if (bytes.size > 8 * 1024) {
+            log("group gossip skipped: ${bytes.size} bytes exceeds gossip limit")
+            return
+        }
+        val sent = sendGossipToSample(bytes, 6)
+        val now = System.currentTimeMillis()
+        // Gossip runs every few seconds, but the persisted diagnostic log should remain readable.
+        // Record a heartbeat at most once per minute; actual verified changes are logged immediately.
+        if (sent > 0 && now - lastGroupGossipSendLogMs >= 60_000L) {
+            lastGroupGossipSendLogMs = now
+            log("group gossip heartbeat: ${hints.size} branch hint(s) sent to $sent peer(s)")
+        }
+    }
+
+    private fun receiveGroupGossip(packet: GroupGossipPacket, source: String) {
+        if (source.isBlank() || source == _ui.value.mainDht || packet.hints.isEmpty()) return
+        groupTrustV2.observePeerLive(source, "GroupGossip")
+        var scheduled = 0
+        packet.hints.forEach { hint ->
+            val pointer = hint.pointer
+            if (pointer.groupId.isBlank() || pointer.branchId.isBlank() || pointer.branchRoot.isBlank() ||
+                pointer.ownerMainDht.isBlank() || pointer.creatorRoot.isBlank()) return@forEach
+
+            val localGroup = groups.byId(pointer.groupId)
+            // An unknown Original can introduce a group. A Claim is only useful once the group is
+            // known, and must point back to that known creator root. This prevents arbitrary gossip
+            // peers from flooding the local store with unattached claim branches.
+            if (pointer.kind == GroupBranchKind.Original) {
+                if (pointer.branchRoot != pointer.creatorRoot) return@forEach
+            } else {
+                if (localGroup == null) return@forEach
+                if (localGroup.rootRecordKey.isNotBlank() && pointer.creatorRoot != localGroup.rootRecordKey) return@forEach
+            }
+
+            val localGeneration = groups.knownPulseGeneration(pointer.groupId, pointer.branchId)
+            val alreadyKnown = groups.branchKnown(pointer.groupId, pointer.branchId)
+            if (alreadyKnown && hint.pulseGeneration > 0L && hint.pulseGeneration <= localGeneration) {
+                return@forEach
+            }
+
+            val key = "${pointer.groupId}|${pointer.branchId}"
+            val stamp = maxOf(hint.pulseGeneration, hint.pulseUpdatedAt, pointer.updatedAt)
+            val previousStamp = groupHintStamp[key]
+            if (previousStamp != null && stamp > 0L && stamp <= previousStamp) return@forEach
+            if (!groupHintInFlight.add(key)) return@forEach
+            scheduled++
+
+            // Gossip is only a hint. refreshBranch re-reads and validates the authoritative header
+            // and Pulse from the DHT before anything is committed to the local group store. A failed
+            // verification does not consume the hint permanently; the next gossip can retry it.
+            scope.launch {
+                try {
+                    val loaded = runCatching { groupRuntime?.refreshBranch(pointer) }.getOrNull()
+                    if (loaded != null) {
+                        if (stamp > 0L) groupHintStamp[key] = stamp
+                        groupTrustV2.ensureWatch(pointer.groupId, pointer.branchId)
+                        val generation = loaded.second?.generation ?: -1L
+                        groupTrustV2.recordEvidence(
+                            peerMainDht = source,
+                            kind = GroupReputationEvidenceKindV2.GossipDhtConfirmed,
+                            evidenceKey = "${pointer.groupId}|${pointer.branchId}|$generation",
+                            groupId = pointer.groupId,
+                            detail = "gossip hint confirmed by authoritative branch DHT",
+                        )
+                        log("group gossip verified: ${loaded.first.name} ${pointer.kind.name} owner=${groupAuthorityName(pointer.ownerMainDht) ?: short(pointer.ownerMainDht)} pulse_generation=$generation")
+                    } else {
+                        log("group gossip verification unavailable: group=${short(pointer.groupId)} branch=${short(pointer.branchId)} from=${short(source)}; will retry on a later hint")
+                    }
+                } finally {
+                    groupHintInFlight.remove(key)
+                }
+            }
+        }
+        if (scheduled > 0) {
+            log("group gossip received from ${short(source)}: ${packet.hints.size} hint(s), $scheduled requiring DHT verification")
+        }
+    }
+
     private fun gossipSummary() {
         val clusters = cache.clusters(10, cache.generation() xor (nowSeconds() / 60)).map { it.copy(exemplars = it.exemplars.take(1), samples = it.samples.take(1)) }
         val message = GossipMessage.Summary(cache.generation(), nowSeconds(), clusters).toJson().toString().encodeToByteArray()
@@ -830,11 +1809,15 @@ class SocialNetworkController(context: Context) {
         if (message.size <= 8 * 1024) sendGossipToSample(message, 6)
     }
 
-    private fun sendGossipToSample(bytes: ByteArray, limit: Int) {
-        val d = daemon ?: return
+    private fun sendGossipToSample(bytes: ByteArray, limit: Int): Int {
+        val d = daemon ?: return 0
+        var sent = 0
         deterministicPeerSample(knownPeers.toList(), nowSeconds(), limit).forEach { peer ->
-            runCatching { d.sendGossip(peer, bytes) }.onSuccess { gossipSentCount.incrementAndGet() }.onFailure { log("gossip to ${short(peer)} failed: ${it.message}") }
+            runCatching { d.sendGossip(peer, bytes) }
+                .onSuccess { gossipSentCount.incrementAndGet(); sent++ }
+                .onFailure { log("gossip to ${short(peer)} failed: ${it.message}") }
         }
+        return sent
     }
 
     private fun updateSnapshots() {
@@ -1071,6 +2054,45 @@ class SocialNetworkController(context: Context) {
                 }.getOrNull() ?: continue
                 val sender = message.optString("sender_main_dht")
 
+                when (widgetNetwork?.receiveMailboxPointer(payload, sender)) {
+                    WidgetMailboxDisposition.Consumed -> {
+                        runCatching { d.deleteInbox(id) }
+                        handled++
+                        continue
+                    }
+                    WidgetMailboxDisposition.RetryLater -> {
+                        // The signed pointer is valid, but the sender's Session DHT may not have
+                        // propagated yet. Keep this mailbox item and retry on the next sweep.
+                        skipped++
+                        continue
+                    }
+                    WidgetMailboxDisposition.NotWidget, null -> Unit
+                }
+
+                if (GroupCustodyWireCodecV2.looksLikeCustody(payload)) {
+                    val custodyMessage = GroupCustodyWireCodecV2.decode(payload)
+                    if (custodyMessage == null) {
+                        log("[groups-v2] CUSTODY_WIRE_REJECT source=${short(sender)} reason=malformed-mailbox")
+                    } else {
+                        groupRuntime?.receiveCustodyWireV2(custodyMessage, sender)
+                    }
+                    runCatching { d.deleteInbox(id) }
+                    handled++
+                    continue
+                }
+
+                val groupV2Packet = GroupEventTransportPacketV2.fromBytes(payload)
+                if (groupV2Packet != null) {
+                    groupRuntime?.receiveCanonicalEventV2(
+                        groupV2Packet,
+                        sender,
+                        GroupEventTransportV2.PrivateMailbox,
+                    )
+                    runCatching { d.deleteInbox(id) }
+                    handled++
+                    continue
+                }
+
                 val groupEnvelope = GroupWireEnvelope.fromBytes(payload)
                 if (groupEnvelope != null) {
                     groupRuntime?.receivePrivate(groupEnvelope, sender)
@@ -1209,6 +2231,7 @@ class SocialNetworkController(context: Context) {
             CommentAck.Status.Published -> CommentState.Accepted
             CommentAck.Status.WaitingApproval -> CommentState.Held
             CommentAck.Status.Rejected -> CommentState.Dropped
+            else -> return
         }
         comments.setState(comment.id, state)
         bumpComments()
@@ -1260,6 +2283,10 @@ class SocialNetworkController(context: Context) {
      * Peers going to zero and staying there is what an offline node looks like from here —
      * the daemon keeps answering, so "connected" alone is misleading.
      */
+    fun diagnosticBreadcrumb(category: String, message: String) {
+        WeaveDiagnostics.event(appContext, category, message)
+    }
+
     private fun healthLine(): String {
         val state = _ui.value
         val since = if (lastPeerSeenMs == 0L) 0L else (System.currentTimeMillis() - lastPeerSeenMs) / 1000
@@ -1277,8 +2304,9 @@ class SocialNetworkController(context: Context) {
         val state = _ui.value
         return buildString {
             appendLine("Weave diagnostic report")
-            appendLine("generated: ${nowSeconds()}")
+            appendLine("generated: ${formatLogTime(System.currentTimeMillis())}")
             appendLine("app id: ${DaemonClient.APP_ID}")
+            appendLine("connected: ${state.connected}")
             appendLine("main dht: ${state.mainDht.ifBlank { "(none)" }}")
             appendLine("profile store root: ${state.profileRoot.ifBlank { "(none)" }}")
             appendLine("published: ${state.published}")
@@ -1287,19 +2315,73 @@ class SocialNetworkController(context: Context) {
             appendLine("last peer seen: ${if (lastPeerSeenMs == 0L) "never" else "${(System.currentTimeMillis() - lastPeerSeenMs) / 1000}s ago"}")
             appendLine("publishing: ${state.publishing}")
             appendLine()
-            appendLine("--- log ---")
-            append(state.debugLog)
+            appendLine("--- group responsibilities for this account ---")
+            groups.responsibilityLines(state.mainDht).forEach { appendLine(it) }
+            appendLine()
+            appendLine("--- Groups v2 Event Store ---")
+            groupEventsV2.diagnosticLines { groupId -> groups.byId(groupId)?.name }.forEach { appendLine(it) }
+            appendLine()
+            appendLine("--- Groups v2 Custody + Branch Decisions ---")
+            groupCustodyV2.diagnosticLines { groupId -> groups.byId(groupId)?.name }.forEach { appendLine(it) }
+            appendLine()
+            appendLine("--- Groups v2 Reputation + Authority Continuity ---")
+            groupTrustV2.diagnosticLines().forEach { appendLine(it) }
+            groupRuntime?.abuseDiagnosticLinesV2()?.forEach { appendLine(it) }
+            appendLine()
+            appendLine("--- lifecycle / daemon RPC breadcrumbs ---")
+            val breadcrumbs = WeaveDiagnostics.tail(appContext)
+            appendLine(if (breadcrumbs.isNotBlank()) breadcrumbs else "(none)")
+            appendLine("--- network/group log ---")
+            val persisted = readPersistentLogTail(DIAGNOSTIC_LOG_KEEP_BYTES)
+            append(if (persisted.isNotBlank()) persisted else state.debugLog)
         }
     }
+
     /** Wall-clock of the last snapshot that saw at least one peer. Zero means never. */
     private var lastPeerSeenMs = 0L
 
-    private fun log(message: String) {
-        val line = "[${nowSeconds()}] $message"
-        val old = _ui.value.debugLog
-        val merged = if (old.length > 45_000) old.takeLast(35_000) + "\n" + line else if (old.isBlank()) line else "$old\n$line"
-        _ui.value = _ui.value.copy(debugLog = merged)
+    private fun logGroupResponsibilities(reason: String) {
+        val main = _ui.value.mainDht
+        log("group responsibilities snapshot ($reason):")
+        groups.responsibilityLines(main).forEach { line -> log("groups: responsibility: $line") }
     }
+
+    private fun formatLogTime(millis: Long): String =
+        Instant.ofEpochMilli(millis).atZone(ZoneId.systemDefault()).format(LOG_TIMESTAMP_FORMAT)
+
+    private fun readPersistentLogTail(maxChars: Int = 180_000): String = runCatching {
+        if (!diagnosticLogFile.exists()) return@runCatching ""
+        diagnosticLogFile.readText().takeLast(maxChars.coerceAtLeast(1_000))
+    }.getOrDefault("")
+
+    private fun appendPersistentLog(line: String) {
+        runCatching {
+            diagnosticLogFile.parentFile?.mkdirs()
+            diagnosticLogFile.appendText(line + "\n")
+            if (diagnosticLogFile.length() > DIAGNOSTIC_LOG_MAX_BYTES) {
+                val tail = diagnosticLogFile.readText().takeLast(DIAGNOSTIC_LOG_KEEP_BYTES)
+                diagnosticLogFile.writeText(tail.substringAfter('\n', tail))
+            }
+        }
+    }
+
+    @Synchronized
+    private fun log(message: String) {
+        val now = System.currentTimeMillis()
+        val line = "[${formatLogTime(now)}] $message"
+        appendPersistentLog(line)
+
+        // The persisted file is the authoritative diagnostic log.  Mirroring a growing
+        // ~180 KiB String into SocialUiState on every single network/gossip line forced the root
+        // Compose tree to recompose for logs it does not even display, and created severe GC churn
+        // on busy daemon startups.  Refresh the UI-facing tail at most once per second instead.
+        if (now - lastDebugUiRefreshMs >= 1_000L) {
+            lastDebugUiRefreshMs = now
+            val tail = readPersistentLogTail(180_000)
+            _ui.value = _ui.value.copy(debugLog = tail)
+        }
+    }
+
 }
 
 private fun deterministicPeerSample(peers: List<String>, seed: Long, limit: Int): List<String> =
@@ -1309,7 +2391,6 @@ private fun deterministicPeerSample(peers: List<String>, seed: Long, limit: Int)
         h
     }.take(limit)
 
-private fun sha256Hex(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it.toInt() and 0xff) }
 private fun nowSeconds(): Long = System.currentTimeMillis() / 1000
 internal fun short(value: String): String = if (value.length <= 18) value else value.take(9) + "…" + value.takeLast(6)
 private fun JSONObject.stringOrNull(key: String): String? = if (has(key) && !isNull(key)) getString(key).takeIf { it.isNotBlank() } else null

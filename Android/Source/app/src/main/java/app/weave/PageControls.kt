@@ -327,3 +327,39 @@ fun ColourRow(selected: Int, onPick: (Int) -> Unit) {
         }
     }
 }
+
+/** Absolute (page-normalized) placement of a widget element. */
+data class WidgetPlacement(
+    val element: Element,
+    val x: Float,
+    val y: Float,
+    val width: Float,
+    val height: Float,
+)
+
+/**
+ * Widget placements without loading any widget package. These are calculated entirely from
+ * inert profile layout metadata, so a viewer can draw/tap placeholders before source is fetched.
+ */
+fun Page.widgetPlacements(): List<WidgetPlacement> = buildList {
+    fun walk(element: Element, left: Float, top: Float, width: Float, height: Float) {
+        val l = left + element.rect.x * width
+        val t = top + element.rect.y * height
+        val w = element.rect.width * width
+        val h = element.rect.height * height
+        if (element.type == ElementType.Widget) add(WidgetPlacement(element, l, t, w, h))
+        element.children.forEach { walk(it, l, t, w, h) }
+    }
+    root.children.forEach { walk(it, 0f, 0f, 1f, 1f) }
+}
+
+/** Topmost widget under a point in canvas pixels, using only profile layout metadata. */
+fun Page.widgetElementAt(x: Float, y: Float, canvasWidth: Float, canvasHeight: Float): Element? {
+    if (canvasWidth <= 0f || canvasHeight <= 0f) return null
+    val nx = x / canvasWidth
+    val ny = y / canvasHeight
+    return widgetPlacements()
+        .filter { p -> nx >= p.x && nx <= p.x + p.width && ny >= p.y && ny <= p.y + p.height }
+        .maxByOrNull { it.element.rect.zIndex }
+        ?.element
+}

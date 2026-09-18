@@ -1,0 +1,39 @@
+Weave Groups v2 Phase 1 - static validation
+Generated: 2026-09-12
+
+Scope
+-----
+New:
+- GroupEventV2.kt
+- GroupEventStoreV2.kt
+
+Modified:
+- DaemonClient.kt
+- GroupRuntime.kt
+- SocialNetworkController.kt
+- OnboardingScreens.kt
+
+Checks performed
+----------------
+PASS - New GroupEventV2 + GroupEventStoreV2 compile with Kotlin 1.9 against focused Android/daemon/JSON stubs.
+PASS - Kotlin source delimiter/structure scan on all six modified/new Kotlin files.
+PASS - No Kotlin parser messages matching: expecting / unexpected tokens / unclosed / conflicting declarations.
+PASS - Canonical event signing domain is constant: weave/group-event/v2.
+PASS - SignAppData API wrappers correspond to daemon v11 actions:
+       get_app_signing_identity / sign_app_payload / verify_app_signature.
+PASS - Event store uses daemon-owned encrypted PrivateVault key groups_v2/event_store_v1.
+PASS - Every event-store mutation path calls persist() before returning from the mutation.
+PASS - Duplicate same-ID/same-canonical-body path does not create a second event.
+PASS - Same-ID/different-canonical-body path stores conflict evidence and preserves canonical event.
+PASS - Local post/comment creation writes a v2 event after the author DHT content reference exists.
+PASS - Content hash uses deterministic binary serialization and is rechecked by reading the DHT payload.
+PASS - Normal v2 event target is group-scoped, avoiding immutable enumeration of all Claims.
+PASS - Copied diagnostics now include Groups v2 store state and up to ~700 KiB of persistent history.
+PASS - Temporary Settings controls exist for Copy event / Re-ingest / Conflict test / Import event.
+
+Full Gradle build
+-----------------
+NOT RUN in this environment. Gradle wrapper attempts to download Gradle 9.4.1 from
+services.gradle.org and this runtime has no outbound DNS/network access.
+
+The user's normal Windows/Android SDK build is therefore the first full Android compiler test.

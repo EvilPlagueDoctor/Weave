@@ -5,7 +5,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 enum class WeaveObjectType {
-    Message, Conversation, Image, Widget, Profile, Group;
+    Message, Conversation, Image, Audio, Widget, Profile, Group;
 
     companion object {
         fun fromWire(value: String): WeaveObjectType =
@@ -56,12 +56,20 @@ data class WeaveMessage(
     val authorId: String,
     val authorName: String,
     val body: String,
+    val title: String? = null,
     val thumbnailBase64: String? = null,
     val fullMedia: List<WeaveObjectRef> = emptyList(),
     val replyTo: WeaveObjectRef? = null,
     val root: WeaveObjectRef? = null,
     val createdAt: Long,
     val editedAt: Long? = null,
+    /**
+     * Branch-local curation never rewrites the author's source object. When a moderator publishes
+     * a replacement view for one moderation branch, these fields make that distinction explicit
+     * instead of making the replacement look like an edit performed by the original author.
+     */
+    val curatedBy: String? = null,
+    val curatedFromHash: String? = null,
     val flags: Int = 0,
     val signature: String = "",
 ) {
@@ -77,6 +85,7 @@ data class WeaveMessage(
         .put("name", authorName)
         .put("body", body)
         .put("created_at", createdAt)
+        .apply { title?.takeIf { it.isNotBlank() }?.let { put("title", it.take(160)) } }
         .put("flags", flags)
         .apply {
             thumbnailBase64?.takeIf { it.isNotBlank() }?.let { put("thumbnail", it) }
@@ -86,6 +95,8 @@ data class WeaveMessage(
             replyTo?.let { put("reply_to", it.toJson()) }
             root?.let { put("root", it.toJson()) }
             editedAt?.let { put("edited_at", it) }
+            curatedBy?.takeIf { it.isNotBlank() }?.let { put("curated_by", it) }
+            curatedFromHash?.takeIf { it.isNotBlank() }?.let { put("curated_from_hash", it) }
             if (signature.isNotBlank()) put("signature", signature)
         }
 
@@ -114,12 +125,15 @@ data class WeaveMessage(
                 authorId = o.optString("author"),
                 authorName = o.optString("name", "Someone").take(80),
                 body = o.optString("body").take(MAX_COMMENT_CHARS),
+                title = o.optString("title").takeIf { it.isNotBlank() }?.take(160),
                 thumbnailBase64 = o.optString("thumbnail").takeIf { it.isNotBlank() },
                 fullMedia = media,
                 replyTo = o.optJSONObject("reply_to")?.let(WeaveObjectRef::fromJson),
                 root = o.optJSONObject("root")?.let(WeaveObjectRef::fromJson),
                 createdAt = o.optLong("created_at"),
                 editedAt = o.optLong("edited_at").takeIf { o.has("edited_at") },
+                curatedBy = o.optString("curated_by").takeIf { it.isNotBlank() },
+                curatedFromHash = o.optString("curated_from_hash").takeIf { it.isNotBlank() },
                 flags = o.optInt("flags"),
                 signature = o.optString("signature"),
             )
@@ -133,9 +147,13 @@ data class MessagePreview(
     val authorId: String,
     val authorName: String,
     val bodyPreview: String,
+    val title: String? = null,
     val thumbnailBase64: String? = null,
     val fullMessage: WeaveObjectRef? = null,
     val createdAt: Long = 0L,
+    val pinned: Boolean = false,
+    val hasAudio: Boolean = false,
+    val curatedBy: String? = null,
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("id", messageId)
@@ -143,7 +161,11 @@ data class MessagePreview(
         .put("name", authorName)
         .put("body", bodyPreview.take(320))
         .put("ts", createdAt)
+        .apply { title?.takeIf { it.isNotBlank() }?.let { put("title", it.take(160)) } }
+        .put("pinned", pinned)
+        .put("audio", hasAudio)
         .apply {
+            curatedBy?.takeIf { it.isNotBlank() }?.let { put("curated_by", it) }
             thumbnailBase64?.takeIf { it.isNotBlank() }?.let { put("thumbnail", it) }
             fullMessage?.let { put("ref", it.toJson()) }
         }
@@ -154,9 +176,13 @@ data class MessagePreview(
             authorId = o.optString("author"),
             authorName = o.optString("name", "Someone"),
             bodyPreview = o.optString("body").take(320),
+            title = o.optString("title").takeIf { it.isNotBlank() }?.take(160),
             thumbnailBase64 = o.optString("thumbnail").takeIf { it.isNotBlank() },
             fullMessage = o.optJSONObject("ref")?.let(WeaveObjectRef::fromJson),
             createdAt = o.optLong("ts"),
+            pinned = o.optBoolean("pinned"),
+            hasAudio = o.optBoolean("audio"),
+            curatedBy = o.optString("curated_by").takeIf { it.isNotBlank() },
         )
     }
 }

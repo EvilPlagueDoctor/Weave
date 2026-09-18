@@ -18,8 +18,8 @@ enum class BrowseMode(val label: String, val glyph: String) {
 
 /**
  * Bottom-bar destinations. The old Activity slot is now a People/Groups mode switch, not
- * another navigation stack. Activity remains a destination reached through Me when moderation
- * actually needs attention.
+ * another navigation stack. Activity remains a destination reached through Settings when profile
+ * moderation actually needs attention.
  */
 enum class Tab(val label: String, val glyph: String) {
     Home("Home", "\u25C9"),
@@ -38,7 +38,7 @@ sealed interface Destination {
     data object Search : Destination
     data object Me : Destination
 
-    /** Existing profile-comment moderation/history, now reached from Me instead of a permanent tab. */
+    /** Existing profile-comment moderation/history, reached from Settings instead of a permanent tab. */
     data object Activity : Destination
 
     data class Profile(val mainDht: String) : Destination
@@ -47,6 +47,8 @@ sealed interface Destination {
     data object Settings : Destination
 
     data class Group(val groupId: String) : Destination
+    data class GroupPost(val groupId: String, val conversationId: String) : Destination
+    data class LinkedMedia(val type: WeaveObjectType, val recordKey: String, val sha256: String) : Destination
     data class GroupEditor(val groupId: String? = null) : Destination
     data object GroupModeration : Destination
 }
@@ -62,6 +64,8 @@ private fun Destination.encode(): String = when (this) {
     is Destination.Profile -> "profile\u0000$mainDht"
     is Destination.QuickEdit -> "quickedit\u0000$pageIndex"
     is Destination.Group -> "group\u0000$groupId"
+    is Destination.GroupPost -> "grouppost\u0000$groupId\u0000$conversationId"
+    is Destination.LinkedMedia -> "media\u0000${type.name}\u0000$recordKey\u0000$sha256"
     is Destination.GroupEditor -> "groupedit\u0000${groupId.orEmpty()}"
 }
 
@@ -76,6 +80,19 @@ private fun decodeDestination(raw: String): Destination = when {
     raw.startsWith("profile\u0000") -> Destination.Profile(raw.substringAfter('\u0000'))
     raw.startsWith("quickedit\u0000") ->
         Destination.QuickEdit(raw.substringAfter('\u0000').toIntOrNull() ?: 0)
+    raw.startsWith("grouppost\u0000") -> {
+        val parts = raw.split('\u0000')
+        Destination.GroupPost(parts.getOrElse(1) { "" }, parts.getOrElse(2) { "" })
+    }
+    raw.startsWith("media\u0000") -> {
+        val parts = raw.split('\u0000')
+        Destination.LinkedMedia(
+            type = WeaveObjectType.entries.firstOrNull { it.name == parts.getOrElse(1) { "" } }
+                ?: WeaveObjectType.Image,
+            recordKey = parts.getOrElse(2) { "" },
+            sha256 = parts.getOrElse(3) { "" },
+        )
+    }
     raw.startsWith("group\u0000") -> Destination.Group(raw.substringAfter('\u0000'))
     raw.startsWith("groupedit\u0000") ->
         Destination.GroupEditor(raw.substringAfter('\u0000').takeIf { it.isNotBlank() })

@@ -26,10 +26,10 @@ class GroupNetwork(
         return GroupBranchNetwork(client, state).readHeader(branchRoot)
     }
 
-    fun readPulse(rootRecordKey: String, page: Int = 0, force: Boolean = false): GroupPulse? {
+    fun readPulse(rootRecordKey: String, page: Int = 0, force: Boolean = true): GroupPulse? {
         if (page != 0) return null // v2 starts with one compact current Pulse per branch.
-        val state = store ?: return readPulseWithoutStore(rootRecordKey)
-        return GroupBranchNetwork(client, state).readPulse(rootRecordKey)
+        val state = store ?: return readPulseWithoutStore(rootRecordKey, force)
+        return GroupBranchNetwork(client, state).readPulse(rootRecordKey, force)
     }
 
     private fun readHeaderWithoutStore(root: String): GroupBranchHeader? = runCatching {
@@ -38,8 +38,8 @@ class GroupNetwork(
         GroupBranchHeader.fromJson(org.json.JSONObject(bytes.decodeToString()))
     }.getOrNull()
 
-    private fun readPulseWithoutStore(root: String): GroupPulse? = runCatching {
-        val result = client.readPublicStore(root, listOf(GroupBranchNetwork.PULSE_SUBKEY), false)
+    private fun readPulseWithoutStore(root: String, force: Boolean = true): GroupPulse? = runCatching {
+        val result = client.readPublicStore(root, listOf(GroupBranchNetwork.PULSE_SUBKEY), force)
         val bytes = CommentChain.decodeValue(result.optJSONArray("values")?.optJSONObject(0)) ?: return null
         GroupPulse.fromJson(org.json.JSONObject(bytes.decodeToString()))
     }.getOrNull()

@@ -1,0 +1,17 @@
+Weave Content Filtering v2 static validation
+Date: 2026-09-11
+
+PASS: Content filter categories are Sexual, Gore / graphic content, Aggressive / hostile text.
+PASS: Generic still-image Violence category removed from runtime/UI.
+PASS: Sexual and Gore share one image classifier pass and cache.
+PASS: OwenElliott image-safety XS output mapping is NSFL -> Gore, NSFW -> Sexual, SFW ignored.
+PASS: Image preprocessing matches upstream ONNX instructions: resized RGB, float values 0..255; graph handles normalization/softmax.
+PASS: Image model asset expected at content_filter/image_safety_xs.onnx.
+PASS: Aggressive/threat text remains independent MiniLM path.
+PASS: Old violence preference keys are read only as a migration fallback; future saves use gore keys.
+PASS: Download scripts target OwenElliott/image-safety-classifier-xs and do not bundle model binaries in source archive.
+PASS: Kotlin delimiter counts balanced for ContentFilter.kt and ContentFilterUi.kt.
+PASS: UTF-8 source read checks passed.
+PASS: Expected model asset references are consistent across code/scripts/docs.
+
+FULL BUILD NOT RUN: Gradle wrapper attempted to download Gradle 9.4.1 but this environment cannot resolve services.gradle.org. Build should be run normally on the development machine after running download_content_filter_models.bat.

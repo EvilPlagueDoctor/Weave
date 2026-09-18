@@ -1,0 +1,36 @@
+Weave Phase 6.10.1 — Chess load / ANR fix
+Static validation
+Date: 2026-09-17
+
+1. Pure Kotlin widget core compilation: PASS
+   HashUtils.kt, WidgetModel.kt, WidgetNetworkWire.kt, WidgetExpressions.kt,
+   WidgetLanguage.kt, WidgetVerifier.kt, WidgetTemplates.kt, WidgetPackageCodec.kt.
+
+2. Android resource XML parse: PASS
+
+3. Full Chess template still compiles and verifies: PASS
+   source ~= 122,368 bytes
+   bytecode ~= 89,550 bytes
+
+4. Template-preparation performance architecture:
+   - compile/verify moved to Dispatchers.Default
+   - encrypted vault save moved to Dispatchers.IO
+   - picker shows a preparing indicator instead of blocking the main thread
+   - saved local package remains source-only
+   - already verified WidgetProgram reused for local serialization and placement cache
+
+5. Widget library loading:
+   - package enumeration/decode moved off the Compose main thread
+   - account-scoped memory cache prevents repeated same-session recompilation
+
+6. Parser allocation reduction:
+   - hot WidgetLanguage Regex patterns are precompiled once
+
+7. Built-in picker presentation:
+   - Choose a built-in widget uses a stronger 2dp primary-colour border
+
+8. Gradle wrapper prerequisite: PASS
+   gradle/wrapper/gradle-wrapper.jar present
+
+9. Full Android Gradle compile: NOT RUN
+   Requires the user's JDK 17+ / Android SDK 36 environment.

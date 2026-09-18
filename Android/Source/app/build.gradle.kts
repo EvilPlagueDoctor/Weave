@@ -10,8 +10,8 @@ android {
         applicationId = "app.weave"
         minSdk = 29
         targetSdk = 36
-        versionCode = 16
-        versionName = "0.5.0-weave"
+        versionCode = 30
+        versionName = "0.9.5-widget-receive-events-v1"
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -38,6 +38,7 @@ dependencies {
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.onnxruntime.android)
     debugImplementation(libs.androidx.compose.ui.tooling)
 }
 

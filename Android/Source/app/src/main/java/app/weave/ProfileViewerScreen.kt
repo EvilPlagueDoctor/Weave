@@ -58,6 +58,17 @@ fun Page.imageHashesOnPage(): Set<String> = buildSet {
     walk(root)
 }
 
+fun Page.audioElementsOnPage(): List<Element> = buildList {
+    fun walk(e: Element) {
+        if (e.type == ElementType.Media &&
+            e.mediaKind == MediaKind.Audio &&
+            e.mediaContentHash.isNotBlank()
+        ) add(e)
+        e.children.forEach(::walk)
+    }
+    walk(root)
+}
+
 /**
  * Fixed-width, vertically scrolling page render.
  *
@@ -74,6 +85,7 @@ fun PageCanvas(
     /** Whose page this is. A "your mark" stamp resolves against it at draw time. */
     ownerKey: String = "",
     onImageLongPress: ((Element) -> Unit)? = null,
+    onWidgetTap: ((Element) -> Unit)? = null,
 ) {
     val strings = RenderStrings(
         mediaKinds = listOf(
@@ -85,11 +97,21 @@ fun PageCanvas(
         widgetSuffix = stringResource(R.string.widget_preview_suffix),
         widgetPaused = stringResource(R.string.widget_paused_short)
     )
-    val hitTest = if (onImageLongPress == null) Modifier else Modifier.pointerInput(page.id) {
-        detectTapGestures(onLongPress = { point ->
-            page.imageElementAt(point.x, point.y, size.width.toFloat(), size.height.toFloat())
-                ?.let(onImageLongPress)
-        })
+    val hitTest = if (onImageLongPress == null && onWidgetTap == null) Modifier else Modifier.pointerInput(page.id, onImageLongPress, onWidgetTap) {
+        detectTapGestures(
+            onTap = { point ->
+                onWidgetTap?.let { callback ->
+                    page.widgetElementAt(point.x, point.y, size.width.toFloat(), size.height.toFloat())
+                        ?.let(callback)
+                }
+            },
+            onLongPress = { point ->
+                onImageLongPress?.let { callback ->
+                    page.imageElementAt(point.x, point.y, size.width.toFloat(), size.height.toFloat())
+                        ?.let(callback)
+                }
+            }
+        )
     }
     Canvas(modifier.then(hitTest)) {
         val root = page.root
@@ -113,11 +135,76 @@ fun PageCanvas(
 private fun pageHeightFor(page: Page, width: Dp): Dp = width / page.aspectRatio.coerceIn(MIN_PAGE_ASPECT, MAX_PAGE_ASPECT)
 
 @Composable
+private fun ActivatedWidgetLayer(
+    page: Page,
+    programs: Map<String, WidgetProgram>,
+    networkHosts: Map<String, WidgetNetworkHost>,
+    loading: Map<String, Boolean>,
+    errors: Map<String, String>,
+    onRetry: (Element) -> Unit,
+    onClose: (Element) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val placements = remember(page) { page.widgetPlacements() }
+    BoxWithConstraints(modifier) {
+        placements.forEach { placement ->
+            val element = placement.element
+            val nodeModifier = Modifier
+                .offset(x = maxWidth * placement.x, y = maxHeight * placement.y)
+                .size(width = maxWidth * placement.width, height = maxHeight * placement.height)
+            val program = programs[element.id]
+            when {
+                program != null -> Box(nodeModifier) {
+                    WidgetRuntimeView(program = program, modifier = Modifier.fillMaxSize(), interactive = true, networkHost = networkHosts[element.id])
+                    Surface(
+                        color = MaterialTheme.colorScheme.surface.copy(alpha = .92f),
+                        shape = RoundedCornerShape(50),
+                        tonalElevation = 3.dp,
+                        shadowElevation = 2.dp,
+                        modifier = Modifier.align(Alignment.TopEnd).padding(4.dp).size(30.dp).clickable { onClose(element) },
+                    ) {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text("×", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+                loading[element.id] == true -> Surface(
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = .94f),
+                    shape = RoundedCornerShape(6.dp),
+                    modifier = nodeModifier,
+                ) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+                            Text(stringResource(R.string.widget_loading), style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+                }
+                errors[element.id] != null -> Surface(
+                    color = MaterialTheme.colorScheme.errorContainer.copy(alpha = .96f),
+                    shape = RoundedCornerShape(6.dp),
+                    modifier = nodeModifier.clickable { onRetry(element) },
+                ) {
+                    Box(Modifier.fillMaxSize().padding(6.dp), contentAlignment = Alignment.Center) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(stringResource(R.string.widget_load_failed), style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                            Text(stringResource(R.string.widget_retry), style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
 fun ProfileViewerScreen(
     profile: RemoteProfile,
     ownKey: String,
     ownName: String,
     loader: MediaLoader,
+    media: LocalMediaStore,
+    controller: SocialNetworkController,
     commentStore: CommentStore,
     openComments: Boolean,
     commentPolicy: CommentPolicy,
@@ -132,11 +219,13 @@ fun ProfileViewerScreen(
     onCopyProfileKey: (RemoteProfile) -> Unit,
     profileGroups: List<GroupDirectoryEntry> = emptyList(),
     onOpenGroup: (String) -> Unit = {},
+    onOpenLink: (DetectedLink) -> Unit = {},
     isFollowing: Boolean,
     onToggleFollow: () -> Unit,
     onPrevProfile: (() -> Unit)?,
     onNextProfile: (() -> Unit)?,
     onBack: () -> Unit,
+    widgetLoader: RemoteWidgetLoader,
 ) {
     var pageIndex by remember(profile.mainDht) { mutableIntStateOf(0) }
     val page = profile.page(pageIndex) ?: return
@@ -145,6 +234,32 @@ fun ProfileViewerScreen(
     val zoom = rememberPageZoomState(profile.mainDht to pageIndex)
     var imageMenuFor by remember(profile.mainDht) { mutableStateOf<Element?>(null) }
     var showProfileMenu by remember(profile.mainDht) { mutableStateOf(false) }
+    val activeWidgets = remember(profile.mainDht) { mutableStateMapOf<String, WidgetProgram>() }
+    val widgetNetworkHosts = remember(profile.mainDht) { mutableStateMapOf<String, WidgetNetworkHost>() }
+    val loadingWidgets = remember(profile.mainDht) { mutableStateMapOf<String, Boolean>() }
+    val widgetErrors = remember(profile.mainDht) { mutableStateMapOf<String, String>() }
+
+    fun activateWidget(element: Element) {
+        if (activeWidgets.containsKey(element.id) || loadingWidgets[element.id] == true) return
+        loadingWidgets[element.id] = true
+        widgetErrors.remove(element.id)
+        scope.launch {
+            widgetLoader.load(element)
+                .onSuccess { program ->
+                    activeWidgets[element.id] = program
+                    controller.widgetNetworkHost(profile.mainDht, element, program)?.let { widgetNetworkHosts[element.id] = it }
+                }
+                .onFailure { error -> widgetErrors[element.id] = error.message ?: "Widget could not be loaded" }
+            loadingWidgets.remove(element.id)
+        }
+    }
+
+    fun closeWidget(element: Element) {
+        widgetNetworkHosts.remove(element.id)?.close()
+        activeWidgets.remove(element.id)
+        loadingWidgets.remove(element.id)
+        widgetErrors.remove(element.id)
+    }
 
     LaunchedEffect(profile.mainDht, pageIndex) { scroll.scrollTo(0) }
 
@@ -178,6 +293,7 @@ fun ProfileViewerScreen(
                             when {
                                 travelled <= -threshold -> onNextProfile?.invoke()
                                 travelled >= threshold -> onPrevProfile?.invoke()
+                                else -> Unit
                             }
                         }
                     ) { _, dragAmount -> travelled += dragAmount }
@@ -187,8 +303,7 @@ fun ProfileViewerScreen(
             val canvasHeight = pageHeightFor(page, canvasWidth)
             Column(Modifier.fillMaxSize().verticalScroll(scroll)) {
                 Surface(color = Color.White, tonalElevation = 0.dp) {
-                    PageCanvas(
-                        page,
+                    Box(
                         Modifier
                             .fillMaxWidth()
                             .height(canvasHeight)
@@ -198,11 +313,27 @@ fun ProfileViewerScreen(
                                 scaleY = zoom.scale,
                                 translationX = zoom.offset.x,
                                 translationY = zoom.offset.y,
-                            ),
-                        imageLookup = loader::lookup,
-                        ownerKey = profile.mainDht,
-                        onImageLongPress = { element -> imageMenuFor = element },
-                    )
+                            )
+                    ) {
+                        PageCanvas(
+                            page,
+                            Modifier.matchParentSize(),
+                            imageLookup = loader::lookup,
+                            ownerKey = profile.mainDht,
+                            onImageLongPress = { element -> imageMenuFor = element },
+                            onWidgetTap = ::activateWidget,
+                        )
+                        ActivatedWidgetLayer(
+                            page = page,
+                            programs = activeWidgets,
+                            networkHosts = widgetNetworkHosts,
+                            loading = loadingWidgets,
+                            errors = widgetErrors,
+                            onRetry = ::activateWidget,
+                            onClose = ::closeWidget,
+                            modifier = Modifier.matchParentSize(),
+                        )
+                    }
                 }
                 if (zoom.zoomed) {
                     TextButton(onClick = { zoom.reset() }, modifier = Modifier.padding(start = 8.dp)) {
@@ -216,6 +347,24 @@ fun ProfileViewerScreen(
                     onPrev = { if (pageIndex > 0) pageIndex-- },
                     onNext = { if (pageIndex < profile.pageCount - 1) pageIndex++ },
                 )
+                val pageAudio = page.audioElementsOnPage()
+                if (pageAudio.isNotEmpty()) {
+                    Column(
+                        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        pageAudio.forEach { element ->
+                            WeaveAudioPlayer(
+                                title = element.mediaTitle.ifBlank { "Audio" },
+                                contentHash = element.mediaContentHash,
+                                recordKey = element.mediaRecordKey,
+                                media = media,
+                                controller = controller,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                    }
+                }
                 if (profileGroups.isNotEmpty()) {
                     ProfileGroupsSection(profileGroups, onOpenGroup)
                 }
@@ -231,6 +380,7 @@ fun ProfileViewerScreen(
                     ownName = ownName,
                     openMode = openComments,
                     onPosted = { scope.launch { scroll.animateScrollTo(scroll.maxValue) } },
+                    onOpenLink = onOpenLink,
                 )
                 Spacer(Modifier.height(24.dp))
             }
@@ -305,7 +455,7 @@ private fun ImageActionDialog(
         text = {
             Column {
                 DialogAction(tr("Save image")) { onSaveToGallery(); onDismiss() }
-                DialogAction(tr("Copy image location")) { onCopyLocation(); onDismiss() }
+                DialogAction("Copy image link") { onCopyLocation(); onDismiss() }
                 DialogAction(tr("Save to editor")) { onSaveToEditor(); onDismiss() }
                 if (element.mediaDescription.isNotBlank()) {
                     HorizontalDivider(Modifier.padding(vertical = 10.dp))
@@ -414,6 +564,7 @@ fun CommentsSection(
     onPost: (pageKey: String, body: String, openMode: Boolean, replyTo: String?) -> Unit,
     onRetry: (commentId: String) -> Unit,
     onPosted: () -> Unit,
+    onOpenLink: (DetectedLink) -> Unit = {},
 ) {
     var revision by remember(pageKey) { mutableIntStateOf(0) }
     var draft by remember(pageKey) { mutableStateOf("") }
@@ -440,6 +591,7 @@ fun CommentsSection(
                 CommentPolicy.Closed -> tr("This profile has comments turned off.")
                 CommentPolicy.Moderated -> tr("Comments attach to this page after the owner approves them.")
                 CommentPolicy.Open -> tr("Comments are public and attach to this page.")
+                else -> tr("Comments")
             },
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -476,6 +628,7 @@ fun CommentsSection(
                 },
                 onHide = { id -> store.hideForMe(id); revision++ },
                 onRetry = { id -> onRetry(id); revision++ },
+                onLink = onOpenLink,
             )
         }
 
@@ -498,10 +651,12 @@ fun CommentsSection(
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-                        Text(
-                            displayBody(comment, expanded = false),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        AutoLinkText(
+                            text = displayBody(comment, expanded = false),
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            ),
+                            onLink = onOpenLink,
                         )
                     }
                     TextButton(

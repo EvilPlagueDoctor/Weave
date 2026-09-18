@@ -24,12 +24,15 @@ enum class GroupEventKind {
     PostAllowed,
     PostRemoved,
     PostRestored,
+    PostPinned,
+    PostUnpinned,
     JoinRequested,
     JoinApproved,
     JoinRejected,
     ReportSubmitted,
     ModeratorGranted,
     ModeratorRevoked,
+    MemberBanned,
     PolicyChanged,
     FeaturedChanged,
 }
@@ -126,6 +129,8 @@ data class GroupModeratorGrant(
     val canModeratePosts: Boolean = true,
     val canApproveMembers: Boolean = true,
     val canHandleReports: Boolean = true,
+    val canPinPosts: Boolean = true,
+    val canEditFeatured: Boolean = true,
     val grantedAt: Long,
 ) {
     fun toJson(): JSONObject = JSONObject()
@@ -133,6 +138,8 @@ data class GroupModeratorGrant(
         .put("posts", canModeratePosts)
         .put("members", canApproveMembers)
         .put("reports", canHandleReports)
+        .put("pin", canPinPosts)
+        .put("featured", canEditFeatured)
         .put("granted_at", grantedAt)
 
     companion object {
@@ -142,6 +149,8 @@ data class GroupModeratorGrant(
                 canModeratePosts = o.optBoolean("posts", true),
                 canApproveMembers = o.optBoolean("members", true),
                 canHandleReports = o.optBoolean("reports", true),
+                canPinPosts = o.optBoolean("pin", true),
+                canEditFeatured = o.optBoolean("featured", true),
                 grantedAt = o.optLong("granted_at"),
             )
         }.getOrNull()
@@ -227,7 +236,7 @@ data class GroupEvent(
         .put("conversation_id", conversationId)
         .put("object_hash", objectHash)
         .put("reason", reason.take(600))
-        .put("metadata", JSONObject().apply { metadata.toSortedMap().forEach { (k, v) -> put(k, v.take(1000)) } })
+        .put("metadata", JSONObject().apply { metadata.toSortedMap().forEach { (k, v) -> put(k, v.take(4000)) } })
 
     fun digestHex(): String = groupSha256Hex(unsignedJson().toString().encodeToByteArray())
 
@@ -340,7 +349,10 @@ data class GroupBranchHeader(
     val eventRoot: String,
     val indexRoot: String,
     val generation: Long,
+    val featured: FeaturedSlot = FeaturedSlot(),
+    val pinnedPostIds: List<String> = emptyList(),
     val moderators: List<GroupModeratorGrant> = emptyList(),
+    val bannedMainDhts: List<String> = emptyList(),
     val knownBranches: List<GroupBranchPointer> = emptyList(),
 ) {
     fun pointer(): GroupBranchPointer = GroupBranchPointer(
@@ -364,7 +376,10 @@ data class GroupBranchHeader(
         .put("event_root", eventRoot)
         .put("index_root", indexRoot)
         .put("generation", generation)
+        .put("featured", featured.toJson())
+        .put("pinned_posts", JSONArray(pinnedPostIds.distinct().take(100)))
         .put("moderators", JSONArray().apply { moderators.forEach { put(it.toJson()) } })
+        .put("banned_authors", JSONArray(bannedMainDhts.distinct().take(512)))
         .put("known_branches", JSONArray().apply { knownBranches.distinctBy { it.branchId }.take(64).forEach { put(it.toJson()) } })
 
     companion object {
@@ -378,8 +393,17 @@ data class GroupBranchHeader(
                 val a = o.optJSONArray("known_branches") ?: JSONArray()
                 for (i in 0 until a.length()) a.optJSONObject(i)?.let(GroupBranchPointer::fromJson)?.let(::add)
             }
+            val pinned = buildList {
+                val a = o.optJSONArray("pinned_posts") ?: JSONArray()
+                for (i in 0 until a.length()) a.optString(i).takeIf { it.isNotBlank() }?.let(::add)
+            }
+            val banned = buildList {
+                val a = o.optJSONArray("banned_authors") ?: JSONArray()
+                for (i in 0 until a.length()) a.optString(i).takeIf { it.isNotBlank() }?.let(::add)
+            }
+            val group = GroupRecord.fromJson(o.getJSONObject("group"))
             GroupBranchHeader(
-                group = GroupRecord.fromJson(o.getJSONObject("group")),
+                group = group,
                 branchId = o.getString("branch_id"),
                 kind = GroupBranchKind.valueOf(o.getString("kind")),
                 ownerMainDht = o.getString("owner"),
@@ -388,7 +412,12 @@ data class GroupBranchHeader(
                 eventRoot = o.getString("event_root"),
                 indexRoot = o.getString("index_root"),
                 generation = o.optLong("generation"),
+                featured = FeaturedSlot.fromJson(o.optJSONObject("featured")).let {
+                    if (it.kind == FeaturedKind.None && !o.has("featured")) group.featured else it
+                },
+                pinnedPostIds = pinned,
                 moderators = moderators,
+                bannedMainDhts = banned,
                 knownBranches = branches,
             )
         }.getOrNull()

@@ -1,0 +1,14 @@
+Weave Phase 6.5 static validation
+=================================
+
+PASS: Android resource XML parses successfully.
+PASS: ProfileEditorApp.kt delimiter balance check.
+PASS: kotlinc parser pass reported no syntax-level `expecting` / `unexpected tokens` errors.
+
+NOT RUN: Full Android Gradle compile.
+Reason: Gradle wrapper requires Gradle 9.4.1; it is not cached and this environment cannot resolve services.gradle.org.
+
+Primary modified files:
+- app/src/main/java/app/weave/ProfileEditorApp.kt
+- app/src/main/res/values/strings.xml
+- app/build.gradle.kts

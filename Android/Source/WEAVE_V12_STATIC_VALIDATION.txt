@@ -1,0 +1,22 @@
+Weave v12 static validation
+============================
+
+Validated in this environment:
+- All Kotlin sources decode as UTF-8.
+- Bracket/delimiter balance checked for every modified Kotlin source.
+- GroupDetailScreen and GroupRuntime have one production call site each; updated callback/constructor signatures match those call sites.
+- Branch selection now records whether the choice is explicit. Original may become the automatic default only while the selection is implicit; explicit Claim/Original choices are protected from refresh/discovery overrides.
+- Group gossip has a dedicated packet kind/version and is parsed before ordinary social gossip.
+- Gossip hints require DHT refresh/verification before local state is committed.
+- Members-only groups are excluded from outgoing group gossip hints.
+- Failed gossip verification remains retryable; in-flight hints are deduplicated.
+- Public group intake TTL changed from 15 minutes to 60 minutes (the daemon's current ServiceRequest maximum).
+- Copied weave://media links are accepted by Quick Edit and normalized by Advanced Edit for compatible image/audio elements.
+- Quick Edit insertion controls are one horizontally scrollable Row.
+- ONNX model binaries are not bundled in the source archive; existing model-download scripts remain present.
+- Project gradle.properties retains the 1536 MiB heap / 768 MiB Metaspace memory fix.
+- No duplicate runCatching block remains in requestGroupJoin().
+
+Not performed here:
+- Full Android Gradle/Kotlin compile. This execution environment has no Android SDK and no cached Gradle 9.4.1 distribution. The user's Windows/Android SDK 36 environment remains the authoritative compile test.
+- Each modified Kotlin file was passed individually through kotlinc's parser front end; no `expecting`, `unexpected tokens`, or `conflicting declarations` parser diagnostics were found before dependency-resolution errors.

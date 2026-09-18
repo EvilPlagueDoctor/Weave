@@ -1,0 +1,25 @@
+Weave local Content Filtering v1 - validation notes
+2026-09-11
+
+Checks completed in this workspace:
+- Kotlin delimiter/source sanity checks passed for all edited Kotlin sources.
+- Kotlin compiler parser smoke check found no parser-level syntax errors in the new ContentFilter sources.
+  (Android/Compose/ONNX references are intentionally unresolved without the Android Gradle classpath.)
+- All TinyThumbnail call sites provide a content ID.
+- Content-filter model binaries are NOT bundled in this source tree.
+- download_content_filter_models.sh passes `bash -n` syntax validation.
+- Edited source files decode as UTF-8 and contain no NUL corruption.
+- No HTTP/network classifier endpoint was added to the application source.
+
+Full Android compile status:
+- A full Gradle compile could not be completed in this environment because the Gradle wrapper
+  could not resolve/download its Gradle distribution from services.gradle.org (DNS/network unavailable).
+- Therefore this package should be compiled normally on the user's Android build machine after running
+  download_content_filter_models.bat (or built without the optional model assets for fallback behavior).
+
+Current intentional limitations:
+- Dedicated graphic-violence/gore IMAGE model is not yet installed; the slot/settings are wired for it.
+- Sexual filtering currently targets images. The MiniLM text path targets toxic/aggressive/threatening text;
+  it is not presented as a dedicated sexual-language classifier.
+- Profile-designer/canvas images are not yet gated; group-post and weave://media image surfaces are.
+- Video filtering is reserved for the later keyframe/transcript phase.

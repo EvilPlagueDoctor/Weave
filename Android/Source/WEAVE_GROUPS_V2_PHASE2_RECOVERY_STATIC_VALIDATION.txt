@@ -1,0 +1,22 @@
+Weave Groups v2 Phase 2 Recovery Patch 2 - static validation
+Date: 2026-09-13
+Version: 0.6.2-groups-v2-phase2-recovery-patch
+
+Checks performed:
+- Source based on Phase 2 Witness Patch 1.
+- Modified Kotlin files checked with kotlinc for parser/syntax errors.
+- GroupRuntime.kt + GroupEventStoreV2.kt checked together so new recovery/store symbols resolve against one another.
+- Larger Groups source subset checked to catch project-local symbol/type regressions; remaining errors are from unavailable Android/org.json classpath in this environment, not new recovery symbols.
+- Full Gradle compile attempted but Gradle wrapper cannot download Gradle 9.4.1 because services.gradle.org is unreachable from this environment.
+- Recovery runtime is explicitly stopped on reconnect/restart/stop/account-session replacement.
+- Fetch cancellation does not mutate event state.
+- Store format remains version 1; new retry JSON fields are optional/backward-compatible and default to zero for older stored events.
+
+Behavioral targets:
+- Incoming remote event persists before content fetch.
+- Content fetch runs asynchronously.
+- 25-second fetch ceiling.
+- Persisted retry count / next retry timestamp.
+- Backoff: 15s, 60s, 5m, 15m, 60m.
+- Startup recovery of valid non-expired unresolved content / owned branch decisions.
+- One queued content-validation job per event ID.

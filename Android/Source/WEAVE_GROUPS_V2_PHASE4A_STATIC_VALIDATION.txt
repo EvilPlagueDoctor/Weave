@@ -1,0 +1,42 @@
+Weave Groups v2 Phase 4A static validation
+Date: 2026-09-15
+
+Version metadata:
+        versionCode = 23
+        versionName = "0.8.0-groups-v2-phase4a-reputation-continuity"
+
+Temporary custody-test instrumentation search (expected no matches):
+PASS: no temporary custody-test instrumentation in production source
+
+Phase 4 source hooks:
+/mnt/data/weave_phase4_work/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/GroupTrustContinuityV2.kt:11:private const val MAX_REPUTATION_EVIDENCE = 512
+/mnt/data/weave_phase4_work/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/GroupTrustContinuityV2.kt:124:    ClaimRecommended,
+/mnt/data/weave_phase4_work/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/GroupTrustContinuityV2.kt:153:class GroupTrustContinuityStoreV2(
+/mnt/data/weave_phase4_work/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/GroupTrustContinuityV2.kt:191:        while (evidence.size > MAX_REPUTATION_EVIDENCE) {
+/mnt/data/weave_phase4_work/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/GroupTrustContinuityV2.kt:196:        logger("[groups-v2] REPUTATION_EVIDENCE peer=${shortTrust(peerMainDht)} kind=${kind.name} delta=${kind.scoreDelta} score=${summary.score} strong=${kind.strong} quarantined=${summary.quarantined}")
+/mnt/data/weave_phase4_work/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/GroupTrustContinuityV2.kt:283:            absentFor >= AUTHORITY_CLAIM_AFTER_MS && hasPendingOrRecentActivity -> GroupAuthorityContinuityLevelV2.ClaimRecommended
+/mnt/data/weave_phase4_work/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/GroupTrustContinuityV2.kt:291:            GroupAuthorityContinuityLevelV2.ClaimRecommended -> "$label haven't been seen for roughly two days while group activity is waiting. You can create an independent Claim moderation branch without replacing the existing branch."
+/mnt/data/weave_phase4_work/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/GroupCustodyStoreV2.kt:319:    fun verifiedCustodiansForGroup(groupId: String, now: Long = System.currentTimeMillis()): Set<String> =
+/mnt/data/weave_phase4_work/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/SocialNetworkController.kt:88:    val groupTrustV2: GroupTrustContinuityStoreV2 = GroupTrustContinuityStoreV2(appContext) { message -> log(message) }
+/mnt/data/weave_phase4_work/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/GroupScreens.kt:388:                            val urgent = authorityContinuity?.level == GroupAuthorityContinuityLevelV2.ClaimRecommended
+/mnt/data/weave_phase4_work/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/GroupScreens.kt:445:                GroupAuthorityContinuityLevelV2.ClaimRecommended -> item {
+/mnt/data/weave_phase4_work/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/GroupScreens.kt:458:                                ) { Text("Create independent Claim") }
+/mnt/data/weave_phase4_work/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/GroupRuntime.kt:28:    private val trustStoreV2: GroupTrustContinuityStoreV2? = null,
+/mnt/data/weave_phase4_work/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/GroupRuntime.kt:1060:            logger("[groups-v2] REPUTATION_WITHHELD event=${stored.event.eventId.take(8)} reason=author-signing-key-unbound-and-source-unproven")
+/mnt/data/weave_phase4_work/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/GroupRuntime.kt:1261:            val receiptCustodians = custody.verifiedCustodiansForGroup(groupId, now)
+
+Non-punitive availability check:
+PASS by design: no recordEvidence calls are attached to CUSTODY_STORE_SEND_FAILED, RECOVERY_REQUEST_SEND_FAILED, route timeout/offline, or authority absence paths.
+
+Parser-oriented Kotlin check:
+PASS: modified Kotlin files show no parser errors (no "expecting"/"unexpected tokens" diagnostics under kotlinc parser pass).
+NOTE: full Gradle compile unavailable because Gradle 9.4.1 wrapper download cannot resolve services.gradle.org in this environment.
+
+Source diff scope versus Phase 3A:
+Files /mnt/data/weave_phase4_pristine/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/build.gradle.kts and /mnt/data/weave_phase4_work/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/build.gradle.kts differ
+Files /mnt/data/weave_phase4_pristine/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/GroupCustodyStoreV2.kt and /mnt/data/weave_phase4_work/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/GroupCustodyStoreV2.kt differ
+Files /mnt/data/weave_phase4_pristine/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/GroupRuntime.kt and /mnt/data/weave_phase4_work/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/GroupRuntime.kt differ
+Files /mnt/data/weave_phase4_pristine/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/GroupScreens.kt and /mnt/data/weave_phase4_work/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/GroupScreens.kt differ
+Only in /mnt/data/weave_phase4_work/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave: GroupTrustContinuityV2.kt
+Files /mnt/data/weave_phase4_pristine/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/SocialNetworkController.kt and /mnt/data/weave_phase4_work/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/SocialNetworkController.kt differ
+Files /mnt/data/weave_phase4_pristine/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/WeaveApp.kt and /mnt/data/weave_phase4_work/Weave-Android-Groups-v2-Phase3A-Custody-Recovery/app/src/main/java/app/weave/WeaveApp.kt differ

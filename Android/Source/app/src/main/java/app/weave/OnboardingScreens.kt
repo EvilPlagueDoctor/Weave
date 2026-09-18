@@ -22,6 +22,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.foundation.Image
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -33,11 +34,27 @@ class OnboardingState(context: Context) : PrivateVault.Participant {
     private val appContext = context.applicationContext
     private val vault = PrivateVault.get(appContext)
     private val legacyPrefs = appContext.getSharedPreferences("weave_onboarding", Context.MODE_PRIVATE)
-    @Volatile private var cachedCompleted = false
+
+    // These are Compose-observable because the daemon/vault may finish attaching after the root
+    // composition has already been created.  A plain volatile boolean made the first-run gate
+    // depend on whether ui.mainDht happened to change at exactly the right moment.
+    private var cachedCompleted by mutableStateOf(false)
+    var ready by mutableStateOf(false)
+        private set
+    var loadProblem by mutableStateOf<String?>(null)
+        private set
+    private var loadedProfileId: String? = null
 
     init { vault.register(this) }
 
     override fun onVaultAttached() {
+        val profileId = vault.currentProfileId() ?: return
+        val sameAccount = loadedProfileId == profileId
+        if (!sameAccount) {
+            ready = false
+            loadProblem = null
+        }
+
         runCatching {
             var encrypted = vault.getText("onboarding/state.json")
             if (encrypted == null && legacyPrefs.contains("completed")) {
@@ -52,15 +69,33 @@ class OnboardingState(context: Context) : PrivateVault.Participant {
                 check(legacyPrefs.edit().clear().commit()) { "could not remove legacy onboarding plaintext" }
             }
             cachedCompleted = encrypted?.let { JSONObject(it).optBoolean("completed", false) } ?: false
+            loadedProfileId = profileId
+            ready = true
+            loadProblem = null
+        }.onFailure { t ->
+            // On a same-account transient reconnect keep the last known answer.  A momentary
+            // Binder failure must never turn an established profile back into "Create profile".
+            if (!sameAccount) ready = false
+            loadProblem = t.message ?: t::class.java.simpleName
+            WeaveDiagnostics.event(
+                appContext,
+                "ONBOARDING_LOAD_FAILED",
+                "profile=${short(profileId)} problem=${loadProblem.orEmpty().replace('\n', ' ').take(180)}"
+            )
         }
     }
 
-    override fun onVaultDetached() { cachedCompleted = false }
+    override fun onVaultDetached() {
+        // Detach means "temporarily unavailable", not logout.  Keep the last-known setup state;
+        // a genuinely different account will replace it in onVaultAttached().
+    }
 
     var completed: Boolean
         get() = cachedCompleted
         set(value) {
             cachedCompleted = value
+            ready = true
+            loadedProfileId = vault.currentProfileId() ?: loadedProfileId
             if (vault.attached) vault.putText("onboarding/state.json", JSONObject().put("completed", value).toString())
         }
 }
@@ -337,11 +372,9 @@ fun MeScreen(
     media: LocalMediaStore,
     loader: MediaLoader,
     ownKey: String,
-    moderationCount: Int,
-    onModeration: () -> Unit,
-    onQuickEdit: (Int) -> Unit,
-    onAdvancedEdit: () -> Unit,
+    onEdit: (Int) -> Unit,
     onSettings: () -> Unit,
+    onOpenLink: (DetectedLink) -> Unit = {},
 ) {
     val ui by controller.ui.collectAsState()
     val scope = rememberCoroutineScope()
@@ -387,13 +420,23 @@ fun MeScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                TextButton(onClick = onModeration) {
-                    Text(if (moderationCount > 0) "${tr("Activity")} $moderationCount" else tr("Activity"))
+                TextButton(
+                    onClick = { onEdit(pageIndex) },
+                    enabled = !showingLive,
+                    modifier = Modifier.widthIn(max = 48.dp),
+                    contentPadding = PaddingValues(horizontal = 4.dp),
+                ) {
+                    Text(
+                        tr("Edit"),
+                        style = MaterialTheme.typography.labelMedium,
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                 }
-                TextButton(onClick = onAdvancedEdit, enabled = !showingLive) { Text(tr("Advanced")) }
-                TextButton(onClick = { onQuickEdit(pageIndex) }, enabled = !showingLive) { Text(tr("Edit")) }
                 Button(
                     enabled = !ui.publishing && uploadProgress == null,
+                    modifier = Modifier.widthIn(max = 88.dp),
                     onClick = {
                         // Discovery shows the profile name, so keep the two from drifting:
                         // renaming a profile should rename it in search too.
@@ -412,9 +455,22 @@ fun MeScreen(
                             uploadProgress = null
                             val uploadFailure = uploaded.exceptionOrNull()
                             if (uploadFailure != null) {
-                                publishError = uploadFailure.message ?: "Couldn't upload the images."
+                                publishError = uploadFailure.message ?: "Couldn't upload the media."
                                 return@launch
                             }
+
+                            // Widget packages are intentionally published only now, as source-only
+                            // blobs. Merely placing/previewing a widget never uploads executable code.
+                            val widgetsUploaded = publishPendingWidgets(state.doc, state.widgetRepo, controller) { done, total ->
+                                uploadProgress = done to total
+                            }
+                            uploadProgress = null
+                            val widgetFailure = widgetsUploaded.exceptionOrNull()
+                            if (widgetFailure != null) {
+                                publishError = widgetFailure.message ?: "Couldn't upload the widget source."
+                                return@launch
+                            }
+
                             // encodeText throws on an invalid document, and this would
                             // otherwise escape as a crash rather than an error.
                             val encoded = runCatching { state.ownProfileTextForPublish() }
@@ -429,7 +485,7 @@ fun MeScreen(
                             }
                         }
                     },
-                    contentPadding = PaddingValues(horizontal = 14.dp)
+                    contentPadding = PaddingValues(horizontal = 8.dp)
                 ) {
                     val progress = uploadProgress
                     if (progress != null) {
@@ -439,7 +495,13 @@ fun MeScreen(
                             color = MaterialTheme.colorScheme.onPrimary,
                         )
                         Spacer(Modifier.width(8.dp))
-                        Text("${tr("Images")} ${progress.first}/${progress.second}")
+                        Text(
+                            "${progress.first}/${progress.second}",
+                            style = MaterialTheme.typography.labelMedium,
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis,
+                        )
                     } else if (ui.publishing) {
                         CircularProgressIndicator(
                             Modifier.size(15.dp),
@@ -447,9 +509,21 @@ fun MeScreen(
                             color = MaterialTheme.colorScheme.onPrimary,
                         )
                         Spacer(Modifier.width(8.dp))
-                        Text(tr("Publishing"))
+                        Text(
+                            tr("Publishing"),
+                            style = MaterialTheme.typography.labelMedium,
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis,
+                        )
                     } else {
-                        Text(tr("Publish"))
+                        Text(
+                            tr("Publish"),
+                            style = MaterialTheme.typography.labelMedium,
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis,
+                        )
                     }
                 }
             }
@@ -490,6 +564,24 @@ fun MeScreen(
                     onPrev = { if (pageIndex > 0) pageIndex-- },
                     onNext = { if (pageIndex < shownDoc.pages.lastIndex) pageIndex++ },
                 )
+                val pageAudio = shownPage.audioElementsOnPage()
+                if (pageAudio.isNotEmpty()) {
+                    Column(
+                        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        pageAudio.forEach { element ->
+                            WeaveAudioPlayer(
+                                title = element.mediaTitle.ifBlank { "Audio" },
+                                contentHash = element.mediaContentHash,
+                                recordKey = element.mediaRecordKey,
+                                media = media,
+                                controller = controller,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                    }
+                }
                 CommentsSection(
                     pageKey = pageKeyOf(ownKey, shownPage.id),
                     pageOwnerKey = ownKey,
@@ -502,6 +594,7 @@ fun MeScreen(
                     openMode = true,
                     onRetry = { id -> controller.retryComment(id) },
                     onPosted = {},
+                    onOpenLink = onOpenLink,
                 )
                 Spacer(Modifier.height(24.dp))
             }
@@ -561,6 +654,9 @@ fun SettingsScreen(
     language: AppLanguageState,
     widgetsEnabled: Boolean,
     onWidgetsEnabledChange: (Boolean) -> Unit,
+    activityCount: Int,
+    onActivity: () -> Unit,
+    onClaimGroupLink: (String, (String) -> Unit) -> Unit,
     onBack: () -> Unit,
 ) {
     val ui by controller.ui.collectAsState()
@@ -572,6 +668,9 @@ fun SettingsScreen(
     var copied by remember { mutableStateOf(false) }
     var showLanguageMenu by remember { mutableStateOf(false) }
     var confirmUnpublish by remember { mutableStateOf(false) }
+    var claimGroupLink by remember { mutableStateOf("") }
+    var claimGroupStatus by remember { mutableStateOf("") }
+    var claimConfirmation by remember { mutableStateOf<String?>(null) }
     // Reset the confirmation shortly after it appears, so a stale "Copied" does not imply
     // the clipboard still holds a report from ten minutes ago.
     LaunchedEffect(copied) {
@@ -586,6 +685,23 @@ fun SettingsScreen(
             }
         }
         Column(Modifier.fillMaxSize().verticalScroll(scroll).padding(16.dp)) {
+            Text(tr("Activity"), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+            Text(
+                "Review profile comments and profile activity that needs your attention.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+            OutlinedButton(onClick = onActivity, modifier = Modifier.padding(top = 8.dp)) {
+                Text(
+                    if (activityCount > 0) "${tr("Activity")} ($activityCount)" else tr("Activity"),
+                    maxLines = 1,
+                    softWrap = false,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+
+            HorizontalDivider(Modifier.padding(vertical = 16.dp))
             Text(tr("Language"), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
             Box(Modifier.padding(top = 8.dp)) {
                 OutlinedButton(onClick = { showLanguageMenu = true }) { Text("🌐  ${language.current.label}") }
@@ -613,6 +729,9 @@ fun SettingsScreen(
                 }
                 Switch(checked = widgetsEnabled, onCheckedChange = onWidgetsEnabledChange)
             }
+
+            HorizontalDivider(Modifier.padding(vertical = 16.dp))
+            ContentFilterSettingsSection()
 
             HorizontalDivider(Modifier.padding(vertical = 16.dp))
             Text(tr("This identity"), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
@@ -651,6 +770,47 @@ fun SettingsScreen(
                 minLines = 2,
             )
             HorizontalDivider(Modifier.padding(vertical = 16.dp))
+            Text("Groups", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+            Text(
+                "Claim moderation of a public group by pasting its Weave group link. Claiming creates your own moderation branch; it does not fork the group.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+            OutlinedTextField(
+                value = claimGroupLink,
+                onValueChange = {
+                    claimGroupLink = it.take(1200)
+                    claimGroupStatus = ""
+                },
+                modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+                label = { Text("Weave group link") },
+                singleLine = true,
+            )
+            Button(
+                onClick = {
+                    onClaimGroupLink(claimGroupLink) { result ->
+                        if (result.startsWith("Group is now claimed")) {
+                            claimGroupStatus = ""
+                            claimConfirmation = result
+                        } else {
+                            claimGroupStatus = result
+                        }
+                    }
+                },
+                enabled = GroupLink.parse(claimGroupLink) != null,
+                modifier = Modifier.padding(top = 8.dp),
+            ) { Text("Claim moderation of group") }
+            if (claimGroupStatus.isNotBlank()) {
+                Text(
+                    claimGroupStatus,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+            }
+
+            HorizontalDivider(Modifier.padding(vertical = 16.dp))
             Text(tr("Comments on your profile"), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
             Text(
                 tr("Published with your profile, so other people's apps know the rule before they write anything."),
@@ -671,6 +831,7 @@ fun SettingsScreen(
                                 CommentPolicy.Open -> tr("Anyone can comment")
                                 CommentPolicy.Moderated -> tr("I approve comments first")
                                 CommentPolicy.Closed -> tr("No comments")
+                                else -> tr("Comments")
                             },
                             style = MaterialTheme.typography.bodyMedium
                         )
@@ -679,6 +840,7 @@ fun SettingsScreen(
                                 CommentPolicy.Open -> tr("Comments appear as soon as they are posted.")
                                 CommentPolicy.Moderated -> tr("Comments wait in Activity until you keep them.")
                                 CommentPolicy.Closed -> tr("Nobody can leave a comment on your pages.")
+                                else -> ""
                             },
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -710,7 +872,7 @@ fun SettingsScreen(
             HorizontalDivider(Modifier.padding(vertical = 16.dp))
             Text(tr("Diagnostics"), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
             Text(
-                tr("Copies this app's own log, plus what it currently knows about the network, to the clipboard. It contains your profile keys, which are public, and nothing else identifying."),
+                tr("Copies Weave's timestamped diagnostic history, lifecycle/editor breadcrumbs, slow/failed daemon RPC metadata, and current network/group state. It can contain public profile/DHT keys, group names and moderation activity, but never app session tokens, request payloads, profile text, authentication proofs, or media contents."),
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 4.dp)
@@ -732,7 +894,7 @@ fun SettingsScreen(
                 }
             }
             Text(
-                tr("The daemon keeps its own, more detailed log. If something is wrong with the network rather than the app, that one is the useful one."),
+                tr("This Weave log is kept across reconnects and records editor/navigation transitions plus Java/Kotlin fatal exceptions, so intermittent failures can be inspected afterward. The daemon keeps a separate lower-level network/API log; for connection problems, copying both is useful."),
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 8.dp)
@@ -740,6 +902,16 @@ fun SettingsScreen(
 
             Spacer(Modifier.height(32.dp))
         }
+    }
+    claimConfirmation?.let { message ->
+        AlertDialog(
+            onDismissRequest = { claimConfirmation = null },
+            title = { Text("Group claimed") },
+            text = { Text(message) },
+            confirmButton = {
+                TextButton(onClick = { claimConfirmation = null }) { Text("OK") }
+            },
+        )
     }
     if (confirmUnpublish) {
         AlertDialog(

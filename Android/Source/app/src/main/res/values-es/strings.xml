@@ -23,7 +23,7 @@
     <string name="new_image">Imagen</string>
     <string name="new_widget">Widget</string>
     <string name="copy_suffix"> Copia</string>
-    <string name="widget_preview_suffix">marcador de widget vacío</string>
+    <string name="widget_preview_suffix">Toca para cargar el widget</string>
     <string name="media_preview_suffix">marcador hasta que cargue el registro multimedia</string>
     <string name="builtin_none">Ninguno</string>
     <string name="builtin_thin1">Fino 1</string>
@@ -210,12 +210,8 @@
     <string name="widget_text">Texto</string>
     <string name="widget_button">Botón</string>
     <string name="widget_box">Cuadro</string>
-    <string name="widget_stream">Transmisión del anfitrión</string>
     <string name="widget_selected">Seleccionado</string>
     <string name="widget_text_value">Texto</string>
-    <string name="widget_stream_label">Etiqueta de transmisión</string>
-    <string name="widget_stream_source">Nombre de transmisión del anfitrión</string>
-    <string name="widget_stream_safety">Las transmisiones del anfitrión son solo de visualización. No pueden acceder a la cámara ni al micrófono del visitante y siempre empiezan en pausa.</string>
     <string name="widget_box_hint">Los cuadros son contenedores visuales simples en VeilWidget v1. Se podrá añadir más estilo visual cuando el modelo de ejecución esté estabilizado.</string>
     <string name="widget_visual_event_note">El editor visual modifica el mismo modelo fuente mostrado en Código. Por ahora VeilWidget v1 mantiene la edición de eventos en Código.</string>
     <string name="widget_edit_events_code">Editar eventos en Código</string>
@@ -238,14 +234,11 @@
     <string name="widget_keep_backup">Conservar copia anterior</string>
     <string name="widget_make_link">Copia enlazada</string>
     <string name="widget_make_fork">Copia derivada</string>
-    <string name="widget_mock_stream_playing">Transmisión local simulada reproduciéndose · TODO(red)</string>
-    <string name="widget_stream_paused">En pausa · toca para simular reproducción</string>
     <string name="widget_library_row">%1$d × %2$d · %3$s</string>
     <string name="widget_new">Widget nuevo</string>
     <string name="widget_new_name">Widget nuevo</string>
     <string name="widget_new_text">Texto nuevo</string>
     <string name="widget_new_button">Botón</string>
-    <string name="widget_live_stream">Transmisión en vivo</string>
     <string name="widget_ready">Widget listo.</string>
     <string name="widget_unsaved">Widget nuevo — aún no guardado.</string>
     <string name="widget_compiled_saved">Widget compilado y guardado localmente.</string>
@@ -311,7 +304,6 @@
     <string name="widget_issue_missing_action">El destino de la acción no existe: %1$s</string>
     <string name="widget_paused_short">En pausa</string>
     <string name="widget_cap_time">Hora</string>
-    <string name="widget_cap_host_stream">Transmisión del anfitrión</string>
     <string name="widget_relation_own">Propio</string>
     <string name="widget_relation_link">Enlace</string>
     <string name="widget_relation_fork">Derivación</string>

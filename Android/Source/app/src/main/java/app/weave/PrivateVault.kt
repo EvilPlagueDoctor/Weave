@@ -28,23 +28,33 @@ class PrivateVault private constructor(private val context: Context) {
     private val participants = CopyOnWriteArraySet<Participant>()
 
     val attached: Boolean get() = daemon != null && profileId != null
+    fun currentProfileId(): String? = profileId
 
     @Synchronized
     fun attach(client: DaemonClient, activeProfileId: String) {
         val changed = profileId != activeProfileId || daemon !== client
-        if (changed && attached) detach()
+        if (changed && attached) detach("replaced by a new daemon/vault attachment")
         daemon = client
         profileId = activeProfileId
         epoch++
+        WeaveDiagnostics.event(context, "VAULT_ATTACH", "profile=${short(activeProfileId)} generation=$epoch")
         participants.forEach { runCatching { it.onVaultAttached() } }
     }
 
     @Synchronized
-    fun detach() {
+    fun detach(reason: String = "daemon session unavailable") {
+        val oldProfile = profileId
         val hadSession = daemon != null || profileId != null
         daemon = null
         profileId = null
         if (hadSession) epoch++
+        if (hadSession) {
+            WeaveDiagnostics.event(
+                context,
+                "VAULT_DETACH",
+                "profile=${oldProfile?.let(::short) ?: "(none)"} generation=$epoch reason=${reason.take(180)}"
+            )
+        }
         participants.forEach { runCatching { it.onVaultDetached() } }
     }
 

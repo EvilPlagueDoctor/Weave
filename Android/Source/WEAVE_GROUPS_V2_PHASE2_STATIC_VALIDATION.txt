@@ -1,0 +1,11 @@
+Weave Groups v2 Phase 2 — static validation notes
+
+Validated in this environment:
+- Modified-file delimiter counts are balanced for (), [], {}.
+- Kotlin compiler parse pass over the modified files reports no parser/structural syntax patterns such as "expecting", "unexpected tokens", "too many arguments", or missing named parameters. A complete compile is not possible here because Android/project dependencies are unavailable to bare kotlinc.
+- Gradle wrapper execution cannot complete because the wrapper attempts to download Gradle 9.4.1 from services.gradle.org and this environment has no external network access.
+- Existing DaemonClient.sendMessage call sites were reviewed after adding optional expiresAtSeconds/awaitResponse parameters; existing calls use two arguments or named arguments and remain source-compatible.
+- Only intended source files differ from the Phase 1 base: DaemonClient.kt, GroupBranchNetwork.kt, GroupEventStoreV2.kt, GroupRuntime.kt, SocialNetworkController.kt, plus new GroupTransportV2.kt; app version metadata and Phase 2 documentation are also changed.
+- Groups-v2 ServiceRequest subscription count is four service IDs (legacy public/private plus v2 public/private witness).
+- Public/private/direct paths carry the same SignedGroupEventV2; receiver paths enter GroupEventStoreV2 before moderation.
+- No full APK was built in this environment. The user's Windows/Android Gradle build is the final compiler/runtime check.

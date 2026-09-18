@@ -99,7 +99,7 @@ object ProfileCodec {
             ElementType.Button -> { w.str(e.label); writeDecoration(w, e.buttonDecoration); writeBackground(w, e.background); w.str(e.fontId); w.f32(e.fontSize); w.u32(e.textArgb.toLong() and 0xFFFFFFFFL); w.u8(e.textAlign.ordinal); w.bool(e.bold); w.bool(e.italic); w.bool(e.underline); w.u8(e.targetType.ordinal); w.str(e.target) }
             ElementType.Stamp -> { writeDecoration(w, e.stampDecoration); w.f32(e.rotationDegrees); w.f32(e.opacity); w.bool(e.flipX); w.bool(e.flipY) }
             ElementType.Media -> { w.u8(e.mediaKind.ordinal); w.str(e.mediaRecordKey); w.str(e.mediaContentHash); w.u32(e.intrinsicWidth); w.u32(e.intrinsicHeight); w.str(e.mediaTitle); w.str(e.mediaDescription) }
-            ElementType.Widget -> { w.str(e.widgetLabel); w.str(e.widgetRecordKey); w.u32(e.widgetItemId); w.str(e.widgetSourceHash); w.u32(e.widgetDefaultWidth); w.u32(e.widgetDefaultHeight); w.bool(e.widgetWarnOnResize) }
+            ElementType.Widget -> { w.str(e.widgetLabel); w.str(e.widgetRecordKey); w.u32(e.widgetItemId); w.str(e.widgetSourceHash); w.u32(e.widgetDefaultWidth); w.u32(e.widgetDefaultHeight); w.bool(e.widgetWarnOnResize); w.str(e.widgetDataDht); w.bool(e.widgetOnline) }
         }
     }
 
@@ -131,7 +131,7 @@ object ProfileCodec {
             }
             ElementType.Stamp -> { e.stampDecoration = readDecoration(r); e.rotationDegrees = r.f32(); e.opacity = r.f32(); e.flipX = r.bool(); e.flipY = r.bool() }
             ElementType.Media -> { e.mediaKind = MediaKind.entries[r.u8()]; e.mediaRecordKey = r.str(); e.mediaContentHash = r.str(); e.intrinsicWidth = r.u32(); e.intrinsicHeight = r.u32(); e.mediaTitle = r.str(); e.mediaDescription = r.str() }
-            ElementType.Widget -> { e.widgetLabel = r.str(); e.widgetRecordKey = r.str(); e.widgetItemId = r.u32(); if (version >= 3) { e.widgetSourceHash = r.str(); e.widgetDefaultWidth = r.u32(); e.widgetDefaultHeight = r.u32(); e.widgetWarnOnResize = r.bool() } }
+            ElementType.Widget -> { e.widgetLabel = r.str(); e.widgetRecordKey = r.str(); e.widgetItemId = r.u32(); if (version >= 3) { e.widgetSourceHash = r.str(); e.widgetDefaultWidth = r.u32(); e.widgetDefaultHeight = r.u32(); e.widgetWarnOnResize = r.bool() }; if (version >= 4) { e.widgetDataDht = r.str(); e.widgetOnline = r.bool() } }
         }
         return e
     }

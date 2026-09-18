@@ -68,6 +68,7 @@ class LocalMediaStore(context: Context) : PrivateVault.Participant {
     private val missing = mutableSetOf<String>()
 
     data class Stored(val contentHash: String, val width: Int, val height: Int)
+    data class AudioStored(val contentHash: String, val durationMs: Long)
     data class SavedImage(val contentHash: String, val width: Int, val height: Int, val description: String)
 
     init { vault.register(this) }
@@ -135,6 +136,56 @@ class LocalMediaStore(context: Context) : PrivateVault.Participant {
     suspend fun importBitmap(bitmap: Bitmap, maxEdge: Int = MAX_IMAGE_EDGE_PX, quality: Int = IMAGE_QUALITY): Stored? =
         withContext(Dispatchers.IO) { storeSanitizedBitmap(bitmap, maxEdge, quality) }
 
+    suspend fun importAudio(uri: Uri): AudioStored? = withContext(Dispatchers.IO) {
+        val generation = vault.generation()
+        val sanitized = sanitizeAudioToM4a(appContext, uri) ?: return@withContext null
+        val hash = MessageDigest.getInstance("SHA-256").digest(sanitized.bytes)
+            .joinToString("") { "%02x".format(it) }
+        val committed = vault.withGeneration(generation) {
+            vault.putNamedBlob(
+                "media/audio",
+                hash,
+                "audio/mp4",
+                sanitized.bytes,
+                PrivateVault.Retention.Persistent,
+            )
+            true
+        } == true
+        if (!committed) null else AudioStored(hash, sanitized.durationMs)
+    }
+
+    fun audioBytesFor(contentHash: String, expectedGeneration: Long? = null): ByteArray? {
+        if (contentHash.isBlank() || !vault.attached) return null
+        return runCatching {
+            if (expectedGeneration == null) {
+                vault.getNamedBlob("media/audio", contentHash, MAX_SANITIZED_AUDIO_BYTES)
+            } else {
+                vault.withGeneration(expectedGeneration) {
+                    vault.getNamedBlob("media/audio", contentHash, MAX_SANITIZED_AUDIO_BYTES)
+                }
+            }
+        }.getOrNull()
+    }
+
+    fun storeVerifiedAudioBytes(
+        contentHash: String,
+        bytes: ByteArray,
+        expectedGeneration: Long? = null,
+    ): Boolean = runCatching {
+        if (bytes.size > MAX_SANITIZED_AUDIO_BYTES) return@runCatching false
+        val generation = expectedGeneration ?: vault.generation()
+        vault.withGeneration(generation) {
+            vault.putNamedBlob(
+                "media/audio",
+                contentHash,
+                "audio/mp4",
+                bytes,
+                PrivateVault.Retention.Cache,
+            )
+            true
+        } == true
+    }.getOrDefault(false)
+
     suspend fun importBytes(bytes: ByteArray, maxEdge: Int = MAX_IMAGE_EDGE_PX, quality: Int = IMAGE_QUALITY): Stored? =
         withContext(Dispatchers.IO) {
             runCatching {
@@ -153,6 +204,52 @@ class LocalMediaStore(context: Context) : PrivateVault.Participant {
                 storeSanitizedBitmap(decoded, maxEdge, quality).also { decoded.recycle() }
             }.getOrNull()
         }
+
+    suspend fun thumbnailBase64For(
+        contentHash: String,
+        maxEdge: Int = 220,
+        quality: Int = 60,
+    ): String? = withContext(Dispatchers.IO) {
+        runCatching {
+            val sourceBytes = bytesFor(contentHash) ?: return@runCatching null
+            val source = ImageDecoder.createSource(java.nio.ByteBuffer.wrap(sourceBytes))
+            val decoded = ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                val longest = max(info.size.width, info.size.height)
+                if (longest > maxEdge) {
+                    val scale = maxEdge.toFloat() / longest
+                    decoder.setTargetSize(
+                        (info.size.width * scale).roundToInt().coerceAtLeast(1),
+                        (info.size.height * scale).roundToInt().coerceAtLeast(1)
+                    )
+                }
+            }
+            try {
+                var attemptQuality = quality.coerceIn(20, 95)
+                var encoded: ByteArray
+                while (true) {
+                    encoded = java.io.ByteArrayOutputStream().use { out ->
+                        val format = when {
+                            decoded.hasAlpha() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> Bitmap.CompressFormat.WEBP_LOSSLESS
+                            Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> Bitmap.CompressFormat.WEBP_LOSSY
+                            else -> {
+                                @Suppress("DEPRECATION")
+                                Bitmap.CompressFormat.WEBP
+                            }
+                        }
+                        decoded.compress(format, if (decoded.hasAlpha()) 100 else attemptQuality, out)
+                        out.toByteArray()
+                    }
+                    if (encoded.size <= WeaveMessage.MAX_THUMBNAIL_BYTES || attemptQuality <= 25) break
+                    attemptQuality -= 10
+                }
+                if (encoded.size > WeaveMessage.MAX_THUMBNAIL_BYTES) null
+                else WeaveMessage.thumbnailToBase64(encoded)
+            } finally {
+                decoded.recycle()
+            }
+        }.getOrNull()
+    }
 
     /** Re-encode pixels only. Lossless WebP is used whenever alpha is present. */
     private fun storeSanitizedBitmap(sourceBitmap: Bitmap, maxEdge: Int, quality: Int): Stored? {
@@ -342,6 +439,21 @@ class LocalMediaStore(context: Context) : PrivateVault.Participant {
                 synchronized(cache) { cache.remove(hash); missing.remove(hash) }
             }
         }
+        val referencedAudio = buildSet {
+            doc.pages.forEach { page ->
+                fun walk(e: Element) {
+                    if (e.type == ElementType.Media &&
+                        e.mediaKind == MediaKind.Audio &&
+                        e.mediaContentHash.isNotBlank()
+                    ) add(e.mediaContentHash)
+                    e.children.forEach(::walk)
+                }
+                walk(page.root)
+            }
+        }
+        vault.listNamedBlobs("media/audio").forEach { hash ->
+            if (hash !in referencedAudio && vault.deleteNamedBlob("media/audio", hash)) removed++
+        }
         return removed
     }
 }
@@ -363,6 +475,12 @@ sealed interface QuickBlock {
         val height: Int,
         val caption: String,
     ) : QuickBlock
+    data class Audio(
+        override val id: String,
+        val contentHash: String,
+        val durationMs: Long,
+        val title: String,
+    ) : QuickBlock
 }
 
 /**
@@ -379,6 +497,7 @@ private const val HEADING_SP = 50f
 private const val BODY_SP = 25f
 private const val HEADING_DETECT_MIN_SP = 26f
 private const val PROFILE_IMAGE_HEIGHT_DP = 180f
+private const val PROFILE_AUDIO_HEIGHT_DP = 72f
 private const val CAPTION_SP = 12f
 
 /**
@@ -401,6 +520,13 @@ fun blocksFromPage(page: Page): List<QuickBlock> = page.root.children
                     e.intrinsicHeight.toInt().coerceAtLeast(1),
                     e.mediaDescription
                 )
+            e.type == ElementType.Media && e.mediaKind == MediaKind.Audio ->
+                QuickBlock.Audio(
+                    e.id,
+                    e.mediaContentHash,
+                    0L,
+                    e.mediaTitle.ifBlank { "Audio" },
+                )
             else -> null
         }
     }
@@ -418,6 +544,7 @@ fun blocksOverflowPage(blocks: List<QuickBlock>, referenceWidthDp: Float, densit
                 is QuickBlock.Heading -> measureTextHeightDp(block.text, HEADING_SP, contentWidthDp, true, densityScale)
                 is QuickBlock.Body -> measureTextHeightDp(block.text, BODY_SP, contentWidthDp, false, densityScale)
                 is QuickBlock.Picture -> PROFILE_IMAGE_HEIGHT_DP
+            is QuickBlock.Audio -> PROFILE_AUDIO_HEIGHT_DP
             }.toDouble()
         }.toFloat()
     return total > referenceWidthDp / MIN_PAGE_ASPECT
@@ -428,7 +555,7 @@ fun pageHasAdvancedContent(page: Page): Boolean = page.root.children.any { e ->
     e.children.isNotEmpty() ||
         e.type == ElementType.Stamp || e.type == ElementType.Widget ||
         e.type == ElementType.Link || e.type == ElementType.Button ||
-        (e.type == ElementType.Media && e.mediaKind != MediaKind.Image)
+        (e.type == ElementType.Media && e.mediaKind == MediaKind.Video)
 }
 
 private fun measureTextHeightDp(text: String, sizeSp: Float, widthDp: Float, bold: Boolean, densityScale: Float): Float {
@@ -461,6 +588,7 @@ fun applyBlocksToPage(page: Page, blocks: List<QuickBlock>, referenceWidthDp: Fl
             is QuickBlock.Heading -> measureTextHeightDp(block.text, HEADING_SP, contentWidthDp, true, densityScale)
             is QuickBlock.Body -> measureTextHeightDp(block.text, BODY_SP, contentWidthDp, false, densityScale)
             is QuickBlock.Picture -> PROFILE_IMAGE_HEIGHT_DP
+            is QuickBlock.Audio -> PROFILE_AUDIO_HEIGHT_DP
         }
     }
 
@@ -517,6 +645,15 @@ fun applyBlocksToPage(page: Page, blocks: List<QuickBlock>, referenceWidthDp: Fl
                 intrinsicWidth = block.width.toLong(), intrinsicHeight = block.height.toLong(),
                 mediaTitle = block.caption.ifBlank { "Image" },
                 mediaDescription = block.caption,
+            )
+
+            is QuickBlock.Audio -> Element(
+                type = ElementType.Media, id = block.id, name = "Audio",
+                rect = rect, mediaKind = MediaKind.Audio,
+                mediaContentHash = block.contentHash,
+                intrinsicWidth = 1, intrinsicHeight = 1,
+                mediaTitle = block.title.ifBlank { "Audio" },
+                mediaDescription = "",
             )
         }
         cursor += h + GAP_DP
@@ -582,6 +719,22 @@ fun QuickEditScreen(
             }
         }
     }
+    val audioPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        importing = true
+        scope.launch {
+            val stored = media.importAudio(uri)
+            importing = false
+            if (stored != null) {
+                blocks = blocks + QuickBlock.Audio(
+                    makeId("audio"),
+                    stored.contentHash,
+                    stored.durationMs,
+                    "Audio",
+                )
+            }
+        }
+    }
     val camera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicturePreview()) { bitmap ->
         if (bitmap == null) return@rememberLauncherForActivityResult
         importing = true
@@ -624,7 +777,11 @@ fun QuickEditScreen(
                 ) {
                     TextButton(onClick = { confirmDiscard = true }) { Text(tr("Discard")) }
                     Spacer(Modifier.weight(1f))
-                    TextButton(onClick = { commit(); onOpenAdvanced() }) { Text(tr("Advanced")) }
+                    TextButton(onClick = {
+                        commit()
+                        state.setPreferredEditorAdvanced(true)
+                        onOpenAdvanced()
+                    }) { Text(tr("Advanced")) }
                     Spacer(Modifier.width(4.dp))
                     Button(onClick = { commit(); onBack() }, contentPadding = PaddingValues(horizontal = 16.dp)) { Text(tr("Done")) }
                 }
@@ -672,7 +829,7 @@ fun QuickEditScreen(
                     ) {
                         CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                         Spacer(Modifier.width(10.dp))
-                        Text(tr("Preparing the image…"), style = MaterialTheme.typography.labelMedium)
+                        Text(tr("Preparing media…"), style = MaterialTheme.typography.labelMedium)
                     }
                 }
                 if (showAdvancedWarning) {
@@ -688,7 +845,11 @@ fun QuickEditScreen(
                                 style = MaterialTheme.typography.labelSmall
                             )
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                                TextButton(onClick = onOpenAdvanced) { Text(tr("Open advanced")) }
+                                TextButton(onClick = {
+                                    commit()
+                                    state.setPreferredEditorAdvanced(true)
+                                    onOpenAdvanced()
+                                }) { Text(tr("Open advanced")) }
                                 TextButton(onClick = { showAdvancedWarning = false }) { Text(tr("Simplify anyway")) }
                             }
                         }
@@ -734,14 +895,21 @@ fun QuickEditScreen(
                     Spacer(Modifier.height(10.dp))
                 }
 
-                Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                // Keep all insertion tools on one swipeable row. On a phone, wrapping Audio or
+                // DHT image onto a second line made the toolbar look like a vertical menu.
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp)
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
                     OutlinedButton(onClick = { blocks = blocks + QuickBlock.Heading(makeId("head"), "Heading") }) { Text(tr("+ Heading")) }
                     OutlinedButton(onClick = { blocks = blocks + QuickBlock.Body(makeId("text"), "") }) { Text(tr("+ Text")) }
                     OutlinedButton(
                         onClick = { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }
                     ) { Text(tr("+ Image")) }
-                }
-                Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { audioPicker.launch("audio/*") }) { Text("+ Audio") }
                     OutlinedButton(onClick = { camera.launch(null) }) { Text(tr("+ Camera")) }
                     OutlinedButton(onClick = { dhtImportError = null; showDhtImport = true }) { Text(tr("+ DHT image")) }
                     if (media.library().isNotEmpty()) {
@@ -774,7 +942,7 @@ fun QuickEditScreen(
                 title = { Text(tr("DHT image location")) },
                 text = {
                     Column {
-                        Text(tr("Paste the image's DHT record key."), style = MaterialTheme.typography.bodySmall)
+                        Text(tr("Paste a copied Weave image link or the image's raw DHT record key."), style = MaterialTheme.typography.bodySmall)
                         OutlinedTextField(
                             value = dhtLocation,
                             onValueChange = { dhtLocation = it.take(512); dhtImportError = null },
@@ -791,7 +959,20 @@ fun QuickEditScreen(
                         onClick = {
                             importing = true
                             scope.launch {
-                                val bytes = controller.downloadMediaByRecordKey(dhtLocation.trim(), 8 * 1024 * 1024)
+                                val pasted = dhtLocation.trim()
+                                val detected = parseDetectedLink(pasted)
+                                val bytes = when (detected) {
+                                    is DetectedLink.Media -> {
+                                        if (detected.mediaType != WeaveObjectType.Image) null
+                                        else controller.downloadMedia(
+                                            rootRecordKey = detected.recordKey,
+                                            expectedSha256Hex = detected.sha256,
+                                            maxBytes = 8 * 1024 * 1024,
+                                        )
+                                    }
+                                    is DetectedLink.Dht -> controller.downloadMediaByRecordKey(detected.recordKey, 8 * 1024 * 1024)
+                                    else -> controller.downloadMediaByRecordKey(pasted, 8 * 1024 * 1024)
+                                }
                                 val stored = bytes?.let { media.importBytes(it) }
                                 importing = false
                                 if (stored != null) {
@@ -884,6 +1065,7 @@ private fun BlockEditor(
                         is QuickBlock.Heading -> tr("Heading")
                         is QuickBlock.Body -> tr("Text")
                         is QuickBlock.Picture -> tr("Image")
+                        is QuickBlock.Audio -> "Audio"
                     },
                     style = MaterialTheme.typography.labelMedium,
                     fontWeight = FontWeight.SemiBold
@@ -928,6 +1110,21 @@ private fun BlockEditor(
                         onValueChange = { onChange(block.copy(caption = it.take(200))) },
                         modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                         label = { Text(tr("Caption (optional)")) },
+                        singleLine = true,
+                    )
+                }
+
+                is QuickBlock.Audio -> Column {
+                    Text(
+                        "Sanitized AAC/M4A${if (block.durationMs > 0) " · ${block.durationMs / 1000}s" else ""}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    OutlinedTextField(
+                        value = block.title,
+                        onValueChange = { onChange(block.copy(title = it.take(120))) },
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                        label = { Text("Audio title") },
                         singleLine = true,
                     )
                 }

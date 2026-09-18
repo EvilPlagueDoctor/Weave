@@ -3,7 +3,7 @@ package app.weave
 import java.util.UUID
 
 object VspfLimits {
-    const val FORMAT_VERSION = 3
+    const val FORMAT_VERSION = 4
     const val MAX_PAGES = 64
     const val MAX_DEPTH = 16
     const val MAX_ELEMENTS_PER_PAGE = 2048
@@ -103,7 +103,11 @@ data class Element(
     var widgetSourceHash: String = "",
     var widgetDefaultWidth: Long = 320,
     var widgetDefaultHeight: Long = 180,
-    var widgetWarnOnResize: Boolean = true
+    var widgetWarnOnResize: Boolean = true,
+    /** Mutable publisher-owned databank for this widget instance; never executable. */
+    var widgetDataDht: String = "",
+    /** Lightweight placeholder hint. Actual permission is derived from locally compiled source. */
+    var widgetOnline: Boolean = false
 )
 
 data class Page(

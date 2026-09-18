@@ -12,6 +12,8 @@ enum class FeaturedKind { None, Post, Widget, Message }
 enum class GroupModerationKind { Report, JoinRequest, Appeal, QuarantinedPost }
 enum class GroupModerationState { Pending, Kept, Dropped, Approved, Rejected }
 
+const val MAX_GROUP_THUMBNAIL_BASE64_CHARS = 20_000
+
 private inline fun <reified T : Enum<T>> enumOr(value: String, fallback: T): T =
     enumValues<T>().firstOrNull { it.name.equals(value, ignoreCase = true) } ?: fallback
 
@@ -77,11 +79,27 @@ data class FeaturedSlot(
     }
 }
 
+data class GroupMessageView(
+    val message: WeaveMessage,
+    val ref: WeaveObjectRef,
+    val pinned: Boolean = false,
+)
+
+data class GroupPostDetail(
+    val groupId: String,
+    val branchId: String,
+    val conversationId: String,
+    val root: GroupMessageView,
+    val comments: List<GroupMessageView>,
+)
+
 data class GroupConversationPreview(
     val conversation: WeaveObjectRef,
     val title: String,
     val lastActivity: Long,
+    val rootMessage: MessagePreview? = null,
     val recentMessages: List<MessagePreview> = emptyList(),
+    val replyCount: Int = 0,
     val recentUniqueAuthors: Int = 0,
     val approximateParticipants: Int = 0,
     val activityScore: Double = 0.0,
@@ -93,6 +111,8 @@ data class GroupConversationPreview(
         .put("conversation", conversation.toJson())
         .put("title", title.take(160))
         .put("last_activity", lastActivity)
+        .apply { rootMessage?.let { put("root_message", it.toJson()) } }
+        .put("reply_count", replyCount)
         .put("unique_authors", recentUniqueAuthors)
         .put("participants", approximateParticipants)
         .put("score", activityScore)
@@ -113,7 +133,9 @@ data class GroupConversationPreview(
                 conversation = WeaveObjectRef.fromJson(o.getJSONObject("conversation")),
                 title = o.optString("title"),
                 lastActivity = o.optLong("last_activity"),
+                rootMessage = o.optJSONObject("root_message")?.let(MessagePreview::fromJson),
                 recentMessages = messages,
+                replyCount = o.optInt("reply_count", messages.size),
                 recentUniqueAuthors = o.optInt("unique_authors"),
                 approximateParticipants = o.optInt("participants"),
                 activityScore = o.optDouble("score"),
@@ -132,6 +154,7 @@ data class GroupPulse(
     val page: Int = 0,
     val pageCount: Int = 1,
     val conversations: List<GroupConversationPreview> = emptyList(),
+    val removedPosts: List<GroupRemovedPostNotice> = emptyList(),
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("v", 1)
@@ -142,6 +165,9 @@ data class GroupPulse(
         .put("page_count", pageCount)
         .put("conversations", JSONArray().apply {
             conversations.take(MAX_PULSE_CONVERSATIONS).forEach { put(it.toJson()) }
+        })
+        .put("removed_posts", JSONArray().apply {
+            removedPosts.take(MAX_REMOVED_POST_NOTICES).forEach { put(it.toJson()) }
         })
 
     companion object {
@@ -154,6 +180,12 @@ data class GroupPulse(
                     a.optJSONObject(i)?.let { add(GroupConversationPreview.fromJson(it)) }
                 }
             }
+            val removed = buildList {
+                val a = o.optJSONArray("removed_posts")
+                if (a != null) for (i in 0 until a.length()) {
+                    a.optJSONObject(i)?.let(GroupRemovedPostNotice::fromJson)?.let(::add)
+                }
+            }
             return GroupPulse(
                 groupId = o.optString("group"),
                 generation = o.optLong("generation"),
@@ -161,10 +193,56 @@ data class GroupPulse(
                 page = o.optInt("page"),
                 pageCount = o.optInt("page_count", 1).coerceAtLeast(1),
                 conversations = conversations,
+                removedPosts = removed,
             )
         }
+
+        const val MAX_REMOVED_POST_NOTICES = 24
     }
 }
+
+data class GroupRemovedPostNotice(
+    val postId: String,
+    val conversationId: String,
+    val title: String,
+    val authorName: String,
+    val reason: String,
+    val removedBy: String,
+    val removedAt: Long,
+) {
+    fun toJson(): JSONObject = JSONObject()
+        .put("post_id", postId)
+        .put("conversation_id", conversationId)
+        .put("title", title.take(160))
+        .put("author_name", authorName.take(80))
+        .put("reason", reason.take(600))
+        .put("removed_by", removedBy)
+        .put("removed_at", removedAt)
+
+    companion object {
+        fun fromJson(o: JSONObject): GroupRemovedPostNotice? = runCatching {
+            GroupRemovedPostNotice(
+                postId = o.getString("post_id"),
+                conversationId = o.optString("conversation_id"),
+                title = o.optString("title").take(160),
+                authorName = o.optString("author_name").take(80),
+                reason = o.optString("reason").take(600),
+                removedBy = o.optString("removed_by"),
+                removedAt = o.optLong("removed_at"),
+            )
+        }.getOrNull()
+    }
+}
+
+/** A readable view of a still-retained Groups-v2 submission in the local curator/custody cache. */
+data class GroupCuratorPost(
+    val eventId: String,
+    val conversationId: String,
+    val authorMainDht: String,
+    val createdAt: Long,
+    val status: String,
+    val message: WeaveMessage?,
+)
 
 data class GroupRecord(
     val groupId: String,
@@ -172,6 +250,8 @@ data class GroupRecord(
     val ownerId: String,
     val name: String,
     val description: String = "",
+    /** Tiny embedded WebP preview used to visually distinguish groups without loading a blob. */
+    val thumbnailBase64: String? = null,
     val tags: List<String> = emptyList(),
     val policy: GroupPolicy = GroupPolicy(),
     val featured: FeaturedSlot = FeaturedSlot(),
@@ -189,6 +269,10 @@ data class GroupRecord(
         .put("owner", ownerId)
         .put("name", name.take(120))
         .put("description", description.take(2000))
+        .apply {
+            thumbnailBase64?.takeIf { it.isNotBlank() && it.length <= MAX_GROUP_THUMBNAIL_BASE64_CHARS }
+                ?.let { put("thumbnail", it) }
+        }
         .put("tags", JSONArray(tags.distinct().take(32)))
         .put("policy", policy.toJson())
         .put("featured", featured.toJson())
@@ -215,6 +299,8 @@ data class GroupRecord(
                 ownerId = o.optString("owner"),
                 name = o.optString("name", "Unnamed group"),
                 description = o.optString("description"),
+                thumbnailBase64 = o.optString("thumbnail")
+                    .takeIf { it.isNotBlank() && it.length <= MAX_GROUP_THUMBNAIL_BASE64_CHARS },
                 tags = tags,
                 policy = GroupPolicy.fromJson(o.optJSONObject("policy")),
                 featured = FeaturedSlot.fromJson(o.optJSONObject("featured")),

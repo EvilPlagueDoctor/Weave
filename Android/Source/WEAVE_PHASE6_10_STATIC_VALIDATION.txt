@@ -1,0 +1,87 @@
+Weave Phase 6.10 — Full Chess Widget
+Static / standalone validation
+Date: 2026-09-17
+
+Checks completed in the build environment:
+
+1. Pure Kotlin widget core compilation from the Phase 6.10 source tree: PASS
+   Compiled together:
+   - HashUtils.kt
+   - WidgetModel.kt
+   - WidgetNetworkWire.kt
+   - WidgetExpressions.kt
+   - WidgetLanguage.kt
+   - WidgetVerifier.kt
+   - WidgetTemplates.kt
+   - WidgetPackageCodec.kt
+
+2. Bundled-template compile + independent bytecode verification: PASS
+   All 7 bundled templates compile and verify:
+   - Clock
+   - My Playlist
+   - Chess
+   - Flappy
+   - Poll
+   - Quick Quiz
+   - Guestbook
+
+   Chess compile characteristics reported by the compiler:
+   - source: 122,368 bytes
+   - nodes: 74
+   - events: 80
+   - helper functions: 23
+   - states: 74
+   - VWB5 bytecode: 89,550 bytes
+
+3. Headless Chess semantic tests against the actual compiled Chess program: PASS
+   Covered:
+   - legal white pawn double move
+   - illegal over-long pawn move
+   - legal knight move
+   - blocked rook move
+   - kingside castling after path clearance
+   - en passant sequence and captured-pawn removal
+   - required promotion choice and Queen promotion application
+   - pinned-piece move rejected when it exposes own king
+   - Fool's Mate reaches checkmate / no legal response
+   - known stalemate position is detected
+
+   Heaviest tested move/checkmate path remained below the 100,000-instruction widget event ceiling.
+   Reported heavy apply/evaluation path: 74,267 interpreted actions before the final evaluation helper.
+
+4. Chess source structure checks: PASS
+   Confirmed present:
+   - 64-cell bounded board array
+   - validate_move helper
+   - apply_move helper
+   - evaluate_game helper
+   - grouped network-action proposal handler
+   - grouped action-committed handler
+   - shared-random-ready handler
+   - explicit resign button input
+
+5. WidgetIssueCode Studio display coverage: PASS
+   53 enum entries / 53 WidgetStudio display branches / 0 missing.
+
+6. Android resource XML parse: PASS
+   9 XML resource files parsed successfully.
+
+7. SHA-256 helper collision check: PASS
+   Exactly one package-level sha256Hex(ByteArray) helper remains: HashUtils.kt.
+
+8. Removed streaming surface check: PASS
+   No active WidgetNodeType.Stream, HOST_STREAM, or Live Stream implementation remains in Widget*.kt source/runtime files.
+
+9. Gradle wrapper packaging prerequisite: PASS
+   gradle/wrapper/gradle-wrapper.jar is present (45,457 bytes).
+
+10. Android-heavy source structural scan: PASS for targeted parser/redeclaration/exhaustiveness failures
+    WidgetStudio.kt, WidgetNetworkManager.kt and SocialNetworkController.kt were passed through standalone Kotlin parsing with the pure widget core on the classpath.
+    No targeted parser “expecting ...”, conflicting-overload/redeclaration, illegal nested-class, or non-exhaustive WidgetIssueCode errors were found.
+    Standalone unresolved Android/Compose/coroutine/project references are expected outside an Android SDK build.
+
+11. Full Android Gradle compile: NOT RUN
+    This environment does not contain Android SDK 36 and does not have the requested Gradle 9.4.1 distribution available locally. The user's Windows JDK 17+ / Android SDK 36 environment remains the authoritative complete Android compile check.
+
+Caveat:
+This is a real first full Chess widget and passes targeted rule tests, but the test harness is not an exhaustive formal proof across every legal Chess position. Two-device networking and UI behavior should be exercised on-device before treating the template as production-polished.

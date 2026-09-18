@@ -1,0 +1,72 @@
+Weave Phase 6.9 — Widget Chess Foundations
+Static / standalone validation
+Date: 2026-09-17
+
+Checks completed in the build environment:
+
+1. Pure Kotlin widget core compilation: PASS
+   Compiled together:
+   - WidgetModel.kt
+   - WidgetExpressions.kt
+   - HashUtils.kt
+   - WidgetNetworkWire.kt
+   - WidgetLanguage.kt
+   - WidgetVerifier.kt
+   - WidgetTemplates.kt
+   - WidgetPackageCodec.kt
+
+2. Phase 6.9 standalone smoke suite: PASS (43 checks)
+   Covered:
+   - all seven bundled templates compile
+   - all seven bundled templates independently verify
+   - all seven templates sourceFor()/compile round-trip
+   - Chess uses a 64-cell bounded numeric board array
+   - Chess helper functions present
+   - grouped network action + committed handlers present
+   - random-ready + 2-sided roll handlers present
+   - local bytecode magic is VWB4
+   - array expression indexing and bounds rejection
+   - grouped-action wire canonical encode/decode
+   - trailing wire bytes rejected
+   - random commit/reveal/roll canonical encode/decode
+   - control-character text rejection
+   - exactly 1 KiB widget text accepted; >1 KiB rejected
+   - published package envelope remains source-only (no VWB4 executable blob)
+   - published source hash preserved and source recompiles
+   - recursive helper-function cycle rejected
+
+3. Kotlin parser/structural scan of Android-heavy changed files: PASS for targeted structural failures
+   Files scanned:
+   - WidgetStudio.kt
+   - WidgetNetworkManager.kt
+   - SocialNetworkController.kt
+   With the pure widget core on classpath, no occurrences of:
+   - parser “expecting ...” errors
+   - class declarations illegally nested in anonymous objects
+   - conflicting overload/redeclaration errors
+   - non-exhaustive WidgetIssueCode handling
+   Remaining standalone errors are unresolved Android/Compose/coroutine/project dependencies because this environment is not an Android SDK build environment.
+
+4. WidgetIssueCode display coverage: PASS
+   52 enum entries / 52 WidgetStudio display branches / 0 missing.
+
+5. Android resource XML parse: PASS
+   9 XML resource files parsed successfully.
+
+6. SHA-256 helper collision check: PASS
+   Exactly one package-level sha256Hex(ByteArray) helper remains: HashUtils.kt.
+
+7. Removed stream widget surface check: PASS
+   No active WidgetNodeType.Stream / HOST_STREAM / Live Stream implementation exists in widget source/runtime code.
+
+8. Gradle wrapper packaging prerequisite: PASS
+   gradle/wrapper/gradle-wrapper.jar is present.
+
+9. Full Android Gradle compile: NOT RUN
+   This environment does not contain Android SDK 36 and does not have the requested Gradle 9.4.1 distribution cached. The user's Windows/JDK17+/SDK36 environment remains the authoritative full Android compile check.
+
+Notable compile-time fix found during this validation:
+- PendingAction had initially been declared as a private data class inside an anonymous WidgetNetworkHost object. Kotlin does not permit a nested class declaration there. It was moved to function-local scope before the anonymous object.
+
+Standalone smoke-suite result:
+TOTAL_PASS=43

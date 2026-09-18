@@ -23,7 +23,7 @@
     <string name="new_image">图片</string>
     <string name="new_widget">组件</string>
     <string name="copy_suffix"> 副本</string>
-    <string name="widget_preview_suffix">空组件占位符</string>
+    <string name="widget_preview_suffix">点按以加载组件</string>
     <string name="media_preview_suffix">媒体记录加载前的占位符</string>
     <string name="builtin_none">无</string>
     <string name="builtin_thin1">细线 1</string>
@@ -210,12 +210,8 @@
     <string name="widget_text">文本</string>
     <string name="widget_button">按钮</string>
     <string name="widget_box">框</string>
-    <string name="widget_stream">主机直播</string>
     <string name="widget_selected">已选择</string>
     <string name="widget_text_value">文本</string>
-    <string name="widget_stream_label">直播标签</string>
-    <string name="widget_stream_source">主机直播名称</string>
-    <string name="widget_stream_safety">主机直播仅用于显示。它们不能访问观看者的摄像头或麦克风，并且总是以暂停状态开始。</string>
     <string name="widget_box_hint">框在 VeilWidget v1 中只是简单的视觉容器。等运行模型稳定后，可以加入更多视觉样式。</string>
     <string name="widget_visual_event_note">可视化编辑器修改的是“代码”中显示的同一份源模型。VeilWidget v1 暂时仍在“代码”中编辑事件。</string>
     <string name="widget_edit_events_code">在代码中编辑事件</string>
@@ -238,14 +234,11 @@
     <string name="widget_keep_backup">保留旧副本</string>
     <string name="widget_make_link">链接副本</string>
     <string name="widget_make_fork">分叉副本</string>
-    <string name="widget_mock_stream_playing">正在播放模拟本地直播 · TODO(网络)</string>
-    <string name="widget_stream_paused">已暂停 · 点击模拟播放</string>
     <string name="widget_library_row">%1$d × %2$d · %3$s</string>
     <string name="widget_new">新组件</string>
     <string name="widget_new_name">新组件</string>
     <string name="widget_new_text">新文本</string>
     <string name="widget_new_button">按钮</string>
-    <string name="widget_live_stream">直播</string>
     <string name="widget_ready">组件已就绪。</string>
     <string name="widget_unsaved">新组件 — 尚未保存。</string>
     <string name="widget_compiled_saved">组件已编译并保存到本地。</string>
@@ -311,7 +304,6 @@
     <string name="widget_issue_missing_action">操作目标不存在：%1$s</string>
     <string name="widget_paused_short">已暂停</string>
     <string name="widget_cap_time">时间</string>
-    <string name="widget_cap_host_stream">主机直播</string>
     <string name="widget_relation_own">自己的</string>
     <string name="widget_relation_link">链接</string>
     <string name="widget_relation_fork">分叉</string>

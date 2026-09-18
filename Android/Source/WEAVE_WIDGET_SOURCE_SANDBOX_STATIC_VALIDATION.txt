@@ -1,0 +1,25 @@
+Weave widget source-only sandbox draft — static/smoke validation
+Date: 2026-09-15
+
+PASS: pure Kotlin core compiled with kotlinc:
+  WidgetModel.kt
+  WidgetLanguage.kt
+  WidgetVerifier.kt
+  WidgetPackageCodec.kt
+
+PASS: starter widget source compiled locally.
+PASS: locally-produced bytecode passed VeilWidgetVerifier.
+PASS: published source package used WEAVE_WIDGET_SOURCE_PACKAGE_V1.
+PASS: decoded published payload did not contain VWB1 bytecode magic.
+PASS: decoding the published package rebuilt bytecode from source locally.
+PASS: CRLF and LF source produced the same canonical SHA-256 identity.
+PASS: verifier rejected a forged Stream node attempting to use https://evil.example
+      instead of an opaque host:<name> resource.
+PASS: strings.xml parsed successfully and has no duplicate resource names.
+
+Not performed in this environment:
+  Full Android/Gradle compile (Android SDK is not installed here).
+
+The source package codec keeps compatibility with legacy Phase-6.1 widget packages, but old
+bytecode is never executed directly: it must match local deterministic compilation and is then
+replaced by the viewer's locally compiled/verified bytecode.

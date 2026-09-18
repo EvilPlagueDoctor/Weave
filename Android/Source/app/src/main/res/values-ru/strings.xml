@@ -23,7 +23,7 @@
     <string name="new_image">Изображение</string>
     <string name="new_widget">Виджет</string>
     <string name="copy_suffix"> Копия</string>
-    <string name="widget_preview_suffix">пустое место для виджета</string>
+    <string name="widget_preview_suffix">Нажмите, чтобы загрузить виджет</string>
     <string name="media_preview_suffix">место до загрузки записи медиа</string>
     <string name="builtin_none">Нет</string>
     <string name="builtin_thin1">Тонкий 1</string>
@@ -210,12 +210,8 @@
     <string name="widget_text">Текст</string>
     <string name="widget_button">Кнопка</string>
     <string name="widget_box">Блок</string>
-    <string name="widget_stream">Поток владельца</string>
     <string name="widget_selected">Выбрано</string>
     <string name="widget_text_value">Текст</string>
-    <string name="widget_stream_label">Подпись потока</string>
-    <string name="widget_stream_source">Имя потока владельца</string>
-    <string name="widget_stream_safety">Потоки владельца предназначены только для отображения. Они не могут обращаться к камере или микрофону зрителя и всегда запускаются на паузе.</string>
     <string name="widget_box_hint">Блоки — простые визуальные контейнеры в VeilWidget v1. Дополнительное оформление можно будет добавить после стабилизации модели выполнения.</string>
     <string name="widget_visual_event_note">Визуальный редактор меняет ту же исходную модель, которая показана в «Код». Пока VeilWidget v1 оставляет редактирование событий в «Код».</string>
     <string name="widget_edit_events_code">Редактировать события в коде</string>
@@ -238,14 +234,11 @@
     <string name="widget_keep_backup">Сохранить старую копию</string>
     <string name="widget_make_link">Связанная копия</string>
     <string name="widget_make_fork">Ответвлённая копия</string>
-    <string name="widget_mock_stream_playing">Воспроизводится тестовый локальный поток · TODO(сеть)</string>
-    <string name="widget_stream_paused">Пауза · коснитесь для имитации воспроизведения</string>
     <string name="widget_library_row">%1$d × %2$d · %3$s</string>
     <string name="widget_new">Новый виджет</string>
     <string name="widget_new_name">Новый виджет</string>
     <string name="widget_new_text">Новый текст</string>
     <string name="widget_new_button">Кнопка</string>
-    <string name="widget_live_stream">Прямая трансляция</string>
     <string name="widget_ready">Виджет готов.</string>
     <string name="widget_unsaved">Новый виджет — ещё не сохранён.</string>
     <string name="widget_compiled_saved">Виджет скомпилирован и сохранён локально.</string>
@@ -311,7 +304,6 @@
     <string name="widget_issue_missing_action">Цель действия не существует: %1$s</string>
     <string name="widget_paused_short">Пауза</string>
     <string name="widget_cap_time">Время</string>
-    <string name="widget_cap_host_stream">Поток владельца</string>
     <string name="widget_relation_own">Собственный</string>
     <string name="widget_relation_link">Связь</string>
     <string name="widget_relation_fork">Ответвление</string>

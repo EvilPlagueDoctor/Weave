@@ -48,7 +48,7 @@ data class ProfilePageRecord(
     val profileBlobRoot: String,
     val profileSha256Hex: String,
     val profileBytes: Long,
-    val vspfVersion: Int = 3,
+    val vspfVersion: Int = 4,
     val commentPolicy: CommentPolicy = CommentPolicy.Open,
 ) {
     fun signature() = MinHash.fromFeatures(extractFeatures(description, features))

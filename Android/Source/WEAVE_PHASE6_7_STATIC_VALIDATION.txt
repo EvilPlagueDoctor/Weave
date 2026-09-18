@@ -1,0 +1,66 @@
+Weave Phase 6.7 - Widget Receive Events / State / If-Else
+Static & standalone validation
+2026-09-16
+
+RESULT: PASS for the available standalone/static checks.
+A complete Android Gradle build was not run in this environment because the project wrapper requests Gradle 9.4.1, the distribution is not cached here, and the Android build toolchain is not available through the sandbox.
+
+Checks performed
+----------------
+1. Pure Kotlin widget core compile
+   - WidgetModel.kt
+   - WidgetExpressions.kt
+   - WidgetNetworkWire.kt
+   - WidgetLanguage.kt
+   - WidgetVerifier.kt
+   - WidgetTemplates.kt
+   - WidgetPackageCodec.kt
+   Result: PASS
+
+2. WidgetNetworkManager Kotlin stub compile against the same minimal Android/daemon stubs used for Phase 6.6.
+   Result: PASS (stub-only unused-parameter warnings).
+
+3. Phase 6.7 smoke suite
+   Result: 37 / 37 checks PASS.
+   Coverage includes:
+   - every bundled template compiles and independently verifies;
+   - Chess contains state, network.input, network.committed, invite, and session-ready handlers;
+   - local bytecode header is VWB3;
+   - state plus typed if/else compiles/verifies;
+   - non-boolean if expressions are rejected;
+   - undeclared receive inputs are rejected;
+   - receive handlers without online=public are rejected;
+   - network.accept outside network.input is rejected;
+   - automatic receive->network.send loops are rejected;
+   - inert network.text(message) compiles;
+   - published packages remain source-only and contain no VWB3 executable marker;
+   - received source-only package recompiles locally to VWB3 with the same source hash;
+   - canonical widget network event round-trip/determinism;
+   - >1 KiB text rejection;
+   - third-input rejection;
+   - control-character rejection.
+
+4. Resource XML parse
+   Result: PASS (9 XML files parsed).
+
+5. Edited large-file structural sanity check
+   - WidgetStudio.kt braces/parentheses balanced.
+   - SocialNetworkController.kt braces/parentheses balanced.
+
+6. Active widget streaming surface search
+   - no WidgetNodeType.Stream
+   - no HOST_STREAM opcodes
+   - no Live Stream template
+   - no stream(...) widget syntax
+   Remaining substrings such as ByteArrayInputStream/OutputStream and "upstream" are ordinary Kotlin/provenance terms, not widget streaming features.
+
+Runtime/security notes
+----------------------
+- Published widgets are still source-only. Legacy VWB1/VWB2 bytecode is not executed by V3; source is recompiled and verified locally.
+- Incoming public-network bytes are validated by Kotlin before a typed WidgetHostEvent reaches the VM.
+- network.accept acknowledges the exact event hash presented by the host.
+- Incoming input handlers match exactly 1-2 locally declared input IDs.
+- network.send/network text/invite creation remain tap-only to prevent receive-driven send loops.
+- Text remains inert UTF-8, max 1 KiB/message, with the Session DHT retaining at most five text-message slots for a widget/session.
+- State is bounded runtime-local state, not arbitrary device storage.
+- Chess exercises matchmaking + acknowledged FROM/TO square flow, but does not yet implement legal chess-move validation or visual piece movement.

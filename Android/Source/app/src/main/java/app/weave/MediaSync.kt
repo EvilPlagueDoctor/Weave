@@ -32,6 +32,16 @@ fun ProfileDocument.imageElements(): List<Element> = buildList {
 fun ProfileDocument.imageHashes(): Set<String> =
     imageElements().mapNotNull { it.mediaContentHash.takeIf(String::isNotBlank) }.toSet()
 
+fun ProfileDocument.audioElements(): List<Element> = buildList {
+    pages.forEach { page ->
+        fun walk(e: Element) {
+            if (e.type == ElementType.Media && e.mediaKind == MediaKind.Audio) add(e)
+            e.children.forEach(::walk)
+        }
+        walk(page.root)
+    }
+}
+
 /**
  * Publishes any image that only exists on this device.
  *
@@ -48,7 +58,7 @@ suspend fun publishPendingMedia(
     controller: SocialNetworkController,
     onProgress: (done: Int, total: Int) -> Unit = { _, _ -> },
 ): Result<Int> {
-    val pending = doc.imageElements().filter {
+    val pending = (doc.imageElements() + doc.audioElements()).filter {
         it.mediaContentHash.isNotBlank() && it.mediaRecordKey.isBlank()
     }
     if (pending.isEmpty()) return Result.success(0)
@@ -74,11 +84,33 @@ suspend fun publishPendingMedia(
         if (!media.isVaultGenerationCurrent(storageGeneration)) {
             return Result.failure(IllegalStateException("The active VeilKnit account changed while media was publishing."))
         }
-        val bytes = media.bytesFor(hash, storageGeneration)
-            ?: return Result.failure(IllegalStateException("An image on this profile is missing from this account's private vault. Re-add it and publish again."))
+        val bytes = when (element.mediaKind) {
+            MediaKind.Image -> media.bytesFor(hash, storageGeneration)
+            MediaKind.Audio -> media.audioBytesFor(hash, storageGeneration)
+            MediaKind.Video -> null
+        } ?: return Result.failure(
+            IllegalStateException(
+                if (element.mediaKind == MediaKind.Audio)
+                    "Audio on this profile is missing from this account's private vault. Re-add it and publish again."
+                else
+                    "An image on this profile is missing from this account's private vault. Re-add it and publish again."
+            )
+        )
 
-        val blob = controller.uploadMedia(IMAGE_CONTENT_TYPE, bytes)
-            ?: return Result.failure(IllegalStateException("Couldn't upload an image. Check the daemon connection and try again."))
+        val contentType = when (element.mediaKind) {
+            MediaKind.Image -> IMAGE_CONTENT_TYPE
+            MediaKind.Audio -> "audio/mp4"
+            MediaKind.Video -> return Result.failure(IllegalStateException("Profile video publishing is not enabled yet."))
+        }
+        val blob = controller.uploadMedia(contentType, bytes)
+            ?: return Result.failure(
+                IllegalStateException(
+                    if (element.mediaKind == MediaKind.Audio)
+                        "Couldn't upload profile audio. Check the daemon connection and try again."
+                    else
+                        "Couldn't upload an image. Check the daemon connection and try again."
+                )
+            )
 
         if (!media.isVaultGenerationCurrent(storageGeneration)) {
             return Result.failure(IllegalStateException("The active VeilKnit account changed while media was publishing."))

@@ -1,0 +1,22 @@
+Weave Groups v2 Phase 5 — static validation
+============================================================
+Target versionCode: 24
+Target versionName: 0.9.0-groups-v2-phase5-production-hardening
+
+PASS: pristine Phase 4A production source used as base.
+PASS: GroupAbuseGuardV2.kt compiles standalone with kotlinc.
+PASS: lightweight delimiter-balance scan passed for all modified Kotlin files.
+PASS: no temporary custody-test markers remain in app source.
+PASS: no Phase-1 manual copy/import/re-ingest/conflict-test controller/UI hooks remain.
+PASS: version metadata updated to versionCode 24 / 0.9.0-groups-v2-phase5-production-hardening.
+PASS: abuse-rate-limit logging explicitly states reputation_penalty=false.
+PASS: recovery pagination cap present: 8 pages / 96 events per custodian chain.
+PASS: custody capacity bound present: 5,000 total retained event refs.
+PASS: canonical EventStore bound present: 4,000 total events.
+PASS: recovery sweeps bounded to 6 groups, 4 custodians/group, 24 requests/sweep.
+PASS: custody worker queue bounded to 96 jobs.
+PASS: public ServiceRequest rate gate occurs before witness/private-key decode loop.
+
+FULL ANDROID COMPILE: NOT AVAILABLE IN THIS ENVIRONMENT.
+Attempted: ./gradlew :app:compileDebugKotlin --offline --no-daemon
+Gradle wrapper still attempted to fetch Gradle 9.4.1 from services.gradle.org and failed with java.net.UnknownHostException because this environment has no network/DNS access to the Gradle distribution. The user's local Android/Gradle build remains the authoritative full compile.

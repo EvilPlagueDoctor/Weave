@@ -23,10 +23,14 @@ class GroupStore(context: Context) : PrivateVault.Participant {
     private val pulses = mutableMapOf<String, GroupPulse>()
     private val moderation = mutableListOf<GroupModerationTask>()
     private val branches = mutableMapOf<String, MutableList<GroupBranchPointer>>()
+    private val branchHeaders = mutableMapOf<String, GroupBranchHeader>()
     private val selectedBranches = mutableMapOf<String, String>()
+    /** Groups whose branch choice was explicitly made by the person (or by claiming). */
+    private val explicitBranchSelections = mutableSetOf<String>()
     private val directoryByAdvertiser = mutableMapOf<String, MutableList<GroupDirectoryEntry>>()
     private val seenEvents = LinkedHashSet<String>()
     private val pending = mutableMapOf<String, GroupPendingItem>()
+    private val postDetails = mutableMapOf<String, GroupPostDetail>()
     private val privateIntakeKeys = mutableMapOf<String, String>()
 
     var revision by mutableLongStateOf(0L)
@@ -51,10 +55,13 @@ class GroupStore(context: Context) : PrivateVault.Participant {
         pulses.clear()
         moderation.clear()
         branches.clear()
+        branchHeaders.clear()
         selectedBranches.clear()
+        explicitBranchSelections.clear()
         directoryByAdvertiser.clear()
         seenEvents.clear()
         pending.clear()
+        postDetails.clear()
         privateIntakeKeys.clear()
         preferredMode = BrowseMode.People
         revision++
@@ -65,10 +72,21 @@ class GroupStore(context: Context) : PrivateVault.Participant {
 
     @Synchronized
     fun owned(ownerId: String): List<GroupRecord> =
-        groups.filter { group ->
-            group.ownerId == ownerId ||
-                group.role in setOf(GroupRole.Creator, GroupRole.Claimer, GroupRole.Admin) ||
-                branches[group.groupId].orEmpty().any { it.ownerMainDht == ownerId }
+        groups.mapNotNull { group ->
+            val ownsBranch = branches[group.groupId].orEmpty().any { it.ownerMainDht == ownerId }
+            val moderatesBranch = branchHeaders.values.any { header ->
+                header.group.groupId == group.groupId &&
+                    header.moderators.any { it.moderatorMainDht == ownerId }
+            }
+            when {
+                group.ownerId == ownerId || group.role in setOf(GroupRole.Creator, GroupRole.Claimer, GroupRole.Admin) ->
+                    group
+                ownsBranch ->
+                    if (group.role == GroupRole.Member) group.copy(role = GroupRole.Claimer) else group
+                moderatesBranch ->
+                    group.copy(role = GroupRole.Moderator)
+                else -> null
+            }
         }.distinctBy { it.groupId }.sortedBy { it.name.lowercase() }
 
     @Synchronized
@@ -135,6 +153,7 @@ class GroupStore(context: Context) : PrivateVault.Participant {
         ownerId: String,
         name: String,
         description: String,
+        thumbnailBase64: String? = null,
         tags: List<String>,
         policy: GroupPolicy,
         featured: FeaturedSlot,
@@ -145,6 +164,7 @@ class GroupStore(context: Context) : PrivateVault.Participant {
             ownerId = ownerId,
             name = name.trim().ifBlank { "Untitled group" }.take(120),
             description = description.trim().take(2000),
+            thumbnailBase64 = thumbnailBase64?.takeIf { it.isNotBlank() },
             tags = tags.map { it.trim() }.filter { it.isNotBlank() }.distinct().take(32),
             policy = policy,
             featured = featured,
@@ -211,13 +231,22 @@ class GroupStore(context: Context) : PrivateVault.Participant {
         persist()
     }
 
-    @Synchronized
-    fun rememberBranch(pointer: GroupBranchPointer, selectIfNone: Boolean, ownedByMe: Boolean = false) {
+    /**
+     * Update branch bookkeeping without touching the encrypted vault. Callers that are ingesting a
+     * directory/header batch can make all of their in-memory changes first and persist once at the
+     * end instead of serializing the entire Groups state for every single pointer.
+     */
+    private fun rememberBranchInMemory(
+        pointer: GroupBranchPointer,
+        selectIfNone: Boolean,
+        ownedByMe: Boolean = false,
+    ) {
         val list = branches.getOrPut(pointer.groupId) { mutableListOf() }
         list.removeAll { it.branchId == pointer.branchId }
         list += pointer
         list.sortByDescending { it.updatedAt }
-        if (selectIfNone || selectedBranches[pointer.groupId].isNullOrBlank()) {
+        val hasExplicitSelection = pointer.groupId in explicitBranchSelections
+        if (selectedBranches[pointer.groupId].isNullOrBlank() || (selectIfNone && !hasExplicitSelection)) {
             selectedBranches[pointer.groupId] = pointer.branchId
         }
         if (ownedByMe) {
@@ -226,7 +255,44 @@ class GroupStore(context: Context) : PrivateVault.Participant {
                 groups[i] = groups[i].copy(role = GroupRole.Claimer, joined = true)
             }
         }
+    }
+
+    @Synchronized
+    fun rememberBranch(pointer: GroupBranchPointer, selectIfNone: Boolean, ownedByMe: Boolean = false) {
+        rememberBranchInMemory(pointer, selectIfNone, ownedByMe)
         persist()
+    }
+
+    private fun branchHeaderKey(groupId: String, branchId: String): String = "$groupId|$branchId"
+
+    @Synchronized
+    fun rememberBranchHeader(header: GroupBranchHeader) {
+        branchHeaders[branchHeaderKey(header.group.groupId, header.branchId)] = header
+        // Original is the sensible automatic default, but only prefer it while the choice is still
+        // implicit. Once the person chooses Original/Claim explicitly, refresh may not change it.
+        rememberBranchInMemory(header.pointer(), selectIfNone = header.kind == GroupBranchKind.Original)
+        persist()
+    }
+
+    /** Store a verified branch header and every branch it advertises in one vault transaction. */
+    @Synchronized
+    fun rememberBranchHeaderAndKnown(header: GroupBranchHeader, ownedByMe: Boolean = false) {
+        branchHeaders[branchHeaderKey(header.group.groupId, header.branchId)] = header
+        rememberBranchInMemory(
+            header.pointer(),
+            selectIfNone = header.kind == GroupBranchKind.Original,
+            ownedByMe = ownedByMe,
+        )
+        header.knownBranches.forEach { pointer ->
+            rememberBranchInMemory(pointer, selectIfNone = false, ownedByMe = false)
+        }
+        persist()
+    }
+
+    @Synchronized
+    fun selectedHeader(groupId: String): GroupBranchHeader? {
+        val pointer = selectedBranch(groupId) ?: return null
+        return branchHeaders[branchHeaderKey(groupId, pointer.branchId)]
     }
 
     @Synchronized
@@ -249,6 +315,7 @@ class GroupStore(context: Context) : PrivateVault.Participant {
     fun selectBranch(groupId: String, branchId: String) {
         if (branches[groupId].orEmpty().none { it.branchId == branchId }) return
         selectedBranches[groupId] = branchId
+        explicitBranchSelections += groupId
         persist()
     }
 
@@ -289,7 +356,7 @@ class GroupStore(context: Context) : PrivateVault.Participant {
             .toMutableList()
         directoryByAdvertiser[advertiserMainDht] = clean
         clean.forEach { entry ->
-            rememberBranch(
+            rememberBranchInMemory(
                 GroupBranchPointer(
                     groupId = entry.groupId,
                     branchId = entry.branchId,
@@ -344,6 +411,7 @@ class GroupStore(context: Context) : PrivateVault.Participant {
             sourceMainDht = sourceMainDht,
             publicSpectator = false,
         )
+        enforcePendingCap()
         persist()
     }
 
@@ -362,6 +430,7 @@ class GroupStore(context: Context) : PrivateVault.Participant {
             expiresAt = normalizedExpiry,
         )
         prunePending(now)
+        enforcePendingCap()
         persist()
     }
 
@@ -381,8 +450,23 @@ class GroupStore(context: Context) : PrivateVault.Participant {
             expiresAt = normalizedExpiry,
         )
         prunePending(now)
+        enforcePendingCap()
         persist()
     }
+
+    private fun postDetailKey(groupId: String, branchId: String, conversationId: String): String =
+        "$groupId|$branchId|$conversationId"
+
+    @Synchronized
+    fun rememberPostDetail(detail: GroupPostDetail) {
+        postDetails[postDetailKey(detail.groupId, detail.branchId, detail.conversationId)] = detail
+        while (postDetails.size > MAX_POST_DETAILS) postDetails.entries.firstOrNull()?.key?.let(postDetails::remove) ?: break
+        revision++
+    }
+
+    @Synchronized
+    fun postDetail(groupId: String, branchId: String, conversationId: String): GroupPostDetail? =
+        postDetails[postDetailKey(groupId, branchId, conversationId)]
 
     @Synchronized
     fun pendingByEvent(eventId: String): GroupPendingItem? = pending[eventId]
@@ -424,6 +508,11 @@ class GroupStore(context: Context) : PrivateVault.Participant {
     @Synchronized
     fun addModerationTask(task: GroupModerationTask) {
         if (moderation.none { it.taskId == task.taskId }) {
+            if (moderation.size >= MAX_MODERATION_TASKS) {
+                val terminal = moderation.filter { it.state != GroupModerationState.Pending }.minByOrNull { it.createdAt }
+                if (terminal != null) moderation.remove(terminal)
+                else if (moderation.isNotEmpty()) moderation.removeAt(0)
+            }
             moderation += task
             persist()
         }
@@ -441,10 +530,88 @@ class GroupStore(context: Context) : PrivateVault.Participant {
         pending.entries.removeAll { (_, item) -> item.expiresAt > 0L && item.expiresAt <= now }
     }
 
+    private fun enforcePendingCap() {
+        while (pending.size > MAX_PENDING_ITEMS) {
+            val victim = pending.entries.minByOrNull { it.value.event.createdAt }?.key ?: break
+            pending.remove(victim)
+        }
+    }
+
+    /** Lightweight, untrusted hints suitable for gossip. DHT verification still decides truth. */
+    @Synchronized
+    fun gossipHints(limit: Int = 16): List<GroupGossipHint> = groups
+        .asSequence()
+        .filter { it.policy.visibility != GroupVisibility.MembersOnly }
+        .flatMap { group ->
+            branches[group.groupId].orEmpty().asSequence().map { pointer ->
+                val pulse = pulses[pulseKey(group.groupId, pointer.branchId)]
+                GroupGossipHint(
+                    pointer = pointer,
+                    pulseGeneration = pulse?.generation ?: 0L,
+                    pulseUpdatedAt = pulse?.updatedAt ?: 0L,
+                )
+            }
+        }
+        .distinctBy { it.pointer.groupId to it.pointer.branchId }
+        .sortedByDescending { maxOf(it.pulseUpdatedAt, it.pointer.updatedAt) }
+        .take(limit.coerceIn(1, 32))
+        .toList()
+
+    /** Human-readable account/group ownership snapshot for copied diagnostics. */
+    @Synchronized
+    fun responsibilityLines(ownMainDht: String): List<String> {
+        if (ownMainDht.isBlank()) return listOf("(daemon identity unavailable)")
+        val out = mutableListOf<String>()
+        groups.sortedBy { it.name.lowercase() }.forEach { group ->
+            val selected = selectedBranch(group.groupId)
+            val groupBranches = branches[group.groupId].orEmpty()
+            groupBranches.filter { it.ownerMainDht == ownMainDht }.forEach { branch ->
+                out += buildString {
+                    append(group.name.ifBlank { group.groupId })
+                    append(" | ")
+                    append(if (branch.kind == GroupBranchKind.Original) "creator/original owner" else "claim owner")
+                    append(" | branch=").append(branch.branchId)
+                    if (selected?.branchId == branch.branchId) append(" | selected")
+                    append(" | pending=").append(pending.values.count { it.event.groupId == group.groupId })
+                }
+            }
+            var foundModeratorGrant = false
+            branchHeaders.values
+                .filter { it.group.groupId == group.groupId }
+                .forEach { header ->
+                    header.moderators.firstOrNull { it.moderatorMainDht == ownMainDht }?.let { grant ->
+                        foundModeratorGrant = true
+                        out += buildString {
+                            append(group.name.ifBlank { group.groupId })
+                            append(" | secondary moderator")
+                            append(" | branch=").append(header.branchId)
+                            append(" | owner=").append(header.ownerMainDht)
+                            append(" | posts=").append(grant.canModeratePosts)
+                            append(" members=").append(grant.canApproveMembers)
+                            append(" reports=").append(grant.canHandleReports)
+                            if (selected?.branchId == header.branchId) append(" | selected")
+                        }
+                    }
+                }
+            if (!foundModeratorGrant && group.role == GroupRole.Moderator) {
+                out += "${group.name.ifBlank { group.groupId }} | secondary moderator (cached role; branch grant not refreshed yet)"
+            }
+        }
+        return out.distinct().ifEmpty { listOf("(no created/claimed/moderated groups known locally)") }
+    }
+
+    @Synchronized
+    fun knownPulseGeneration(groupId: String, branchId: String): Long =
+        pulses[pulseKey(groupId, branchId)]?.generation ?: 0L
+
+    @Synchronized
+    fun branchKnown(groupId: String, branchId: String): Boolean =
+        branches[groupId].orEmpty().any { it.branchId == branchId }
+
     @Synchronized
     private fun load() {
         groups.clear(); pulses.clear(); moderation.clear(); branches.clear()
-        selectedBranches.clear(); directoryByAdvertiser.clear(); seenEvents.clear(); pending.clear(); privateIntakeKeys.clear()
+        selectedBranches.clear(); explicitBranchSelections.clear(); directoryByAdvertiser.clear(); seenEvents.clear(); pending.clear(); postDetails.clear(); privateIntakeKeys.clear()
         if (!vault.attached) { revision++; return }
         runCatching {
             val root = JSONObject(vault.getText(STATE_KEY) ?: "{}")
@@ -466,6 +633,21 @@ class GroupStore(context: Context) : PrivateVault.Participant {
             while (selectedKeys.hasNext()) {
                 val key = selectedKeys.next()
                 selectedBranches[key] = selected.optString(key)
+            }
+            val explicit = root.optJSONArray("explicit_branch_selections")
+            if (explicit != null) {
+                for (i in 0 until explicit.length()) {
+                    explicit.optString(i).takeIf { it.isNotBlank() }?.let(explicitBranchSelections::add)
+                }
+            } else {
+                // v2 did not distinguish automatic/default selection from a user's choice. A
+                // selected Claim is the safest migration signal that the non-default branch was
+                // deliberately chosen (or owned), so preserve that as explicit.
+                selectedBranches.forEach { (groupId, branchId) ->
+                    if (branches[groupId].orEmpty().any { it.branchId == branchId && it.kind == GroupBranchKind.Claim }) {
+                        explicitBranchSelections += groupId
+                    }
+                }
             }
             val dirs = root.optJSONObject("directories") ?: JSONObject()
             val dirKeys = dirs.keys()
@@ -504,6 +686,11 @@ class GroupStore(context: Context) : PrivateVault.Participant {
                 }
             }
             prunePending(System.currentTimeMillis())
+            enforcePendingCap()
+            while (moderation.size > MAX_MODERATION_TASKS) {
+                val terminal = moderation.filter { it.state != GroupModerationState.Pending }.minByOrNull { it.createdAt }
+                if (terminal != null) moderation.remove(terminal) else moderation.removeAt(0)
+            }
         }
         revision++
     }
@@ -513,7 +700,7 @@ class GroupStore(context: Context) : PrivateVault.Participant {
         if (!vault.attached) { revision++; return }
         runCatching {
             val root = JSONObject()
-                .put("v", 2)
+                .put("v", 3)
                 .put("groups", JSONArray().apply { groups.forEach { put(it.toLocalJson()) } })
                 .put("moderation", JSONArray().apply { moderation.forEach { put(it.toJson()) } })
                 .put("branches", JSONArray().apply {
@@ -522,6 +709,7 @@ class GroupStore(context: Context) : PrivateVault.Participant {
                 .put("selected_branches", JSONObject().apply {
                     selectedBranches.forEach { (group, branch) -> put(group, branch) }
                 })
+                .put("explicit_branch_selections", JSONArray(explicitBranchSelections.toList()))
                 .put("directories", JSONObject().apply {
                     directoryByAdvertiser.forEach { (advertiser, list) ->
                         put(advertiser, JSONArray().apply { list.forEach { put(it.toJson()) } })
@@ -546,6 +734,9 @@ class GroupStore(context: Context) : PrivateVault.Participant {
         private const val STATE_KEY = "groups/state-v2.json"
         private const val UI_KEY = "groups/ui.json"
         private const val MAX_SEEN_EVENTS = 4096
+        private const val MAX_PENDING_ITEMS = 2000
+        private const val MAX_MODERATION_TASKS = 2000
+        private const val MAX_POST_DETAILS = 256
         private fun safeKey(value: String): String =
             value.replace(Regex("[^A-Za-z0-9_.-]"), "_").take(160)
     }

@@ -13,6 +13,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.border
@@ -49,6 +50,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
@@ -63,9 +65,14 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.*
 
 enum class EditMode(@StringRes val labelRes: Int, @StringRes val shortRes: Int) {
@@ -147,20 +154,40 @@ private fun localizedDefaultProfile(context: Context): ProfileDocument {
 /** Fixed filename for the profile the app is actually using, distinct from named exports. */
 const val ACTIVE_PROFILE_FILE = "active.txt"
 
+private data class ActiveProfileLoad(
+    val document: ProfileDocument?,
+    val missing: Boolean = false,
+    val problem: String? = null,
+)
+
 /**
- * Restores the working profile, falling back to a fresh starter document when there is no
- * saved one or the saved one will not parse.
+ * Distinguishes "there is no saved profile" from "the vault is temporarily unavailable".
+ * A missing profile legitimately gets the starter document; a read/decode failure is surfaced
+ * instead of silently pretending the star starter profile was the person's saved data.
  */
-fun loadActiveProfile(context: Context): ProfileDocument {
+private fun loadActiveProfileState(context: Context): ActiveProfileLoad {
     val vault = PrivateVault.get(context)
-    if (!vault.attached) return localizedDefaultProfile(context)
-    val bytes = runCatching { vault.getNamedBlob("profiles", ACTIVE_PROFILE_FILE, PROFILE_MAX_LOCAL_BYTES) }.getOrNull()
-        ?: return localizedDefaultProfile(context)
-    return runCatching { ProfileCodec.decodeText(bytes.toString(Charsets.UTF_8)) }
-        .getOrElse { localizedDefaultProfile(context) }
+    if (!vault.attached) return ActiveProfileLoad(null, problem = "VeilKnit private storage is temporarily unavailable")
+    val bytes = try {
+        vault.getNamedBlob("profiles", ACTIVE_PROFILE_FILE, PROFILE_MAX_LOCAL_BYTES)
+    } catch (t: Throwable) {
+        return ActiveProfileLoad(null, problem = "Could not read the saved profile: ${t.message ?: t::class.java.simpleName}")
+    }
+    if (bytes == null) return ActiveProfileLoad(localizedDefaultProfile(context), missing = true)
+    return try {
+        ActiveProfileLoad(ProfileCodec.decodeText(bytes.toString(Charsets.UTF_8)))
+    } catch (t: Throwable) {
+        ActiveProfileLoad(null, problem = "Saved profile could not be decoded: ${t.message ?: t::class.java.simpleName}")
+    }
 }
 
+/** Initial construction happens before the daemon normally attaches, so this placeholder is not
+ * authoritative. The first successful vault attachment replaces it with the account's document. */
+fun loadActiveProfile(context: Context): ProfileDocument =
+    loadActiveProfileState(context).document ?: localizedDefaultProfile(context)
+
 private const val PROFILE_MAX_LOCAL_BYTES = 8 * 1024 * 1024
+private const val PROFILE_EDITOR_MODE_KEY = "profile/editor-mode-v1.txt"
 
 class EditorState(private val context: Context) : PrivateVault.Participant {
     private val vault = PrivateVault.get(context)
@@ -209,40 +236,109 @@ class EditorState(private val context: Context) : PrivateVault.Participant {
     var showWidgetPicker by mutableStateOf(false)
     var widgetReplaceTargetId by mutableStateOf<String?>(null)
     var pendingWidgetBoxResize by mutableStateOf<PendingWidgetBoxResize?>(null)
-    private val widgetProgramCache = mutableMapOf<String, Pair<String, WidgetProgram>>()
+    // Widget source packages can be large (Chess is ~122 KiB). Never let Canvas/draw code cause
+    // a synchronous encrypted-vault read + source compile on the Android main thread. The cache is
+    // shared with a small background loader so it must be thread-safe.
+    private val widgetProgramCache = ConcurrentHashMap<String, Pair<String, WidgetProgram>>()
+    private val widgetProgramLoads = ConcurrentHashMap.newKeySet<String>()
+    private val widgetLoadScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var lastAttachedProfileId: String? = null
+    private var profileLoadedForCurrentAccount = false
+    /** null = not known/read failed, false = genuinely no saved profile, true = saved profile loaded. */
+    var savedProfilePresent by mutableStateOf<Boolean?>(null)
+        private set
+    private var pendingPersist = false
+    var vaultAvailable by mutableStateOf(vault.attached)
+        private set
 
     init { vault.register(this) }
 
     override fun onVaultAttached() {
-        // Migrate all legacy plaintext profile documents before loading the working profile.
+        val attachedProfileId = vault.currentProfileId() ?: return
+        val sameAccountReconnect = lastAttachedProfileId != null &&
+            lastAttachedProfileId == attachedProfileId && profileLoadedForCurrentAccount
+        vaultAvailable = true
+        WeaveDiagnostics.event(
+            context,
+            "EDITOR_VAULT_ATTACH",
+            "profile=${short(attachedProfileId)} same_account=$sameAccountReconnect pending_persist=$pendingPersist doc=${documentDiagnosticId()}"
+        )
+
+        // A transient Binder/daemon reconnect must not replace the in-memory editor document or
+        // reset page/tool/navigation state. If an edit happened while storage was unavailable,
+        // flush it now that the same account's vault is back.
+        if (sameAccountReconnect) {
+            persistError = null
+            if (pendingPersist) {
+                val flushed = persistActive()
+                WeaveDiagnostics.event(context, "PROFILE_PERSIST_RESUME", "ok=$flushed doc=${documentDiagnosticId()}")
+            }
+            invalidate()
+            return
+        }
+
+        // Initial attachment, or a genuinely different VeilKnit profile: now it is correct to
+        // cross the account boundary and load that account's private editor state.
+        lastAttachedProfileId = attachedProfileId
+        profileLoadedForCurrentAccount = false
+        savedProfilePresent = null
         legacyProfileDir.listFiles { f -> f.isFile && f.extension.equals("txt", true) }?.forEach { file ->
             vault.migrateLegacyNamedBlob("profiles", file.name, file, "text/plain; charset=utf-8")
         }
         runCatching {
             if (legacyProfileDir.isDirectory && legacyProfileDir.list().isNullOrEmpty()) legacyProfileDir.delete()
         }
-        doc = loadActiveProfile(context)
-        currentFileName = null
-        savedSnapshot = doc.deepCopy()
-        undo.clear(); redo.clear()
-        pageIndex = 0
-        selectedId = doc.pages.first().root.id
-        focusedBoxId = firstBoxId()
-        mode = EditMode.Boxes
-        persistError = null
+
+        val loaded = loadActiveProfileState(context)
+        if (loaded.document != null) {
+            doc = loaded.document
+            currentFileName = null
+            savedSnapshot = doc.deepCopy()
+            undo.clear(); redo.clear()
+            pageIndex = 0
+            selectedId = doc.pages.first().root.id
+            focusedBoxId = firstBoxId()
+            mode = EditMode.Boxes
+            persistError = null
+            profileLoadedForCurrentAccount = true
+            savedProfilePresent = !loaded.missing
+        } else {
+            // Do not silently manufacture a star profile on an I/O/decode failure. The existing
+            // in-memory document remains untouched; the error is visible and diagnostics retain
+            // the reason. On a normal first attachment this document is only the pre-attach
+            // placeholder, but importantly it is not mistaken for a successfully loaded profile.
+            persistError = loaded.problem ?: "Saved profile is temporarily unavailable"
+            savedProfilePresent = null
+            WeaveDiagnostics.event(
+                context,
+                "PROFILE_LOAD_FAILED",
+                "profile=${short(attachedProfileId)} problem=${persistError.orEmpty().replace('\n', ' ').take(220)}"
+            )
+        }
+        preferAdvancedEditor = runCatching { vault.getText(PROFILE_EDITOR_MODE_KEY) == "advanced" }.getOrDefault(false)
+        pendingPersist = false
         widgetProgramCache.clear()
+        widgetProgramLoads.clear()
         invalidate()
     }
 
     override fun onVaultDetached() {
-        // Account switching is a hard boundary. Drop decrypted document/widget state immediately.
-        doc = localizedDefaultProfile(context)
-        currentFileName = null
-        savedSnapshot = doc.deepCopy()
-        undo.clear(); redo.clear(); widgetProgramCache.clear()
-        pageIndex = 0; selectedId = doc.pages.first().root.id; focusedBoxId = firstBoxId()
+        // A daemon reconnect is not an account logout. Keep the decrypted working document and
+        // editor state in memory so Compose cannot flash the starter profile or kick the user out
+        // of their work. A different profile is handled when onVaultAttached() receives its id.
+        vaultAvailable = false
+        persistError = null
+        WeaveDiagnostics.event(
+            context,
+            "EDITOR_VAULT_DETACH",
+            "profile=${lastAttachedProfileId?.let(::short) ?: "(none)"} doc=${documentDiagnosticId()} page=$pageIndex mode=${mode.name}"
+        )
         invalidate()
     }
+
+    fun documentDiagnosticId(): String = runCatching {
+        ProfileCodec.encodeText(doc).hashCode().toUInt().toString(16).padStart(8, '0')
+    }.getOrDefault("encode-error")
 
     fun text(@StringRes id: Int, vararg args: Any): String = context.getString(id, *args)
     fun toast(@StringRes id: Int, vararg args: Any) = Toast.makeText(context, text(id, *args), Toast.LENGTH_SHORT).show()
@@ -255,6 +351,17 @@ class EditorState(private val context: Context) : PrivateVault.Participant {
      * resolve to the current owner rather than to something baked into the document.
      */
     var ownerKey by mutableStateOf("")
+
+    /** Which profile editor this account used most recently. */
+    var preferAdvancedEditor by mutableStateOf(false)
+        private set
+
+    fun setPreferredEditorAdvanced(value: Boolean) {
+        preferAdvancedEditor = value
+        if (vault.attached) {
+            runCatching { vault.putText(PROFILE_EDITOR_MODE_KEY, if (value) "advanced" else "basic") }
+        }
+    }
 
     /** Set when the working document could not be written. Surfaced in the UI, not swallowed. */
     var persistError by mutableStateOf<String?>(null)
@@ -269,13 +376,42 @@ class EditorState(private val context: Context) : PrivateVault.Participant {
      * wrong default for the one function whose whole job is not losing the person's work.
      */
     fun persistActive(): Boolean {
+        if (!vault.attached) {
+            pendingPersist = true
+            persistError = null
+            WeaveDiagnostics.event(
+                context,
+                "PROFILE_PERSIST_DEFERRED",
+                "profile=${lastAttachedProfileId?.let(::short) ?: "(none)"} doc=${documentDiagnosticId()} reason=vault_unavailable"
+            )
+            return false
+        }
+        val wasPending = pendingPersist
+        var encodedSize = 0
         val outcome = runCatching {
             // Encode first; the daemon uploads chunks, commits the encrypted name->blob index,
             // and only then releases the previous encrypted blob.
             val encoded = ProfileCodec.encodeText(doc).toByteArray(Charsets.UTF_8)
+            encodedSize = encoded.size
             vault.putNamedBlob("profiles", ACTIVE_PROFILE_FILE, "text/plain; charset=utf-8", encoded)
         }
         persistError = outcome.exceptionOrNull()?.let { it.message ?: it::class.java.simpleName }
+        pendingPersist = outcome.isFailure
+        if (outcome.isSuccess) {
+            // A successful write is authoritative evidence that this account now has a real
+            // profile. This is what lets first-run advance without depending on a separate
+            // onboarding flag racing the encrypted profile load.
+            savedProfilePresent = true
+            profileLoadedForCurrentAccount = true
+        }
+        if (outcome.isFailure || wasPending) {
+            WeaveDiagnostics.event(
+                context,
+                if (outcome.isSuccess) "PROFILE_PERSIST_RECOVERED" else "PROFILE_PERSIST_FAILED",
+                "profile=${lastAttachedProfileId?.let(::short) ?: "(none)"} doc=${documentDiagnosticId()} bytes=$encodedSize" +
+                    (persistError?.let { " error=${it.replace('\n', ' ').take(180)}" } ?: "")
+            )
+        }
         return outcome.isSuccess
     }
 
@@ -411,6 +547,7 @@ class EditorState(private val context: Context) : PrivateVault.Participant {
     fun continuousEditDoc(block: (ProfileDocument) -> Unit) { if (!continuousEditing) { pushUndo(); continuousEditing = true }; block(doc); invalidate(true) }
     fun endContinuous() { continuousEditing = false; uiRevision++ }
 
+    fun canUndo(): Boolean = undo.isNotEmpty()
     fun undo() { if (undo.isEmpty()) return; redo.addLast(doc.deepCopy()); doc = undo.removeLast(); repairSelection() }
     fun redo() { if (redo.isEmpty()) return; undo.addLast(doc.deepCopy()); doc = redo.removeLast(); repairSelection() }
     fun revert() { pushUndo(); doc = savedSnapshot.deepCopy(); pageIndex = 0; selectedId = doc.pages[0].root.id; mode = EditMode.Boxes; focusedBoxId = firstBoxId(); invalidate() }
@@ -503,27 +640,52 @@ class EditorState(private val context: Context) : PrivateVault.Participant {
     fun finishDepthDrag() { depthEditing = false; depthInvalidDrop = false; depthArmedId = null; uiRevision++ }
 
     private fun reIdTree(e: Element) { e.id = makeId("item"); e.children.forEach(::reIdTree) }
+
+    private fun itemKindLabel(e: Element?, pageRoot: Boolean = false): String {
+        if (pageRoot) return text(R.string.item_kind_page)
+        return when (e?.type) {
+            ElementType.Block -> text(R.string.item_kind_box)
+            ElementType.Text -> text(R.string.item_kind_text)
+            ElementType.Link -> text(R.string.item_kind_link)
+            ElementType.Button -> text(R.string.item_kind_button)
+            ElementType.Stamp -> text(R.string.item_kind_stamp)
+            ElementType.Media -> text(R.string.item_kind_media)
+            ElementType.Widget -> text(R.string.item_kind_widget)
+            null -> text(R.string.item_kind_item)
+        }
+    }
+
     fun deleteSelected() {
         val page = doc.pages[pageIndex]
         if (selectedId == page.root.id) {
             if (doc.pages.size <= 1) { toast(R.string.must_keep_page); return }
+            val kind = itemKindLabel(page.root, pageRoot = true)
             pushUndo(); val removed = page.id; doc.pages.removeAt(pageIndex); if (doc.defaultPageId == removed) doc.defaultPageId = doc.pages.first().id
-            pageIndex = pageIndex.coerceAtMost(doc.pages.lastIndex); selectedId = doc.pages[pageIndex].root.id; focusedBoxId = firstBoxId(); invalidate(); return
+            pageIndex = pageIndex.coerceAtMost(doc.pages.lastIndex); selectedId = doc.pages[pageIndex].root.id; focusedBoxId = firstBoxId(); invalidate()
+            toast(R.string.editor_deleted_item, kind)
+            return
         }
+        val target = selected() ?: return
+        val kind = itemKindLabel(target)
         val parent = parentOf(selectedId) ?: return; pushUndo(); parent.children.removeAll { it.id == selectedId }
         if (selectedId == focusedBoxId) focusedBoxId = firstBoxId()
         selectedId = if (mode == EditMode.Foreground) focusedBoxId ?: page.root.id else parent.id; invalidate()
+        toast(R.string.editor_deleted_item, kind)
     }
     fun duplicateSelected() {
         val page = doc.pages[pageIndex]
         if (selectedId == page.root.id) {
             if (doc.pages.size >= VspfLimits.MAX_PAGES) return
+            val kind = itemKindLabel(page.root, pageRoot = true)
             pushUndo(); val copy = page.copy(id = makeId("page"), name = page.name + text(R.string.copy_suffix), root = page.root.deepCopy()); reIdTree(copy.root); copy.root.name = copy.name
-            doc.pages += copy; pageIndex = doc.pages.lastIndex; selectedId = copy.root.id; focusedBoxId = firstBoxId(); invalidate(); return
+            doc.pages += copy; pageIndex = doc.pages.lastIndex; selectedId = copy.root.id; focusedBoxId = firstBoxId(); invalidate()
+            toast(R.string.editor_cloned_item, kind)
+            return
         }
-        val e = selected() ?: return; val parent = parentOf(selectedId) ?: return; pushUndo(); val c = e.deepCopy(); reIdTree(c); c.name += text(R.string.copy_suffix)
+        val e = selected() ?: return; val kind = itemKindLabel(e); val parent = parentOf(selectedId) ?: return; pushUndo(); val c = e.deepCopy(); reIdTree(c); c.name += text(R.string.copy_suffix)
         c.rect.x = (c.rect.x + .03f).coerceAtMost(1f - c.rect.width); c.rect.y = (c.rect.y + .03f).coerceAtMost(1f - c.rect.height); c.rect.zIndex = e.rect.zIndex + 1
         parent.children += c; selectedId = c.id; if (isRootBox(c)) focusedBoxId = c.id; invalidate()
+        toast(R.string.editor_cloned_item, kind)
     }
     fun adjustLayer(delta: Int) { val e = selected() ?: return; if (isPageRoot(e)) return; pushUndo(); e.rect.zIndex += delta; invalidate() }
 
@@ -618,7 +780,7 @@ class EditorState(private val context: Context) : PrivateVault.Participant {
         }
         uiRevision++
     }
-    fun beginDrag(nxPage: Float, nyPage: Float) {
+    fun beginDrag(nxPage: Float, nyPage: Float): Boolean {
         val hit = hitTest(nxPage,nyPage); selectedId=hit.elementId; dragParentRect=hit.parentRect
         val e=selected(); dragElement=when(mode){
             EditMode.Background -> if(e?.type==ElementType.Stamp)e else null
@@ -626,22 +788,98 @@ class EditorState(private val context: Context) : PrivateVault.Participant {
             EditMode.Foreground -> if(e!=null && e.id!=focusedBoxId)e else null
         }
         if(dragElement!=null)pushUndo()
+        return dragElement != null
     }
     fun dragBy(dxNormPage: Float,dyNormPage: Float){val e=dragElement?:return;val pw=dragParentRect.w.coerceAtLeast(.001f);val ph=dragParentRect.h.coerceAtLeast(.001f);e.rect.x=(e.rect.x+dxNormPage/pw).coerceIn(0f,1f-e.rect.width);e.rect.y=(e.rect.y+dyNormPage/ph).coerceIn(0f,1f-e.rect.height);renderRevision++}
     fun endDrag(){dragElement=null;uiRevision++}
 
     private fun widgetLocalId(recordKey: String): String? = recordKey.removePrefix("local-widget:").takeIf { recordKey.startsWith("local-widget:") && it.isNotBlank() }
-    fun widgetPackageFor(e: Element): WidgetPackage? = if (e.type == ElementType.Widget) widgetLocalId(e.widgetRecordKey)?.let(widgetRepo::find) else null
+    fun widgetPackageFor(e: Element): WidgetPackage? {
+        if (e.type != ElementType.Widget) return null
+        val localId = widgetLocalId(e.widgetRecordKey)
+        return when {
+            localId != null -> widgetRepo.find(localId)
+            e.widgetSourceHash.isNotBlank() -> widgetRepo.findBySourceHash(e.widgetSourceHash)
+            else -> null
+        }
+    }
+    /** Cache-only package lookup for Compose inspectors. Never does daemon I/O or source compile. */
+    fun widgetPackageCachedFor(e: Element): WidgetPackage? {
+        if (e.type != ElementType.Widget) return null
+        val localId = widgetLocalId(e.widgetRecordKey)
+        return when {
+            localId != null -> widgetRepo.peekCached(localId)
+            e.widgetSourceHash.isNotBlank() -> widgetRepo.peekCachedBySourceHash(e.widgetSourceHash)
+            else -> null
+        }
+    }
+
+    fun requestWidgetProgram(e: Element) { widgetProgramFor(e) }
+
     fun widgetProgramFor(e: Element): WidgetProgram? {
-        val localId = widgetLocalId(e.widgetRecordKey) ?: return null
+        if (e.type != ElementType.Widget) return null
         val expected = e.widgetSourceHash
-        val cached = widgetProgramCache[localId]
-        if (cached != null && expected.isNotBlank() && cached.first == expected) return cached.second
-        val pkg = widgetRepo.find(localId) ?: return null
-        if (expected.isNotBlank() && pkg.manifest.sourceHash != expected) return null
-        val program = runCatching { VeilWidgetBytecode.decode(pkg.bytecode) }.getOrNull() ?: return null
-        widgetProgramCache[localId] = pkg.manifest.sourceHash to program
-        return program
+        val localId = widgetLocalId(e.widgetRecordKey)
+        val lookupKey = localId ?: expected.takeIf { it.isNotBlank() }?.let { "source:${it.lowercase()}" } ?: return null
+
+        widgetProgramCache[lookupKey]?.let { cached ->
+            if (expected.isBlank() || cached.first.equals(expected, ignoreCase = true)) return cached.second
+        }
+
+        // drawElement() calls this from Canvas on the UI thread. A cold process has an empty
+        // package/program cache, and WidgetRepository.find() recompiles source while decoding its
+        // source-only vault package. Doing that inline is enough to ANR on Chess. Schedule exactly
+        // one background load and render the normal inert placeholder until it finishes.
+        if (widgetProgramLoads.add(lookupKey)) {
+            val recordKey = e.widgetRecordKey
+            val sourceHash = expected
+            val profileAtStart = vault.currentProfileId()
+            widgetLoadScope.launch {
+                val started = System.currentTimeMillis()
+                try {
+                    val pkg = when {
+                        localId != null -> widgetRepo.find(localId)
+                        sourceHash.isNotBlank() -> widgetRepo.findBySourceHash(sourceHash)
+                        else -> null
+                    }
+                    if (pkg != null && (sourceHash.isBlank() || pkg.manifest.sourceHash.equals(sourceHash, ignoreCase = true))) {
+                        val program = withContext(Dispatchers.Default) {
+                            VeilWidgetVerifier.verifyBytecode(pkg.bytecode).program
+                        }
+                        if (program != null && profileAtStart != null && profileAtStart == vault.currentProfileId()) {
+                            withContext(Dispatchers.Main.immediate) {
+                                // Re-check after switching dispatchers: account changes clear the
+                                // cache and a stale previous-account loader must never repopulate it.
+                                if (profileAtStart != vault.currentProfileId()) return@withContext
+                                val value = pkg.manifest.sourceHash to program
+                                widgetProgramCache[pkg.manifest.widgetId] = value
+                                widgetProgramCache[lookupKey] = value
+                                widgetProgramCache["source:${pkg.manifest.sourceHash.lowercase()}"] = value
+                                renderRevision++
+                                uiRevision++
+                            }
+                            WeaveDiagnostics.event(
+                                context,
+                                "WIDGET_RENDER_PREPARE",
+                                "name=${pkg.manifest.name.take(80)} source_bytes=${pkg.source.toByteArray(Charsets.UTF_8).size} total_ms=${System.currentTimeMillis() - started}"
+                            )
+                        }
+                    }
+                } catch (t: Throwable) {
+                    WeaveDiagnostics.event(
+                        context,
+                        "WIDGET_RENDER_PREPARE_FAILED",
+                        "record=${recordKey.take(80)} exception=${t::class.java.simpleName}:${t.message.orEmpty().replace('\n', ' ').take(160)}"
+                    )
+                } finally {
+                    widgetProgramLoads.remove(lookupKey)
+                }
+            }
+        }
+        return null
+    }
+    fun primeWidgetProgram(pkg: WidgetPackage, program: WidgetProgram) {
+        widgetProgramCache[pkg.manifest.widgetId] = pkg.manifest.sourceHash to program
     }
     private fun foregroundParent(): Element? {
         val root = doc.pages.getOrNull(pageIndex)?.root ?: return null
@@ -737,7 +975,11 @@ class EditorState(private val context: Context) : PrivateVault.Participant {
         e.widgetDefaultWidth = dw.toLong(); e.widgetDefaultHeight = dh.toLong(); e.widgetWarnOnResize = pkg.manifest.warnOnResize
         selectedId = e.id
         refreshAutoName(e)
-        runCatching { VeilWidgetBytecode.decode(pkg.bytecode) }.getOrNull()?.let { widgetProgramCache[pkg.manifest.widgetId] = pkg.manifest.sourceHash to it }
+        if (widgetProgramCache[pkg.manifest.widgetId]?.first != pkg.manifest.sourceHash) {
+            VeilWidgetVerifier.verifyBytecode(pkg.bytecode).program?.let {
+                widgetProgramCache[pkg.manifest.widgetId] = pkg.manifest.sourceHash to it
+            }
+        }
         widgetReplaceTargetId = null
         pendingWidgetBoxResize = null
         showWidgetPicker = false
@@ -793,7 +1035,15 @@ class EditorState(private val context: Context) : PrivateVault.Participant {
     }
     fun acceptCurrentWidgetVersion(e: Element) {
         val pkg=widgetPackageFor(e)?:return
-        pushUndo(); e.widgetSourceHash=pkg.manifest.sourceHash; e.widgetDefaultWidth=pkg.manifest.defaultWidth.toLong(); e.widgetDefaultHeight=pkg.manifest.defaultHeight.toLong(); e.widgetWarnOnResize=pkg.manifest.warnOnResize; invalidate()
+        pushUndo()
+        e.widgetSourceHash=pkg.manifest.sourceHash
+        e.widgetDefaultWidth=pkg.manifest.defaultWidth.toLong()
+        e.widgetDefaultHeight=pkg.manifest.defaultHeight.toLong()
+        e.widgetWarnOnResize=pkg.manifest.warnOnResize
+        // A changed source hash must be uploaded as a new source-only blob on the next Publish.
+        // Never leave a new hash pointing at an old public widget package.
+        e.widgetRecordKey="local-widget:${pkg.manifest.widgetId}"
+        invalidate()
     }
     fun chooseReplacementFor(e: Element) { widgetReplaceTargetId=e.id; showWidgetPicker=true }
 
@@ -852,7 +1102,7 @@ internal val DesignerColorScheme = lightColorScheme(
 )
 
 @Composable
-fun EditorScreen(state: EditorState, onBack: () -> Unit) {
+fun EditorScreen(state: EditorState, onOpenBasic: () -> Unit, onBack: () -> Unit) {
     var confirmDiscard by remember { mutableStateOf(false) }
     val entrySnapshot = remember { state.doc.deepCopy() }
 
@@ -877,7 +1127,16 @@ fun EditorScreen(state: EditorState, onBack: () -> Unit) {
             val availableWidth: Dp = maxWidth
             val panelWidth: Dp = minOf(370.dp, availableWidth * .42f)
             Column(Modifier.fillMaxSize()) {
-                EditorHeader(state, onDiscard = { confirmDiscard = true }, onDone = { state.persistActive(); onBack() })
+                EditorHeader(
+                    state = state,
+                    onDiscard = { confirmDiscard = true },
+                    onOpenBasic = {
+                        state.persistActive()
+                        state.setPreferredEditorAdvanced(false)
+                        onOpenBasic()
+                    },
+                    onDone = { state.persistActive(); onBack() },
+                )
                 Box(Modifier.weight(1f).fillMaxWidth().clipToBounds()) {
                     PageWorkspace(state, Modifier.fillMaxSize())
                     if (!state.panelCollapsed) {
@@ -928,7 +1187,12 @@ fun EditorScreen(state: EditorState, onBack: () -> Unit) {
 }
 
 @Composable
-private fun EditorHeader(state: EditorState, onDiscard: () -> Unit, onDone: () -> Unit) {
+private fun EditorHeader(
+    state: EditorState,
+    onDiscard: () -> Unit,
+    onOpenBasic: () -> Unit,
+    onDone: () -> Unit,
+) {
     val page = state.doc.pages[state.pageIndex]
     Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 1.dp) {
         Row(Modifier.fillMaxWidth().height(54.dp).padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -936,6 +1200,9 @@ private fun EditorHeader(state: EditorState, onDiscard: () -> Unit, onDone: () -
             Column(Modifier.weight(1f)) {
                 Text(state.doc.profileName, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, maxLines = 1)
                 Text(stringResource(R.string.workspace_page, page.name), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            TextButton(onClick = onOpenBasic, contentPadding = PaddingValues(horizontal = 8.dp)) {
+                Text("Basic", maxLines = 1, softWrap = false)
             }
             TextButton(onClick = { state.showWidgetStudio = true }) { Text("\u2318", style = MaterialTheme.typography.titleMedium) }
             Button(onClick = onDone, contentPadding = PaddingValues(horizontal = 14.dp)) { Text("Done") }
@@ -979,6 +1246,8 @@ private fun PageWorkspace(state:EditorState,modifier:Modifier=Modifier){
     val page=state.doc.pages[state.pageIndex]
     val cam=state.cameraTarget()
     var workspaceZoom by remember(state.pageIndex) { mutableFloatStateOf(1f) }
+    var workspacePan by remember(state.pageIndex) { mutableStateOf(Offset.Zero) }
+    val density = LocalDensity.current
     val left by animateFloatAsState(cam.x,tween(220),label="cameraLeft")
     val top by animateFloatAsState(cam.y,tween(220),label="cameraTop")
     val width by animateFloatAsState(cam.w,tween(220),label="cameraWidth")
@@ -1023,19 +1292,43 @@ private fun PageWorkspace(state:EditorState,modifier:Modifier=Modifier){
         val widthByHeight=usableH*page.aspectRatio
         val pageW=minOf(usableW,widthByHeight)
         val pageH=pageW/page.aspectRatio
+        val pageWidthPx = with(density) { pageW.toPx() }
+        val pageHeightPx = with(density) { pageH.toPx() }
+        val viewportWidthPx = with(density) { maxWidth.toPx() }
+        val viewportHeightPx = with(density) { maxHeight.toPx() }
+        fun clampViewportPan(next: Offset): Offset {
+            val maxX = max(0f, (pageWidthPx * workspaceZoom - viewportWidthPx) / 2f)
+            val maxY = max(0f, (pageHeightPx * workspaceZoom - viewportHeightPx) / 2f)
+            return Offset(next.x.coerceIn(-maxX, maxX), next.y.coerceIn(-maxY, maxY))
+        }
+        LaunchedEffect(workspaceZoom, pageWidthPx, pageHeightPx, viewportWidthPx, viewportHeightPx) {
+            workspacePan = clampViewportPan(workspacePan)
+        }
         Surface(
             modifier = Modifier
                 .size(pageW,pageH)
                 .graphicsLayer {
                     scaleX = workspaceZoom
                     scaleY = workspaceZoom
+                    translationX = workspacePan.x
+                    translationY = workspacePan.y
                 },
             shape = RoundedCornerShape(12.dp),
             color = Color.White,
             shadowElevation = 10.dp
         ) {
             Box(Modifier.fillMaxSize().border(1.dp,MaterialTheme.colorScheme.outlineVariant,RoundedCornerShape(12.dp))){
-                ProfileCanvas(state,renderRevision,NRect(left,top,width,height),Modifier.fillMaxSize())
+                ProfileCanvas(
+                    state,
+                    renderRevision,
+                    NRect(left,top,width,height),
+                    Modifier.fillMaxSize(),
+                    onViewportPan = { delta ->
+                        // Empty-canvas drags pan the viewport. Dragging an actual item still moves
+                        // that item, so the two gestures never fight each other.
+                        workspacePan = clampViewportPan(workspacePan + Offset(delta.x * workspaceZoom, delta.y * workspaceZoom))
+                    }
+                )
                 if(state.mode==EditMode.Foreground){
                     Surface(
                         color=MaterialTheme.colorScheme.surface.copy(alpha=.94f),
@@ -1060,7 +1353,7 @@ private fun PageWorkspace(state:EditorState,modifier:Modifier=Modifier){
             shape = RoundedCornerShape(999.dp),
             tonalElevation = 2.dp,
             modifier = Modifier.align(Alignment.TopCenter).padding(top = 10.dp)
-                .clickable { workspaceZoom = 1f }
+                .clickable { workspaceZoom = 1f; workspacePan = Offset.Zero }
         ) {
             Text(
                 stringResource(R.string.zoom_hint,(workspaceZoom * 100).roundToInt()),
@@ -1073,7 +1366,13 @@ private fun PageWorkspace(state:EditorState,modifier:Modifier=Modifier){
 }
 
 @Composable
-private fun ProfileCanvas(state:EditorState,renderRevision:Int,camera:NRect,modifier:Modifier){
+private fun ProfileCanvas(
+    state:EditorState,
+    renderRevision:Int,
+    camera:NRect,
+    modifier:Modifier,
+    onViewportPan:(Offset)->Unit = {}
+){
     val renderStrings=RenderStrings(
         mediaKinds=listOf(stringResource(R.string.media_image),stringResource(R.string.media_audio),stringResource(R.string.media_video)),
         mediaSuffix=stringResource(R.string.media_preview_suffix),
@@ -1084,17 +1383,22 @@ private fun ProfileCanvas(state:EditorState,renderRevision:Int,camera:NRect,modi
         Canvas(
             Modifier.fillMaxSize()
                 .pointerInput(state.pageIndex,state.mode,state.focusedBoxId,camera){
+                    var movingItem = false
                     detectDragGestures(
                         onDragStart={p->
                             val nx=camera.x+(p.x/size.width)*camera.w
                             val ny=camera.y+(p.y/size.height)*camera.h
-                            state.beginDrag(nx,ny)
+                            movingItem = state.beginDrag(nx,ny)
                         },
-                        onDragEnd=state::endDrag,
-                        onDragCancel=state::endDrag
+                        onDragEnd={ state.endDrag(); movingItem = false },
+                        onDragCancel={ state.endDrag(); movingItem = false }
                     ){change,dragAmount->
                         change.consume()
-                        state.dragBy((dragAmount.x/size.width)*camera.w,(dragAmount.y/size.height)*camera.h)
+                        if (movingItem) {
+                            state.dragBy((dragAmount.x/size.width)*camera.w,(dragAmount.y/size.height)*camera.h)
+                        } else {
+                            onViewportPan(dragAmount)
+                        }
                     }
                 }
                 .pointerInput(state.pageIndex,state.mode,state.focusedBoxId,camera){
@@ -1359,22 +1663,59 @@ private fun ToolStrip(state:EditorState, modifier: Modifier = Modifier){
                     drawCube = mode == EditMode.Boxes
                 )
             }
-            VerticalDivider(Modifier.height(54.dp).padding(horizontal=5.dp))
-            Text(
-                stringResource(R.string.add_label),
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 2.dp)
-            )
-            state.allowedTools().forEach { tool ->
+
+            // While editing inside a box, selecting one of its contents creates a fourth
+            // context tile (Text, Link, Button, etc.) immediately to the right of Contents.
+            // At that point the inspector is the editing surface for the object, so the
+            // add-tools strip is hidden until the box itself/empty canvas is selected again.
+            val selected = state.selected()
+            val contentItemSelected = state.mode == EditMode.Foreground &&
+                selected != null && selected.id != state.focusedBoxId
+            if (contentItemSelected && selected != null) {
+                val label = when (selected.type) {
+                    ElementType.Text -> stringResource(R.string.item_kind_text)
+                    ElementType.Link -> stringResource(R.string.item_kind_link)
+                    ElementType.Button -> stringResource(R.string.item_kind_button)
+                    ElementType.Block -> stringResource(R.string.item_kind_box)
+                    ElementType.Stamp -> stringResource(R.string.item_kind_stamp)
+                    ElementType.Media -> stringResource(R.string.item_kind_media)
+                    ElementType.Widget -> stringResource(R.string.item_kind_widget)
+                }
+                val glyph = when (selected.type) {
+                    ElementType.Text -> "T"
+                    ElementType.Link -> "↗"
+                    ElementType.Button -> "▰"
+                    ElementType.Block -> ""
+                    ElementType.Stamp -> "★"
+                    ElementType.Media -> "▧"
+                    ElementType.Widget -> "⌘"
+                }
                 ToolbarTile(
-                    glyph = tool.symbol,
-                    label = stringResource(tool.compactRes),
-                    active = tool == state.tool,
-                    onClick = { state.add(tool) },
-                    description = state.text(tool.descriptionRes),
-                    drawCube = tool == EditorTool.Block
+                    glyph = glyph,
+                    label = label,
+                    active = true,
+                    onClick = { state.panelCollapsed = false },
+                    description = state.text(R.string.selected_item_description, label),
+                    drawCube = selected.type == ElementType.Block
                 )
+            } else {
+                VerticalDivider(Modifier.height(54.dp).padding(horizontal=5.dp))
+                Text(
+                    stringResource(R.string.add_label),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 2.dp)
+                )
+                state.allowedTools().forEach { tool ->
+                    ToolbarTile(
+                        glyph = tool.symbol,
+                        label = stringResource(tool.compactRes),
+                        active = tool == state.tool,
+                        onClick = { state.add(tool) },
+                        description = state.text(tool.descriptionRes),
+                        drawCube = tool == EditorTool.Block
+                    )
+                }
             }
         }
     }
@@ -1530,8 +1871,13 @@ private fun PropertiesPanel(state:EditorState,modifier:Modifier=Modifier){
                 ) { Text("›", style = MaterialTheme.typography.titleLarge) }
             }
             HorizontalDivider()
-            Column(Modifier.fillMaxWidth().padding(horizontal=10.dp,vertical=8.dp),verticalArrangement=Arrangement.spacedBy(7.dp)){
-                ModeStatus(state)
+            // Pages & layers now occupies the old mode-status slot directly below Inspector.
+            // Cap its expanded height so the selection tree cannot push the quick actions or
+            // property sections completely off-screen on profiles with many pages.
+            Box(Modifier.fillMaxWidth().heightIn(max = 260.dp).verticalScroll(rememberScrollState()).padding(horizontal=10.dp,vertical=8.dp)) {
+                HierarchyTree(state)
+            }
+            Column(Modifier.fillMaxWidth().padding(horizontal=10.dp,vertical=6.dp),verticalArrangement=Arrangement.spacedBy(7.dp)){
                 QuickObjectActions(state)
             }
             HorizontalDivider()
@@ -1539,17 +1885,17 @@ private fun PropertiesPanel(state:EditorState,modifier:Modifier=Modifier){
                 Modifier.weight(1f).fillMaxWidth().verticalScroll(scroll).padding(12.dp),
                 verticalArrangement=Arrangement.spacedBy(10.dp)
             ) {
-                HierarchyTree(state)
                 val depthEnabled=state.depthTopFirst().isNotEmpty()
                 val moveSizeEnabled=!(state.mode==EditMode.Foreground&&e.id==state.focusedBoxId)
                 val appearanceEnabled=when{
-                    state.mode==EditMode.Foreground&&e.id==state.focusedBoxId->false
                     state.isPageRoot(e)&&state.mode!=EditMode.Background->false
                     else->e.type in listOf(ElementType.Block,ElementType.Stamp,ElementType.Text,ElementType.Button)
                 }
                 val contentEnabled=e.type in listOf(ElementType.Text,ElementType.Link,ElementType.Button,ElementType.Media,ElementType.Widget)
+                val moveSizeTitle = if (state.mode == EditMode.Background && state.isPageRoot(e))
+                    stringResource(R.string.section_page_size) else stringResource(R.string.section_move_size)
                 Section(stringResource(R.string.section_depth),state.sectionExpanded(PanelSection.Depth),{state.toggleSection(PanelSection.Depth)},stringResource(R.string.depth_help),depthEnabled){DepthPanel(state)}
-                Section(stringResource(R.string.section_move_size),state.sectionExpanded(PanelSection.MoveSize),{state.toggleSection(PanelSection.MoveSize)},stringResource(R.string.move_size_help),moveSizeEnabled){MoveSizePanel(state,e)}
+                Section(moveSizeTitle,state.sectionExpanded(PanelSection.MoveSize),{state.toggleSection(PanelSection.MoveSize)},stringResource(R.string.move_size_help),moveSizeEnabled){MoveSizePanel(state,e)}
                 Section(stringResource(R.string.section_appearance),state.sectionExpanded(PanelSection.Appearance),{state.toggleSection(PanelSection.Appearance)},stringResource(R.string.appearance_help),appearanceEnabled){AppearancePanel(state,e)}
                 if(contentEnabled)
                     Section(stringResource(R.string.section_content),state.sectionExpanded(PanelSection.Content),{state.toggleSection(PanelSection.Content)},stringResource(R.string.content_help),true){ContentPanel(state,e)}
@@ -1699,33 +2045,6 @@ private fun HierarchyRow(state: EditorState, entry: HierarchyEntry) {
 }
 
 @Composable
-private fun ModeStatus(state:EditorState){
-    Surface(
-        color=MaterialTheme.colorScheme.secondaryContainer.copy(alpha=.74f),
-        shape=RoundedCornerShape(11.dp),
-        modifier=Modifier.fillMaxWidth().border(1.dp,MaterialTheme.colorScheme.outlineVariant,RoundedCornerShape(11.dp))
-    ){
-        Row(Modifier.fillMaxWidth().padding(horizontal=9.dp,vertical=7.dp),verticalAlignment=Alignment.CenterVertically){
-            if(state.mode==EditMode.Background){
-                Text("◩",style=MaterialTheme.typography.titleLarge,modifier=Modifier.width(34.dp),textAlign=TextAlign.Center)
-                Text(stringResource(R.string.mode_background),fontWeight=FontWeight.SemiBold,modifier=Modifier.weight(1f))
-            }else{
-                Column(horizontalAlignment=Alignment.CenterHorizontally,modifier=Modifier.width(45.dp)){
-                    IsometricCubeIcon(Modifier.size(24.dp),MaterialTheme.colorScheme.primary)
-                    Text(stringResource(R.string.this_box_top),style=MaterialTheme.typography.labelSmall,lineHeight=10.sp)
-                    Text(stringResource(R.string.this_box_bottom),style=MaterialTheme.typography.labelSmall,lineHeight=10.sp)
-                }
-                Spacer(Modifier.weight(1f))
-                if(state.mode==EditMode.Boxes&&state.findElement(state.focusedBoxId)!=null)
-                    TextButton(onClick={state.enterBox(state.focusedBoxId!!)}){Text(stringResource(R.string.edit_contents),maxLines=1)}
-                if(state.mode==EditMode.Foreground)
-                    TextButton(onClick=state::exitBox){Text(stringResource(R.string.exit_box),maxLines=1)}
-            }
-        }
-    }
-}
-
-@Composable
 private fun QuickObjectActions(state:EditorState){
     Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(8.dp)){
         OutlinedButton(
@@ -1738,6 +2057,12 @@ private fun QuickObjectActions(state:EditorState){
             modifier=Modifier.weight(1f).height(42.dp).semantics{contentDescription=state.text(R.string.duplicate)},
             contentPadding=PaddingValues(0.dp)
         ){Box(Modifier.fillMaxSize(),contentAlignment=Alignment.Center){Text("⧉",style=MaterialTheme.typography.titleMedium)}}
+        OutlinedButton(
+            onClick=state::undo,
+            enabled=state.canUndo(),
+            modifier=Modifier.weight(1f).height(42.dp).semantics{contentDescription=state.text(R.string.undo)},
+            contentPadding=PaddingValues(0.dp)
+        ){Box(Modifier.fillMaxSize(),contentAlignment=Alignment.Center){Text("↶",style=MaterialTheme.typography.titleMedium)}}
     }
 }
 
@@ -1809,7 +2134,6 @@ private fun MoveSizePanel(state:EditorState,e:Element){
 
 @Composable
 private fun AppearancePanel(state:EditorState,e:Element){
-    if(state.mode==EditMode.Foreground&&e.id==state.focusedBoxId)return
     if(state.isPageRoot(e)&&state.mode!=EditMode.Background)return
     when(e.type){
         ElementType.Block -> BlockAppearance(state,e)
@@ -2162,7 +2486,23 @@ private fun MediaProperties(state:EditorState,e:Element){
     )
     BufferedEditorTextField(
         key="${e.id}:mediaRecord",value=e.mediaRecordKey,label=stringResource(R.string.media_record_key),modifier=Modifier.fillMaxWidth(),
-        onLive={v->state.continuousEdit{it.mediaRecordKey=v}},onFinished=state::endContinuous
+        onLive={v->
+            val detected=parseDetectedLink(v)
+            state.continuousEdit{element->
+                when(detected){
+                    is DetectedLink.Media->{
+                        val compatible=(element.mediaKind==MediaKind.Image&&detected.mediaType==WeaveObjectType.Image)||
+                            (element.mediaKind==MediaKind.Audio&&detected.mediaType==WeaveObjectType.Audio)
+                        if(compatible){
+                            element.mediaRecordKey=detected.recordKey
+                            element.mediaContentHash=detected.sha256
+                        }else element.mediaRecordKey=v
+                    }
+                    is DetectedLink.Dht->element.mediaRecordKey=detected.recordKey
+                    else->element.mediaRecordKey=v
+                }
+            }
+        },onFinished=state::endContinuous
     )
 }
 
@@ -2335,8 +2675,8 @@ private fun DrawScope.drawWidgetProgramStatic(program: WidgetProgram, r: Rect, p
         )
         when (n.type) {
             WidgetNodeType.Box -> drawRect(Color(n.backgroundArgb), nr.topLeft, nr.size)
-            WidgetNodeType.Text, WidgetNodeType.Button -> {
-                if (n.type == WidgetNodeType.Button) {
+            WidgetNodeType.Text, WidgetNodeType.Button, WidgetNodeType.TextInput -> {
+                if (n.type != WidgetNodeType.Text) {
                     drawRoundRect(Color(n.backgroundArgb), nr.topLeft, nr.size, CornerRadius(6f, 6f))
                     drawRoundRect(Color(0x557D3440), nr.topLeft, nr.size, CornerRadius(6f,6f), style = Stroke(1f))
                 }
@@ -2351,11 +2691,6 @@ private fun DrawScope.drawWidgetProgramStatic(program: WidgetProgram, r: Rect, p
                     textAlign = when(n.align){WidgetTextAlign.Left->TextAlignMode.Left;WidgetTextAlign.Center->TextAlignMode.Center;WidgetTextAlign.Right->TextAlignMode.Right}
                 )
                 drawTextWrapped(n.text, nr, fake, n.textArgb, when(n.align){WidgetTextAlign.Left->Layout.Alignment.ALIGN_NORMAL;WidgetTextAlign.Center->Layout.Alignment.ALIGN_CENTER;WidgetTextAlign.Right->Layout.Alignment.ALIGN_OPPOSITE})
-            }
-            WidgetNodeType.Stream -> {
-                drawRoundRect(Color(0xFF242A31), nr.topLeft, nr.size, CornerRadius(6f,6f))
-                val fake = Element(type=ElementType.Text,fontSize=12f,textAlign=TextAlignMode.Center,textArgb=0xFFFFFFFF.toInt())
-                drawTextWrapped("▶\n${n.streamLabel}\n$pausedText", nr, fake, 0xFFFFFFFF.toInt(), Layout.Alignment.ALIGN_CENTER)
             }
         }
     }
@@ -2387,13 +2722,112 @@ private fun WidgetBoxResizeDialog(state: EditorState) {
 
 @Composable
 private fun WidgetPickerDialog(state: EditorState) {
-    val packages = remember(state.showWidgetPicker, state.uiRevision) { state.widgetRepo.all() }
+    var packages by remember(state.showWidgetPicker) { mutableStateOf<List<WidgetPackage>>(emptyList()) }
+    var libraryLoading by remember(state.showWidgetPicker) { mutableStateOf(true) }
+    var templateMenuOpen by remember(state.showWidgetPicker) { mutableStateOf(false) }
+    var preparingTemplateId by remember(state.showWidgetPicker) { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    val appContext = LocalContext.current.applicationContext
+    LaunchedEffect(state.showWidgetPicker) {
+        if (state.showWidgetPicker) {
+            libraryLoading = true
+            packages = withContext(Dispatchers.IO) { state.widgetRepo.all() }
+            libraryLoading = false
+        }
+    }
     AlertDialog(
-        onDismissRequest = { state.showWidgetPicker = false },
+        onDismissRequest = { if (preparingTemplateId == null) state.showWidgetPicker = false },
         title = { Text(stringResource(R.string.choose_widget)) },
         text = {
-            Column(Modifier.heightIn(max = 480.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(7.dp)) {
-                if (packages.isEmpty()) Text(stringResource(R.string.no_widgets), style = MaterialTheme.typography.bodySmall)
+            Column(Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                Text(stringResource(R.string.widget_built_in_templates), style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                Box(Modifier.fillMaxWidth()) {
+                    OutlinedButton(
+                        onClick = { if (preparingTemplateId == null) templateMenuOpen = true },
+                        enabled = preparingTemplateId == null,
+                        border = BorderStroke(2.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.72f)),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.30f)
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        val preparing = preparingTemplateId
+                        if (preparing != null) {
+                            CircularProgressIndicator(Modifier.size(17.dp), strokeWidth = 2.dp)
+                            Spacer(Modifier.width(8.dp))
+                            val name = WidgetTemplateCatalog.all.firstOrNull { it.id == preparing }?.name ?: preparing
+                            Text(stringResource(R.string.widget_preparing_template, name), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        } else {
+                            Text(stringResource(R.string.widget_choose_template))
+                        }
+                    }
+                    DropdownMenu(expanded = templateMenuOpen, onDismissRequest = { templateMenuOpen = false }) {
+                        WidgetTemplateCatalog.all.forEach { template ->
+                            DropdownMenuItem(
+                                enabled = preparingTemplateId == null,
+                                text = {
+                                    Column {
+                                        Text(template.name, fontWeight = FontWeight.SemiBold)
+                                        Text(
+                                            when (template.readiness) {
+                                                WidgetTemplateReadiness.Ready -> stringResource(R.string.widget_template_ready)
+                                                WidgetTemplateReadiness.HostScaffold -> stringResource(R.string.widget_template_host_scaffold)
+                                                WidgetTemplateReadiness.LanguageScaffold -> stringResource(R.string.widget_template_language_scaffold)
+                                            },
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                },
+                                onClick = {
+                                    templateMenuOpen = false
+                                    if (preparingTemplateId == null) {
+                                        preparingTemplateId = template.id
+                                        scope.launch {
+                                        val started = android.os.SystemClock.elapsedRealtime()
+                                        var compileMs = -1L
+                                        var saveMs = -1L
+                                        val result = runCatching {
+                                            val compileStarted = android.os.SystemClock.elapsedRealtime()
+                                            val prepared = withContext(Dispatchers.Default) { state.widgetRepo.prepareFromTemplate(template) }
+                                            compileMs = android.os.SystemClock.elapsedRealtime() - compileStarted
+                                            val saveStarted = android.os.SystemClock.elapsedRealtime()
+                                            withContext(Dispatchers.IO) { state.widgetRepo.savePrepared(prepared) }
+                                            saveMs = android.os.SystemClock.elapsedRealtime() - saveStarted
+                                            prepared
+                                        }
+                                        val elapsed = android.os.SystemClock.elapsedRealtime() - started
+                                        WeaveDiagnostics.event(
+                                            appContext,
+                                            "WIDGET_TEMPLATE_PREPARE",
+                                            "id=${template.id} ok=${result.isSuccess} source_bytes=${template.source.toByteArray(Charsets.UTF_8).size} compile_ms=$compileMs save_ms=$saveMs total_ms=$elapsed"
+                                        )
+                                        preparingTemplateId = null
+                                        result.onSuccess { prepared ->
+                                            state.primeWidgetProgram(prepared.pkg, prepared.program)
+                                            state.placeWidget(prepared.pkg)
+                                        }.onFailure {
+                                            state.toast(R.string.widget_template_prepare_failed, template.name)
+                                        }
+                                        }
+                                    }
+                                }
+                            )
+                        }
+                    }
+                }
+                Text(stringResource(R.string.widget_templates_are_source), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+                HorizontalDivider()
+                Text(stringResource(R.string.widget_your_library), style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                if (libraryLoading) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                        Text(stringResource(R.string.widget_loading_library), style = MaterialTheme.typography.bodySmall)
+                    }
+                } else if (packages.isEmpty()) {
+                    Text(stringResource(R.string.no_widgets), style = MaterialTheme.typography.bodySmall)
+                }
                 packages.forEach { pkg ->
                     Surface(
                         color = MaterialTheme.colorScheme.surfaceVariant,
@@ -2412,16 +2846,23 @@ private fun WidgetPickerDialog(state: EditorState) {
             }
         },
         confirmButton = {},
-        dismissButton = { TextButton(onClick = { state.showWidgetPicker = false }) { Text(stringResource(R.string.cancel)) } }
+        dismissButton = {
+            TextButton(
+                enabled = preparingTemplateId == null,
+                onClick = { state.showWidgetPicker = false }
+            ) { Text(stringResource(R.string.cancel)) }
+        }
     )
 }
 
 @Composable
 private fun WidgetProperties(state: EditorState, e: Element) {
-    val pkg = state.widgetPackageFor(e)
+    @Suppress("UNUSED_VARIABLE") val packageRevision = state.uiRevision
+    LaunchedEffect(e.id, e.widgetRecordKey, e.widgetSourceHash) { state.requestWidgetProgram(e) }
+    val pkg = state.widgetPackageCachedFor(e)
     val size = state.widgetLogicalSize(e)
     if (pkg == null && e.widgetRecordKey.isNotBlank()) {
-        Text(stringResource(R.string.widget_missing_local), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+        Text("Loading widget details…", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
     }
     if (pkg != null && e.widgetSourceHash.isNotBlank() && pkg.manifest.sourceHash != e.widgetSourceHash) {
         Text(stringResource(R.string.widget_source_mismatch), color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodySmall)

@@ -1,0 +1,25 @@
+Weave Phase 6.4 static validation
+=================================
+
+Checked source invariants:
+
+[PASS] EditorState.onVaultDetached() no longer assigns localizedDefaultProfile().
+[PASS] Same-account vault reattach preserves the current document/editor state.
+[PASS] A different attached profile still loads that account's encrypted profile.
+[PASS] Persist attempts while the vault is unavailable are deferred and retried on same-account attach.
+[PASS] SocialUiState has a separate connected flag; reconnect reset retains the last confirmed mainDht.
+[PASS] WeaveShell remains composed for a known identity while connected=false and displays a reconnect banner.
+[PASS] Public downloadBlob() reconstructs data using <=256 KiB read_blob_range requests.
+[PASS] Private blob reads use <=256 KiB ranges and validate final length.
+[PASS] rawRequest() records failure metadata without recording request/response payloads.
+[PASS] Small/fast successful RPCs are omitted from the persistent breadcrumb log to avoid creating new I/O jank.
+[PASS] Copy diagnostics includes lifecycle/RPC breadcrumbs.
+[PASS] Fatal Java/Kotlin exceptions are logged then delegated to Android's previous uncaught-exception handler.
+[PASS] Kotlin command-line parser run did not report syntax-token/"expecting" errors in the changed files; unresolved Android/Compose/project symbols are expected without the Android classpath.
+
+Full Android compile attempt:
+
+[NOT AVAILABLE IN THIS ENVIRONMENT]
+`./gradlew :app:compileDebugKotlin --offline` attempted to obtain Gradle 9.4.1, but the distribution is not cached and this sandbox has no access to services.gradle.org. Therefore this file does not claim a successful Android Gradle build.
+[PASS] AppDiagnostics.kt compiled successfully with a minimal Android Context stub; MainActivity.kt + AppDiagnostics.kt compiled successfully with minimal Activity/Bundle/setContent stubs.
+[PASS] Profile storage/load errors are surfaced as an in-app warning rather than silently replaced by a starter-profile success state.

@@ -1,0 +1,43 @@
+Weave Phase 6.10.2 — Startup/profile gate + Widget Studio load fix
+Static validation
+Date: 2026-09-18
+
+1. Pure Kotlin widget core compilation: PASS
+   HashUtils.kt, WidgetModel.kt, WidgetNetworkWire.kt, WidgetExpressions.kt,
+   WidgetLanguage.kt, WidgetVerifier.kt, WidgetTemplates.kt, WidgetPackageCodec.kt.
+
+2. Android resource XML parsing: PASS
+
+3. Gradle wrapper prerequisite: PASS
+   gradle/wrapper/gradle-wrapper.jar present
+
+4. Profile gate hardening: STATIC REVIEW PASS
+   - transient OnboardingState detach does not clear completed
+   - saved profile presence is Compose-observable
+   - first-run waits for authoritative profile/setup state
+   - inconsistent completed-with-missing-profile goes to recovery gate
+   - successful profile persistence marks profile present
+
+5. Cold profile widget rendering: STATIC REVIEW PASS
+   - widgetProgramFor() performs cache-only UI-thread read
+   - cold package/source preparation is scheduled once in a background scope
+   - VWB verification runs on Dispatchers.Default
+   - Compose/Canvas renders inert placeholder until cache completes
+   - WidgetProperties uses cache-only package lookup
+   - account/profile id is rechecked before a background widget load may populate caches
+
+6. Widget Studio large-widget behavior: STATIC REVIEW PASS
+   - initial repository enumeration/decode off main thread
+   - visible loading indicator for initial load
+   - compile/save + compile preview asynchronous
+   - library list load asynchronous
+   - visual edits no longer full-source compile on each change
+   - load failure handled in-band rather than rethrown
+
+7. Startup allocation/recomposition mitigation: STATIC REVIEW PASS
+   - persisted diagnostic line still written immediately
+   - SocialUiState debugLog tail refreshed no more than once per second
+
+8. Full Android Gradle compile: NOT RUN
+   The sandbox cannot download the requested Gradle 9.4.1 distribution.
+   Run build_project.bat on JDK 17+ / Android SDK 36.

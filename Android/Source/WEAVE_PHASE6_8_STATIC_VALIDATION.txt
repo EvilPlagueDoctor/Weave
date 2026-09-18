@@ -1,0 +1,61 @@
+Weave Phase 6.8 - Widget Multi-Action Window / Host Close / Syntax Guide
+Static & standalone validation
+2026-09-16
+
+RESULT: PASS for the available standalone/static checks.
+A complete Android Gradle build was not run in this environment because the Android build toolchain/Gradle 9.4.1 distribution is not available in the sandbox. The Gradle wrapper JAR has been restored from the prior working Weave snapshot so build_project.bat/gradlew can bootstrap Gradle normally on a development machine.
+
+Checks performed
+----------------
+1. Pure Kotlin widget core compile + smoke suite
+   Files include WidgetModel, WidgetExpressions, WidgetNetworkWire, WidgetLanguage,
+   WidgetVerifier, WidgetTemplates, and WidgetPackageCodec.
+   Result: PASS, 40 / 40 checks.
+
+   Added Phase 6.8 coverage:
+   - 17 declared button inputs compile (the old 16-input ceiling is gone);
+   - 33 declared inputs are rejected against the new 32-input ceiling;
+   - MAX_NETWORK_ACTIONS_IN_FLIGHT is 5;
+   - all bundled templates still compile and verify;
+   - VWB3 remains the local deterministic bytecode format;
+   - source-only publication/receipt still recompiles locally;
+   - strict wire rejection for >1 KiB text, a third input in one action, and control characters remains intact.
+
+2. Kotlin parser-level sanity on edited Android-heavy files
+   - SocialNetworkController.kt
+   - ProfileViewerScreen.kt
+   Invoked kotlinc without Android/project dependencies and checked stderr for parser errors
+   such as "expecting", "unexpected tokens", or unclosed syntax.
+   Result: no parser-style syntax errors found (unresolved Android/project references are expected in this check).
+
+3. Structural balance
+   - SocialNetworkController.kt: braces/parentheses/brackets balanced.
+   - ProfileViewerScreen.kt: braces/parentheses/brackets balanced.
+
+4. Resource XML parse
+   Result: PASS (9 XML files parsed).
+
+5. Widget streaming surface search
+   Result: no active WidgetNodeType.Stream, HOST_STREAM opcode, Live Stream template,
+   or widget stream(...) syntax was found.
+
+6. DOCX guide QA
+   - Weave_Widget_Language_V1_1_Syntax_and_Kotlin_Runtime_Guide.docx
+   - Rendered to 9 pages with the canonical DOCX renderer.
+   - Every page visually inspected after table no-split/repeating-header cleanup.
+   Result: PASS.
+
+Phase 6.8 behavior notes
+------------------------
+- Public widgets may declare up to 32 network inputs; button inputs count toward the same limit.
+- One network action still carries at most two declared inputs.
+- A paired session may now have up to five unacknowledged input actions in flight.
+  This is a bounded in-flight window, not an atomic five-event packet. Each action retains
+  its own canonical event hash and exact acknowledgement.
+- Slot reservation uses an AtomicInteger so rapid taps cannot race past the five-action cap.
+- Every activated profile widget has a host-owned X overlay. Pressing X calls
+  WidgetNetworkHost.close(), clears pending local invite/action/pairing state, removes the
+  runtime from Compose, and returns to the inert click-to-load placeholder.
+- Closing a runtime does not erase already-published DHT history.
+- The bundled Chess example can send FROM and TO square actions back-to-back without waiting
+  for acknowledgement of the first action.

@@ -1,0 +1,56 @@
+Weave Phase 6.6 — Public Widget Networking V1
+Static / standalone validation summary
+
+PASS: widget core standalone Kotlin compile
+  WidgetModel.kt
+  WidgetLanguage.kt
+  WidgetVerifier.kt
+  WidgetNetworkWire.kt
+  WidgetTemplates.kt
+  WidgetPackageCodec.kt
+
+PASS: WidgetNetworkManager standalone compile with minimal Android/daemon/private-vault stubs.
+  The previously found typed-return and ArrayDeque compatibility errors were corrected.
+
+PASS: WidgetSync standalone compile with stubs/coroutines.
+
+PASS: ProfileModel.kt + ProfileCodec.kt standalone compile.
+
+PASS: Phase 6.6 widget smoke tests — 34 checks.
+  - all bundled templates compile and independently verify
+  - offline source cannot use public network actions
+  - >16 declared network inputs is rejected
+  - >2 simultaneous input values is rejected
+  - >1024 UTF-8 byte network text is rejected
+  - canonical network event encode/decode round-trip
+  - trailing bytes rejected
+  - public signal encode/decode round-trip
+  - Widget Data DHT summary encode/decode round-trip
+  - source-only widget package round-trip
+  - PublicNetwork capability re-derived locally
+  - retirement tombstone includes machine-readable state + disco message
+
+PASS: all app/src/main resource XML files parse successfully (10 files).
+
+PASS: Android string-resource static scan.
+  Kotlin R.string references: 326
+  defined string resources: 346
+  missing: 0
+
+PASS: active app/src/main has no old widget media-streaming symbols matching:
+  HostStream
+  stream_source
+  Live Stream
+  WidgetNodeType.Stream
+  widget_stream_
+  Gaming Stream
+  host:gaming
+
+NOTE: references to generic daemon/subscription "streams" are unrelated to removed media widget streaming and remain intentionally.
+
+PASS: version metadata updated:
+  versionCode 29
+  versionName 0.9.4-widget-public-network-v1
+
+FULL ANDROID GRADLE BUILD: NOT RUN IN THIS ENVIRONMENT.
+The project wrapper requests Gradle 9.4.1. That distribution is not cached here and the environment cannot resolve services.gradle.org, so ./gradlew cannot start. This validation therefore does not replace a normal Android Studio/Gradle build on the development machine.

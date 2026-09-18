@@ -5,6 +5,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.concurrent.Executors
 
 /**
  * Creator/claimer branch persistence and transport.
@@ -21,6 +22,7 @@ import java.util.UUID
 class GroupBranchNetwork(
     private val client: DaemonClient,
     private val store: GroupStore,
+    private val logger: (String) -> Unit = {},
 ) {
     data class OwnedBranch(
         val storeId: String,
@@ -51,7 +53,10 @@ class GroupBranchNetwork(
             eventRoot = owned.eventChain.recordKey,
             indexRoot = owned.indexRecordKey,
             generation = (previous?.generation ?: 0L) + 1L,
+            featured = previous?.featured ?: publicGroup.featured,
+            pinnedPostIds = previous?.pinnedPostIds.orEmpty(),
             moderators = previous?.moderators.orEmpty(),
+            bannedMainDhts = previous?.bannedMainDhts.orEmpty(),
             knownBranches = mergeBranches(
                 previous?.knownBranches.orEmpty(),
                 GroupBranchPointer(
@@ -76,7 +81,7 @@ class GroupBranchNetwork(
                 )
             )
         }
-        store.rememberBranch(header.pointer(), selectIfNone = true, ownedByMe = true)
+        store.rememberBranch(header.pointer(), selectIfNone = false, ownedByMe = true)
         store.upsertPulse(pulse, branchId)
         return publicGroup to header
     }
@@ -105,10 +110,23 @@ class GroupBranchNetwork(
             eventRoot = owned.eventChain.recordKey,
             indexRoot = owned.indexRecordKey,
             generation = 1,
+            featured = creatorHeader.featured,
+            pinnedPostIds = creatorHeader.pinnedPostIds,
             knownBranches = listOf(pointerToCreator),
         )
         writeHeader(owned.storeId, header)
-        writePulse(owned.storeId, GroupPulse(group.groupId, updatedAt = now))
+
+        // A claim starts as a moderation copy of what the Original currently exposes, rather than
+        // an empty group. From this point forward the claim is independent and may keep/remove
+        // different items. The DHT refs are copied, not the media bytes themselves.
+        val creatorPulse = readPulse(creatorHeader.branchRoot, force = true)
+        val initialPulse = (creatorPulse ?: GroupPulse(group.groupId)).copy(
+            generation = 1,
+            updatedAt = now,
+        )
+        writePulse(owned.storeId, initialPulse)
+        store.upsertPulse(initialPulse, branchId)
+
         appendEvent(
             owned,
             GroupEvent(
@@ -122,6 +140,26 @@ class GroupBranchNetwork(
                 metadata = mapOf("creator_root" to creatorHeader.creatorRoot),
             )
         )
+
+        // Copy the Original's current visible index so posts/comments shown in the inherited Pulse
+        // can actually be opened on the new branch. Failures are per-entry; one stale ref must not
+        // prevent the claim itself from being created.
+        readVisibleEntries(creatorHeader.branchRoot, maxEntries = 1000).forEach { entry ->
+            val ref = entry.messageRef ?: return@forEach
+            runCatching {
+                applyDecision(
+                    header = header,
+                    postId = entry.postId,
+                    conversationId = entry.conversationId,
+                    postHash = entry.postHash,
+                    state = GroupPostState.Visible,
+                    messageRef = ref,
+                    actorMainDht = claimerMainDht,
+                    reason = "Inherited from Original when moderation was claimed",
+                )
+            }
+        }
+
         store.rememberBranch(header.pointer(), selectIfNone = false, ownedByMe = true)
         return header
     }
@@ -132,8 +170,14 @@ class GroupBranchNetwork(
         GroupBranchHeader.fromJson(JSONObject(bytes.decodeToString()))
     }.getOrNull()
 
-    fun readPulse(branchRoot: String): GroupPulse? = runCatching {
-        val result = client.readPublicStore(branchRoot, listOf(PULSE_SUBKEY), false)
+    /**
+     * Read the branch's current Pulse. The Pulse is the authoritative lightweight view of the
+     * current post list, so remote reads must force a DHT refresh rather than accepting a cached
+     * value indefinitely. This is particularly important for already-discovered groups: their
+     * branch root usually stays the same while subkey 1 changes as posts/comments are accepted.
+     */
+    fun readPulse(branchRoot: String, force: Boolean = true): GroupPulse? = runCatching {
+        val result = client.readPublicStore(branchRoot, listOf(PULSE_SUBKEY), force)
         val bytes = CommentChain.decodeValue(result.optJSONArray("values")?.optJSONObject(0)) ?: return null
         GroupPulse.fromJson(JSONObject(bytes.decodeToString()))
     }.getOrNull()
@@ -150,6 +194,31 @@ class GroupBranchNetwork(
      * the post ID. A full conversation view can batch buckets later; the Group Pulse remains the
      * cheap initial view.
      */
+    fun readVisibleEntries(
+        branchRoot: String,
+        conversationId: String? = null,
+        maxEntries: Int = 100,
+    ): List<GroupPostIndexEntry> = runCatching {
+        val header = readHeader(branchRoot) ?: return emptyList()
+        val wanted = (1 until INDEX_SUBKEYS).toList()
+        val values = client.readPublicStore(header.indexRoot, wanted, true).optJSONArray("values")
+            ?: return emptyList()
+        val out = mutableListOf<GroupPostIndexEntry>()
+        for (i in 0 until values.length()) {
+            val bytes = CommentChain.decodeValue(values.optJSONObject(i)) ?: continue
+            val entries = JSONObject(bytes.decodeToString()).optJSONArray("entries") ?: continue
+            for (j in 0 until entries.length()) {
+                val entry = entries.optJSONObject(j)?.let(GroupPostIndexEntry::fromJson) ?: continue
+                if (entry.state != GroupPostState.Visible || entry.messageRef == null) continue
+                if (conversationId != null && entry.conversationId != conversationId) continue
+                out += entry
+            }
+        }
+        out.distinctBy { it.postId }
+            .sortedByDescending { it.decidedAt }
+            .take(maxEntries.coerceIn(1, 500))
+    }.getOrElse { emptyList() }
+
     fun readPostDecision(branchRoot: String, postId: String): GroupPostIndexEntry? = runCatching {
         val header = readHeader(branchRoot) ?: return null
         val bucket = bucketFor(postId)
@@ -252,6 +321,98 @@ class GroupBranchNetwork(
         return entry
     }
 
+    fun publishPulse(header: GroupBranchHeader, pulse: GroupPulse) {
+        require(header.ownerMainDht == client.identity().optString("main_dht")) {
+            "Only this branch owner may publish its Pulse"
+        }
+        val owned = resolveOwned(header)
+        writePulse(owned.storeId, pulse)
+        store.upsertPulse(pulse, header.branchId)
+    }
+
+    fun setFeatured(
+        header: GroupBranchHeader,
+        slot: FeaturedSlot,
+        actorMainDht: String,
+    ): GroupBranchHeader {
+        require(header.ownerMainDht == client.identity().optString("main_dht"))
+        val grant = header.moderators.firstOrNull { it.moderatorMainDht == actorMainDht }
+        require(actorMainDht == header.ownerMainDht || grant?.canEditFeatured == true) {
+            "Actor may not edit the featured area on this branch"
+        }
+        val updated = header.copy(
+            generation = header.generation + 1,
+            featured = slot,
+        )
+        val owned = resolveOwned(header)
+        writeHeader(owned.storeId, updated)
+        appendEvent(
+            owned,
+            GroupEvent(
+                groupId = header.group.groupId,
+                branchId = header.branchId,
+                kind = GroupEventKind.FeaturedChanged,
+                actorMainDht = actorMainDht,
+                createdAt = System.currentTimeMillis(),
+                objectId = slot.ref?.objectId.orEmpty(),
+                objectHash = groupSha256Hex(slot.toJson().toString().encodeToByteArray()),
+            )
+        )
+        store.rememberBranchHeader(updated)
+        return updated
+    }
+
+    fun setPinned(
+        header: GroupBranchHeader,
+        postId: String,
+        pinned: Boolean,
+        actorMainDht: String,
+    ): GroupBranchHeader {
+        require(header.ownerMainDht == client.identity().optString("main_dht"))
+        val grant = header.moderators.firstOrNull { it.moderatorMainDht == actorMainDht }
+        require(actorMainDht == header.ownerMainDht || grant?.canPinPosts == true) {
+            "Actor may not pin posts on this branch"
+        }
+        val updatedHeader = header.copy(
+            generation = header.generation + 1,
+            pinnedPostIds = if (pinned) {
+                (header.pinnedPostIds.filterNot { it == postId } + postId).takeLast(100)
+            } else {
+                header.pinnedPostIds.filterNot { it == postId }
+            },
+        )
+        val owned = resolveOwned(header)
+        writeHeader(owned.storeId, updatedHeader)
+        store.rememberBranchHeader(updatedHeader)
+
+        val current = readPulse(header.branchRoot) ?: GroupPulse(header.group.groupId)
+        val updatedConversations = current.conversations.map { conversation ->
+            conversation.copy(
+                recentMessages = conversation.recentMessages
+                    .map { if (it.messageId == postId) it.copy(pinned = pinned) else it }
+                    .sortedWith(compareByDescending<MessagePreview> { it.pinned }.thenByDescending { it.createdAt })
+            )
+        }
+        val updated = current.copy(
+            generation = current.generation + 1,
+            updatedAt = System.currentTimeMillis(),
+            conversations = updatedConversations,
+        )
+        publishPulse(updatedHeader, updated)
+        appendEvent(
+            owned,
+            GroupEvent(
+                groupId = header.group.groupId,
+                branchId = header.branchId,
+                kind = if (pinned) GroupEventKind.PostPinned else GroupEventKind.PostUnpinned,
+                actorMainDht = actorMainDht,
+                createdAt = System.currentTimeMillis(),
+                objectId = postId,
+            )
+        )
+        return updatedHeader
+    }
+
     fun grantModerator(header: GroupBranchHeader, grant: GroupModeratorGrant): GroupBranchHeader {
         require(header.ownerMainDht == client.identity().optString("main_dht"))
         val updated = header.copy(
@@ -272,6 +433,39 @@ class GroupBranchNetwork(
                 objectId = grant.moderatorMainDht,
             )
         )
+        return updated
+    }
+
+    fun banAuthor(
+        header: GroupBranchHeader,
+        authorMainDht: String,
+        actorMainDht: String,
+    ): GroupBranchHeader {
+        require(header.ownerMainDht == client.identity().optString("main_dht"))
+        val grant = header.moderators.firstOrNull { it.moderatorMainDht == actorMainDht }
+        require(actorMainDht == header.ownerMainDht || grant?.canModeratePosts == true) {
+            "Actor may not ban authors on this branch"
+        }
+        require(authorMainDht.isNotBlank()) { "Author identity is empty" }
+        val updated = header.copy(
+            generation = header.generation + 1,
+            bannedMainDhts = (header.bannedMainDhts.filterNot { it == authorMainDht } + authorMainDht)
+                .takeLast(512),
+        )
+        val owned = resolveOwned(header)
+        writeHeader(owned.storeId, updated)
+        appendEvent(
+            owned,
+            GroupEvent(
+                groupId = header.group.groupId,
+                branchId = header.branchId,
+                kind = GroupEventKind.MemberBanned,
+                actorMainDht = actorMainDht,
+                createdAt = System.currentTimeMillis(),
+                objectId = authorMainDht,
+            )
+        )
+        store.rememberBranchHeader(updated)
         return updated
     }
 
@@ -370,6 +564,106 @@ class GroupBranchNetwork(
                     result.optString("request_id_hex").takeIf { it.isNotBlank() }
                 }.getOrNull()
             }
+    }
+
+    /**
+     * Groups-v2 submission transport. The signed event is dispatched through three independent
+     * paths: a direct-preferred authenticated send, a forced persistent mailbox copy, and a
+     * spectator-readable public witness. All operations are queued on a bounded process-wide pool
+     * so posting does not wait for slow DHT/mailbox commits.
+     */
+    fun sendCanonicalSubmissionV2(
+        event: SignedGroupEventV2,
+        authorities: List<GroupBranchPointer>,
+        privateIntakeKey: ByteArray? = null,
+    ) {
+        val selectedBranch = store.selectedBranch(event.groupId)?.branchId
+        val targets = authorities
+            .filter { it.ownerMainDht.isNotBlank() }
+            .distinctBy { it.ownerMainDht }
+            .sortedWith(
+                compareByDescending<GroupBranchPointer> { it.branchId == selectedBranch }
+                    .thenByDescending { it.kind == GroupBranchKind.Original }
+                    .thenByDescending { it.updatedAt }
+            )
+            .take(MAX_V2_AUTHORITY_FANOUT)
+
+        val remoteTargets = targets.filter { it.ownerMainDht != event.authorMainDht }
+        val mailboxExpirySeconds = (event.expiresAt / 1000L).takeIf { it > 0L }
+        logger("[groups-v2] TRANSPORT_SCHEDULE event=${event.eventId.take(8)} authorities=${targets.size} remote=${remoteTargets.size} fast=${remoteTargets.size} mailbox=${remoteTargets.size} witness=${targets.take(PUBLIC_WITNESS_HOSTS).size} private=${privateIntakeKey != null}")
+
+        remoteTargets.forEach { authority ->
+            val packet = GroupEventTransportPacketV2(event, targetOwnerMainDht = authority.ownerMainDht)
+            val bytes = packet.toBytes()
+            require(bytes.size <= 8 * 1024) { "Groups v2 direct packet exceeds daemon message limit" }
+
+            scheduleV2Transport("FAST_PATH", event.eventId, authority.ownerMainDht) {
+                client.sendMessage(
+                    recipientMainDht = authority.ownerMainDht,
+                    payload = bytes,
+                    expiresAtSeconds = mailboxExpirySeconds,
+                    preferDirect = true,
+                ).optString("message_id_hex")
+            }
+            scheduleV2Transport("MAILBOX_COPY", event.eventId, authority.ownerMainDht) {
+                client.sendMessage(
+                    recipientMainDht = authority.ownerMainDht,
+                    payload = bytes,
+                    expiresAtSeconds = mailboxExpirySeconds,
+                    preferDirect = false,
+                ).optString("message_id_hex")
+            }
+        }
+
+        // A ServiceRequest is spectator-readable, so a few host copies are enough to make the
+        // same group-scoped event independently observable without publishing once per Claim.
+        // The witness uses a compact binary codec because the daemon ServiceRequest wrapper has a
+        // strict 1024-byte serialized ceiling; direct/mailbox packets intentionally remain JSON.
+        val witnessPacket = GroupEventTransportPacketV2(event)
+        val compactWitness = GroupEventWitnessCodecV2.encode(event)
+        val witnessPayload = privateIntakeKey?.let { GroupEventTransportCryptoV2.encrypt(witnessPacket, it) }
+            ?: compactWitness
+        require(witnessPayload.size <= MAX_V2_WITNESS_PAYLOAD_BYTES) {
+            "Groups v2 compact witness is unexpectedly large: ${witnessPayload.size} bytes"
+        }
+        logger("[groups-v2] WITNESS_ENCODE event=${event.eventId.take(8)} compact_bytes=${compactWitness.size} payload_bytes=${witnessPayload.size} encrypted=${privateIntakeKey != null}")
+        targets.take(PUBLIC_WITNESS_HOSTS).forEach { host ->
+            scheduleV2Transport("PUBLIC_WITNESS", event.eventId, host.ownerMainDht) {
+                val result = client.publishServiceRequest(
+                    intendedHostMainDht = host.ownerMainDht,
+                    serviceIdHex = if (privateIntakeKey == null) V2_PUBLIC_WITNESS_SERVICE_ID else V2_PRIVATE_WITNESS_SERVICE_ID,
+                    manifestHashHex = if (privateIntakeKey == null) V2_PUBLIC_WITNESS_MANIFEST_HASH else V2_PRIVATE_WITNESS_MANIFEST_HASH,
+                    instanceIdHex = v2WitnessInstanceId(event.groupId, host.ownerMainDht),
+                    payload = witnessPayload,
+                    delegationAllowed = true,
+                    spectatorsAllowed = true,
+                    ttlSeconds = OPEN_INTAKE_TTL_SECONDS,
+                )
+                result.optString("request_id_hex")
+            }
+        }
+    }
+
+    private fun scheduleV2Transport(
+        label: String,
+        eventId: String,
+        target: String,
+        operation: () -> String,
+    ) {
+        V2_TRANSPORT_POOL.execute {
+            val started = System.currentTimeMillis()
+            runCatching(operation)
+                .onSuccess { receipt ->
+                    logger("[groups-v2] TRANSPORT_${label}_QUEUED event=${eventId.take(8)} target=${short(target)} receipt=${receipt.take(16)} elapsed=${System.currentTimeMillis() - started}ms")
+                }
+                .onFailure { error ->
+                    val message = error.message.orEmpty()
+                    logger("[groups-v2] TRANSPORT_${label}_FAILED event=${eventId.take(8)} target=${short(target)} elapsed=${System.currentTimeMillis() - started}ms error=${message.take(240)}")
+                    if (message.contains("reputation", ignoreCase = true) || message.contains("blocked", ignoreCase = true)) {
+                        logger("[groups-v2] REPUTATION_BLOCK_HINT event=${eventId.take(8)} target=${short(target)} transport=$label note=daemon_policy_rejected_send")
+                    }
+                }
+        }
     }
 
     /**
@@ -473,7 +767,10 @@ class GroupBranchNetwork(
 
     fun subscribeOpenIntake(onClosed: (String) -> Unit = {}): Long =
         client.subscribeServiceRequests(
-            serviceIdsHex = listOf(OPEN_INTAKE_SERVICE_ID, PRIVATE_INTAKE_SERVICE_ID),
+            serviceIdsHex = listOf(
+                OPEN_INTAKE_SERVICE_ID, PRIVATE_INTAKE_SERVICE_ID,
+                V2_PUBLIC_WITNESS_SERVICE_ID, V2_PRIVATE_WITNESS_SERVICE_ID,
+            ),
             onRequest = ::receiveOpenServiceRequest,
             onClosed = onClosed,
         )
@@ -562,13 +859,24 @@ class GroupBranchNetwork(
         const val INDEX_SUBKEYS = 64
         const val MAX_INDEX_BUCKET_ENTRIES = 128
 
-        const val OPEN_INTAKE_TTL_SECONDS = 15L * 60L
+        const val OPEN_INTAKE_TTL_SECONDS = 60L * 60L
+        const val MAX_V2_AUTHORITY_FANOUT = 24
+        const val PUBLIC_WITNESS_HOSTS = 3
+        const val MAX_V2_WITNESS_PAYLOAD_BYTES = 700
+
+        private val V2_TRANSPORT_POOL = Executors.newFixedThreadPool(4) { runnable ->
+            Thread(runnable, "weave-groups-v2-transport").apply { isDaemon = true }
+        }
 
         // 32-byte SHA-256 identifiers encoded as hex; stable across every Weave install.
         val OPEN_INTAKE_SERVICE_ID: String = groupSha256Hex("weave/group/open-intake/v2".encodeToByteArray())
         val OPEN_INTAKE_MANIFEST_HASH: String = groupSha256Hex("weave/group/open-intake/manifest/v2".encodeToByteArray())
         val PRIVATE_INTAKE_SERVICE_ID: String = groupSha256Hex("weave/group/private-intake/v2".encodeToByteArray())
         val PRIVATE_INTAKE_MANIFEST_HASH: String = groupSha256Hex("weave/group/private-intake/manifest/v2".encodeToByteArray())
+        val V2_PUBLIC_WITNESS_SERVICE_ID: String = groupSha256Hex("weave/group/event-witness/v2".encodeToByteArray())
+        val V2_PUBLIC_WITNESS_MANIFEST_HASH: String = groupSha256Hex("weave/group/event-witness/manifest/v2".encodeToByteArray())
+        val V2_PRIVATE_WITNESS_SERVICE_ID: String = groupSha256Hex("weave/group/event-witness-private/v2".encodeToByteArray())
+        val V2_PRIVATE_WITNESS_MANIFEST_HASH: String = groupSha256Hex("weave/group/event-witness-private/manifest/v2".encodeToByteArray())
 
         fun originalBranchId(groupId: String): String =
             "original-${groupSha256Hex(groupId.encodeToByteArray()).take(24)}"
@@ -578,6 +886,9 @@ class GroupBranchNetwork(
 
         private fun privateInstanceId(key: ByteArray): String =
             groupSha256Hex(key + "|weave-private-intake|".encodeToByteArray())
+
+        private fun v2WitnessInstanceId(groupId: String, hostMainDht: String): String =
+            groupSha256Hex("$groupId|$hostMainDht|weave-v2-witness".encodeToByteArray())
 
         private fun bucketFor(postId: String): Int {
             val digest = MessageDigest.getInstance("SHA-256").digest(postId.encodeToByteArray())

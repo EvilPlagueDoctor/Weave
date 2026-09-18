@@ -1,0 +1,17 @@
+Phase 6.3 static validation
+===========================
+
+Performed in the packaging environment:
+
+PASS: All bundled widget templates compile with VeilWidgetLanguage.compile().
+PASS: All locally generated template bytecode passes VeilWidgetVerifier.
+PASS: Each bundled template can be encoded as a published source-only package and decoded again.
+PASS: Published template envelopes contain no literal VWB1 executable bytecode payload.
+PASS: Source package sizes for the bundled templates are far below MAX_REMOTE_WIDGET_PACKAGE_BYTES (256 KiB).
+PASS: Remote widget source is fetched only from RemoteWidgetLoader.load(), which is called from explicit widget activation in ProfileViewerScreen.
+PASS: Profile publish now uploads pending widget source packages before encoding/publishing the profile.
+PASS: Changed accepted local widget versions are forced back to local-widget: references so republish cannot leave a new hash pointing at old source.
+PASS: All Android strings.xml files remain well-formed XML after the UI additions.
+
+Android build note:
+The full Gradle Android compile could not be run in this environment because the wrapper requires Gradle 9.4.1 and the distribution is not cached; outbound access to services.gradle.org is unavailable here.
