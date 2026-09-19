@@ -811,12 +811,18 @@ fun GroupDetailScreen(
                     )
                     postImage?.let { selected ->
                         media.bitmapFor(selected.contentHash)?.let { bitmap ->
-                            Image(
+                            FilteredImage(
+                                contentId = "group-compose-image:${selected.contentHash}",
                                 bitmap = bitmap,
-                                contentDescription = "Selected post image",
-                                modifier = Modifier.fillMaxWidth().heightIn(max = 180.dp),
-                                contentScale = ContentScale.Fit,
-                            )
+                                modifier = Modifier.fillMaxWidth(),
+                            ) { gateModifier ->
+                                Image(
+                                    bitmap = bitmap,
+                                    contentDescription = "Selected post image",
+                                    modifier = gateModifier.fillMaxWidth().heightIn(max = 180.dp),
+                                    contentScale = ContentScale.Fit,
+                                )
+                            }
                         }
                     }
                     Text(

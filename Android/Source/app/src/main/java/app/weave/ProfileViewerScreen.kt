@@ -1,6 +1,7 @@
 package app.weave
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
@@ -20,6 +21,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
@@ -56,6 +58,30 @@ fun Page.imageHashesOnPage(): Set<String> = buildSet {
         e.children.forEach(::walk)
     }
     walk(root)
+}
+
+
+data class PageImagePlacement(
+    val element: Element,
+    val x: Float,
+    val y: Float,
+    val width: Float,
+    val height: Float,
+)
+
+fun Page.imagePlacementsOnPage(): List<PageImagePlacement> = buildList {
+    fun walk(e: Element, x: Float, y: Float, width: Float, height: Float) {
+        if (!e.rect.visible) return
+        val childX = x + e.rect.x * width
+        val childY = y + e.rect.y * height
+        val childWidth = e.rect.width * width
+        val childHeight = e.rect.height * height
+        if (e.type == ElementType.Media && e.mediaKind == MediaKind.Image) {
+            add(PageImagePlacement(e, childX, childY, childWidth, childHeight))
+        }
+        e.children.forEach { walk(it, childX, childY, childWidth, childHeight) }
+    }
+    root.children.forEach { walk(it, 0f, 0f, 1f, 1f) }
 }
 
 fun Page.audioElementsOnPage(): List<Element> = buildList {
@@ -113,20 +139,55 @@ fun PageCanvas(
             }
         )
     }
-    Canvas(modifier.then(hitTest)) {
-        val root = page.root
-        val rootRect = Rect(0f, 0f, size.width, size.height)
-        drawBackground(rootRect, root.background)
-        root.children.sortedBy { it.rect.zIndex }.forEach {
-            drawElement(
-                it, rootRect, "",
-                selectChildren = false,
-                strings = strings,
-                inlineEditingId = null,
-                widgetLookup = widgetLookup,
-                imageLookup = imageLookup,
-                ownerKey = ownerKey
-            )
+    val imagePlacements = remember(page) { page.imagePlacementsOnPage() }
+    val visibleImagePlacements = remember(page, imagePlacements) {
+        imagePlacements.filter { it.element.rect.visible && it.width > 0f && it.height > 0f }
+    }
+    val renderedImageIds = visibleImagePlacements
+        .mapNotNull { placement -> imageLookup(placement.element)?.let { placement.element.id } }
+        .toSet()
+
+    BoxWithConstraints(modifier.then(hitTest)) {
+        Canvas(Modifier.matchParentSize()) {
+            val root = page.root
+            val rootRect = Rect(0f, 0f, size.width, size.height)
+            drawBackground(rootRect, root.background)
+            root.children.sortedBy { it.rect.zIndex }.forEach {
+                drawElement(
+                    it, rootRect, "",
+                    selectChildren = false,
+                    strings = strings,
+                    inlineEditingId = null,
+                    widgetLookup = widgetLookup,
+                    imageLookup = imageLookup,
+                    ownerKey = ownerKey,
+                    skipImageIds = renderedImageIds,
+                )
+            }
+        }
+
+        visibleImagePlacements.forEach { placement ->
+            val bitmap = imageLookup(placement.element)
+            if (bitmap != null) {
+                Box(
+                    Modifier
+                        .offset(x = maxWidth * placement.x, y = maxHeight * placement.y)
+                        .size(width = maxWidth * placement.width, height = maxHeight * placement.height)
+                ) {
+                    FilteredImage(
+                        contentId = "profile-image:${placement.element.mediaContentHash.ifBlank { placement.element.id }}",
+                        bitmap = bitmap,
+                        modifier = Modifier.fillMaxSize(),
+                    ) { gateModifier ->
+                        Image(
+                            bitmap = bitmap,
+                            contentDescription = placement.element.mediaTitle.ifBlank { "Profile image" },
+                            modifier = gateModifier.fillMaxSize(),
+                            contentScale = ContentScale.Fit,
+                        )
+                    }
+                }
+            }
         }
     }
 }

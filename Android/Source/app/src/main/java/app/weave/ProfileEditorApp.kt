@@ -1559,7 +1559,8 @@ internal fun DrawScope.drawElement(
     inlineEditingId:String?=null,
     widgetLookup:(Element)->WidgetProgram? = { null },
     imageLookup:(Element)->ImageBitmap? = { null },
-    ownerKey:String = ""
+    ownerKey:String = "",
+    skipImageIds:Set<String> = emptySet(),
 ){
     if(!e.rect.visible)return
     val r=childRect(parent,e.rect)
@@ -1567,7 +1568,7 @@ internal fun DrawScope.drawElement(
         ElementType.Block->{
             drawBackground(r,e.background)
             drawBorderSpec(r,e.border,e.borderThickness)
-            e.children.sortedBy{it.rect.zIndex}.forEach{drawElement(it,r,if(selectChildren)selectedId else "",selectChildren,strings,inlineEditingId,widgetLookup,imageLookup,ownerKey)}
+            e.children.sortedBy{it.rect.zIndex}.forEach{drawElement(it,r,if(selectChildren)selectedId else "",selectChildren,strings,inlineEditingId,widgetLookup,imageLookup,ownerKey,skipImageIds)}
         }
         ElementType.Stamp->drawStamp(r,e,ownerKey)
         ElementType.Text-> if(e.id != inlineEditingId) drawTextWrapped(e.text,r,e)
@@ -1587,6 +1588,7 @@ internal fun DrawScope.drawElement(
         }
         ElementType.Media->{
             val bitmap = if(e.mediaKind==MediaKind.Image) imageLookup(e) else null
+            if (e.mediaKind == MediaKind.Image && e.id in skipImageIds) return
             if(bitmap!=null){
                 // Keep the source aspect ratio instead of stretching pixels to the element
                 // rectangle. Transparent pixels are drawn normally, so the page background

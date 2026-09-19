@@ -34,14 +34,16 @@ fun ContentFilterSettingsSection(filter: ContentFilter = LocalContentFilter.curr
     FilterPreferenceRow(
         category = ContentFilterCategory.Sexual,
         preference = filter.preferences.sexual,
-        status = if (filter.sexualImageModelReady) "Image model ready" else "Image model not installed",
+        status = if (filter.sexualImageModelReady) "Image model ready" else "Image model NOT installed — images cannot be classified",
+        statusIsError = !filter.sexualImageModelReady,
         onSensitivity = { filter.update(ContentFilterCategory.Sexual, sensitivity = it) },
         onAction = { filter.update(ContentFilterCategory.Sexual, action = it) },
     )
     FilterPreferenceRow(
         category = ContentFilterCategory.Gore,
         preference = filter.preferences.gore,
-        status = if (filter.goreImageModelReady) "Image model ready" else "Image model not installed",
+        status = if (filter.goreImageModelReady) "Image model ready" else "Image model NOT installed — images cannot be classified",
+        statusIsError = !filter.goreImageModelReady,
         onSensitivity = { filter.update(ContentFilterCategory.Gore, sensitivity = it) },
         onAction = { filter.update(ContentFilterCategory.Gore, action = it) },
     )
@@ -49,6 +51,7 @@ fun ContentFilterSettingsSection(filter: ContentFilter = LocalContentFilter.curr
         category = ContentFilterCategory.Aggression,
         preference = filter.preferences.aggression,
         status = if (filter.aggressionTextModelReady) "Comment model ready" else "Comment model not installed (explicit-threat fallback only)",
+        statusIsError = false,
         onSensitivity = { filter.update(ContentFilterCategory.Aggression, sensitivity = it) },
         onAction = { filter.update(ContentFilterCategory.Aggression, action = it) },
     )
@@ -66,13 +69,19 @@ private fun FilterPreferenceRow(
     category: ContentFilterCategory,
     preference: CategoryFilterPreference,
     status: String,
+    statusIsError: Boolean,
     onSensitivity: (FilterSensitivity) -> Unit,
     onAction: (FilterAction) -> Unit,
 ) {
     ElevatedCard(Modifier.fillMaxWidth().padding(vertical = 5.dp)) {
         Column(Modifier.padding(12.dp)) {
             Text(category.label, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
-            Text(status, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                status,
+                style = MaterialTheme.typography.labelSmall,
+                color = if (statusIsError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                fontWeight = if (statusIsError) FontWeight.SemiBold else FontWeight.Normal,
+            )
             Row(
                 Modifier.fillMaxWidth().padding(top = 8.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -216,6 +225,9 @@ private fun FilteredImageInternal(
         return
     }
     val decision = filter.decision(scores ?: ContentScores(), contentId)
+    LaunchedEffect(contentId, decision.action, decision.category, decision.score, compact) {
+        filter.logImageRender(contentId, decision, compact)
+    }
     FilterGate(contentId = contentId, decision = decision, modifier = modifier, compact = compact) { childModifier ->
         content(childModifier)
     }

@@ -29,6 +29,30 @@ import kotlinx.coroutines.launch
 import app.weave.backbone.CommentPolicy
 import org.json.JSONObject
 
+private const val DIAGNOSTIC_CLIPBOARD_MAX_CHARS = 200_000
+private const val DIAGNOSTIC_CLIPBOARD_HEAD_CHARS = 24_000
+private const val DIAGNOSTIC_CLIPBOARD_FALLBACK_CHARS = 60_000
+
+/**
+ * Android transports clipboard contents through Binder. Large diagnostic reports can exceed the
+ * process-wide Binder transaction buffer and crash ClipboardManager.setPrimaryClip(). Preserve the
+ * report header/current-state section plus the newest tail while staying comfortably below that
+ * limit (Strings are parcelled roughly as UTF-16, so characters are not equivalent to bytes).
+ */
+private fun clipboardSafeDiagnostics(report: String, maxChars: Int): Pair<String, Boolean> {
+    if (report.length <= maxChars) return report to false
+
+    val marker = buildString {
+        appendLine()
+        appendLine("--- older diagnostic detail omitted for Android clipboard safety ---")
+        appendLine("full report chars: ${report.length}; copied chars capped at $maxChars")
+        appendLine("--- most recent diagnostic detail follows ---")
+    }
+    val headChars = minOf(DIAGNOSTIC_CLIPBOARD_HEAD_CHARS, maxChars / 3)
+    val tailChars = (maxChars - headChars - marker.length).coerceAtLeast(1_000)
+    return (report.take(headChars) + marker + report.takeLast(tailChars)) to true
+}
+
 /** Remembers setup state inside the current VeilKnit account's encrypted app vault. */
 class OnboardingState(context: Context) : PrivateVault.Participant {
     private val appContext = context.applicationContext
@@ -665,7 +689,7 @@ fun SettingsScreen(
     val clipboard = remember(context) {
         context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
     }
-    var copied by remember { mutableStateOf(false) }
+    var copyStatus by remember { mutableStateOf<String?>(null) }
     var showLanguageMenu by remember { mutableStateOf(false) }
     var confirmUnpublish by remember { mutableStateOf(false) }
     var claimGroupLink by remember { mutableStateOf("") }
@@ -673,8 +697,8 @@ fun SettingsScreen(
     var claimConfirmation by remember { mutableStateOf<String?>(null) }
     // Reset the confirmation shortly after it appears, so a stale "Copied" does not imply
     // the clipboard still holds a report from ten minutes ago.
-    LaunchedEffect(copied) {
-        if (copied) { delay(2500); copied = false }
+    LaunchedEffect(copyStatus) {
+        if (copyStatus != null) { delay(3500); copyStatus = null }
     }
 
     Column(Modifier.fillMaxSize()) {
@@ -877,24 +901,69 @@ fun SettingsScreen(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 4.dp)
             )
+            // Resolve localized labels in composable scope. The onClick callback itself is not
+            // composable, so it must not invoke tr(...) directly.
+            val diagnosticsCopiedText = tr("Copied")
+            val diagnosticsCopiedTrimmedText = tr("Copied recent log (trimmed)")
+            val diagnosticsCopyFailedText = tr("Copy failed")
+
             Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(onClick = {
-                    clipboard.setPrimaryClip(
-                        ClipData.newPlainText("Weave diagnostics", controller.diagnosticReport())
+                    val fullReport = controller.diagnosticReport()
+                    val (safeReport, trimmed) = clipboardSafeDiagnostics(
+                        fullReport,
+                        DIAGNOSTIC_CLIPBOARD_MAX_CHARS,
                     )
-                    copied = true
+
+                    val firstAttempt = runCatching {
+                        clipboard.setPrimaryClip(ClipData.newPlainText("Weave diagnostics", safeReport))
+                    }
+
+                    if (firstAttempt.isSuccess) {
+                        copyStatus = if (trimmed) diagnosticsCopiedTrimmedText else diagnosticsCopiedText
+                        controller.diagnosticBreadcrumb(
+                            "DIAGNOSTICS_COPY",
+                            "ok full_chars=${fullReport.length} copied_chars=${safeReport.length} trimmed=$trimmed",
+                        )
+                    } else {
+                        // Be defensive even if a vendor ROM has a smaller Binder allowance. A
+                        // clipboard failure is diagnostic information, not a reason to crash Weave.
+                        val (fallbackReport, _) = clipboardSafeDiagnostics(
+                            fullReport,
+                            DIAGNOSTIC_CLIPBOARD_FALLBACK_CHARS,
+                        )
+                        val fallbackAttempt = runCatching {
+                            clipboard.setPrimaryClip(ClipData.newPlainText("Weave diagnostics", fallbackReport))
+                        }
+                        if (fallbackAttempt.isSuccess) {
+                            copyStatus = diagnosticsCopiedTrimmedText
+                            controller.diagnosticBreadcrumb(
+                                "DIAGNOSTICS_COPY_FALLBACK",
+                                "primary_failed=${firstAttempt.exceptionOrNull()?.javaClass?.simpleName} " +
+                                    "full_chars=${fullReport.length} copied_chars=${fallbackReport.length}",
+                            )
+                        } else {
+                            copyStatus = diagnosticsCopyFailedText
+                            controller.diagnosticBreadcrumb(
+                                "DIAGNOSTICS_COPY_FAILED",
+                                "primary=${firstAttempt.exceptionOrNull()?.javaClass?.simpleName} " +
+                                    "fallback=${fallbackAttempt.exceptionOrNull()?.javaClass?.simpleName} " +
+                                    "full_chars=${fullReport.length}",
+                            )
+                        }
+                    }
                 }) { Text(tr("Copy log")) }
-                if (copied) {
+                copyStatus?.let { status ->
                     Text(
-                        tr("Copied"),
+                        status,
                         style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.primary,
+                        color = if (status == diagnosticsCopyFailedText) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
                         modifier = Modifier.align(Alignment.CenterVertically)
                     )
                 }
             }
             Text(
-                tr("This Weave log is kept across reconnects and records editor/navigation transitions plus Java/Kotlin fatal exceptions, so intermittent failures can be inspected afterward. The daemon keeps a separate lower-level network/API log; for connection problems, copying both is useful."),
+                tr("This Weave log is kept across reconnects and records editor/navigation transitions plus Java/Kotlin fatal exceptions, so intermittent failures can be inspected afterward. Very large reports are trimmed for Android clipboard safety while preserving the report summary and newest log history. The daemon keeps a separate lower-level network/API log; for connection problems, copying both is useful."),
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 8.dp)

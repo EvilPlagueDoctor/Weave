@@ -7,6 +7,7 @@ import ai.onnxruntime.TensorInfo
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.util.Log
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
@@ -109,24 +110,38 @@ class ContentFilter(private val context: Context) : PrivateVault.Participant {
 
     private val textCache = BoundedCache<String, ContentScores>(384)
     private val imageCache = BoundedCache<String, ContentScores>(192)
+    private val renderLogCache = BoundedCache<String, String>(384)
     private val revealed = mutableStateMapOf<String, Unit>()
 
     private val imageSafetyClassifier by lazy { OnnxImageSafetyClassifier(context) }
     private val toxicTextClassifier by lazy { OnnxToxicTextClassifier(context) }
 
-    init { vault.register(this) }
+    init {
+        vault.register(this)
+        diagnostic(
+            "INIT image_model=${assetExists(IMAGE_SAFETY_MODEL_ASSET)} " +
+                "text_model=${assetExists(TOXIC_MODEL_ASSET)} vocab=${assetExists(VOCAB_ASSET)}"
+        )
+    }
 
     override fun onVaultAttached() {
         preferences = loadPreferences()
         textCache.clear()
         imageCache.clear()
+        renderLogCache.clear()
         revealed.clear()
+        diagnostic(
+            "VAULT_ATTACHED " + preferenceSummary() +
+                " image_model=$imageSafetyModelReady text_model=$aggressionTextModelReady"
+        )
     }
 
     override fun onVaultDetached() {
+        diagnostic("VAULT_DETACHED")
         preferences = ContentFilterPreferences()
         textCache.clear()
         imageCache.clear()
+        renderLogCache.clear()
         revealed.clear()
     }
 
@@ -144,9 +159,18 @@ class ContentFilter(private val context: Context) : PrivateVault.Participant {
             ContentFilterCategory.Aggression -> preferences.copy(aggression = next)
         }
         savePreferences()
+        diagnostic(
+            "PREFERENCE category=${category.name} " +
+                "old=${old.sensitivity.name}/${old.action.name}@${formatScore(old.sensitivity.threshold)} " +
+                "new=${next.sensitivity.name}/${next.action.name}@${formatScore(next.sensitivity.threshold)} " +
+                "image_model=$imageSafetyModelReady"
+        )
     }
 
-    fun reveal(contentId: String) { revealed[contentId] = Unit }
+    fun reveal(contentId: String) {
+        revealed[contentId] = Unit
+        diagnostic("REVEAL content=${diagnosticContentId(contentId)}")
+    }
     fun isRevealed(contentId: String): Boolean = revealed.containsKey(contentId)
 
     fun decision(scores: ContentScores, contentId: String): FilterDecision {
@@ -170,14 +194,47 @@ class ContentFilter(private val context: Context) : PrivateVault.Participant {
     }
 
     suspend fun classifyImage(contentId: String, bitmap: Bitmap): ContentScores {
-        imageCache[contentId]?.let { return it }
+        imageCache[contentId]?.let {
+            diagnostic(
+                "IMAGE_CACHE_HIT content=${diagnosticContentId(contentId)} " +
+                    "sexual=${formatScore(it.sexual)} gore=${formatScore(it.gore)}"
+            )
+            return it
+        }
         if (preferences.sexual.sensitivity == FilterSensitivity.Off && preferences.gore.sensitivity == FilterSensitivity.Off) {
+            diagnostic("IMAGE_SKIP content=${diagnosticContentId(contentId)} reason=all_image_filters_off")
             return ContentScores()
         }
+        diagnostic(
+            "IMAGE_CLASSIFY_BEGIN content=${diagnosticContentId(contentId)} " +
+                "size=${bitmap.width}x${bitmap.height} model_ready=$imageSafetyModelReady " +
+                "sexual=${preferences.sexual.sensitivity.name}/${preferences.sexual.action.name}" +
+                "@${formatScore(preferences.sexual.sensitivity.threshold)} " +
+                "gore=${preferences.gore.sensitivity.name}/${preferences.gore.action.name}" +
+                "@${formatScore(preferences.gore.sensitivity.threshold)}"
+        )
         // One compact local model returns SFW / NSFW / NSFL (gore) probabilities.
-        val score = imageSafetyClassifier.classify(bitmap)
+        val score = imageSafetyClassifier.classify(contentId, bitmap)
         imageCache[contentId] = score
+        val decision = decision(score, contentId)
+        diagnostic(
+            "IMAGE_CLASSIFY_RESULT content=${diagnosticContentId(contentId)} " +
+                "sexual=${formatScore(score.sexual)} gore=${formatScore(score.gore)} " +
+                "decision=${decision.action.name} category=${decision.category?.name ?: "none"} " +
+                "decision_score=${formatScore(decision.score)} revealed=${isRevealed(contentId)}"
+        )
         return score
+    }
+
+    fun logImageRender(contentId: String, decision: FilterDecision, compact: Boolean) {
+        val signature = "${decision.action.name}|${decision.category?.name}|${formatScore(decision.score)}|$compact|${isRevealed(contentId)}"
+        if (renderLogCache[contentId] == signature) return
+        renderLogCache[contentId] = signature
+        diagnostic(
+            "IMAGE_RENDER content=${diagnosticContentId(contentId)} action=${decision.action.name} " +
+                "category=${decision.category?.name ?: "none"} score=${formatScore(decision.score)} " +
+                "compact=$compact revealed=${isRevealed(contentId)}"
+        )
     }
 
     private fun assetExists(path: String): Boolean = runCatching { context.assets.open(path).use { } }.isSuccess
@@ -204,10 +261,29 @@ class ContentFilter(private val context: Context) : PrivateVault.Participant {
         runCatching { vault.putText(PREFS_VAULT_KEY, root.toString()) }
     }
 
+    private fun preferenceSummary(): String =
+        "sexual=${preferences.sexual.sensitivity.name}/${preferences.sexual.action.name}" +
+            "@${formatScore(preferences.sexual.sensitivity.threshold)} " +
+            "gore=${preferences.gore.sensitivity.name}/${preferences.gore.action.name}" +
+            "@${formatScore(preferences.gore.sensitivity.threshold)} " +
+            "aggression=${preferences.aggression.sensitivity.name}/${preferences.aggression.action.name}" +
+            "@${formatScore(preferences.aggression.sensitivity.threshold)}"
+
+    private fun diagnostic(message: String) {
+        Log.d(DIAGNOSTIC_TAG, message)
+        WeaveDiagnostics.event(context, "CONTENT_FILTER", message)
+    }
+
+    private fun diagnosticContentId(contentId: String): String =
+        contentId.replace('\n', '_').replace('\r', '_').take(96)
+
+    private fun formatScore(value: Float): String = String.format(Locale.US, "%.4f", value)
+
     private fun <T : Enum<T>> enumValueOrDefault(value: String?, fallback: T): T =
         fallback.declaringJavaClass.enumConstants.firstOrNull { it.name == value } ?: fallback
 
     companion object {
+        private const val DIAGNOSTIC_TAG = "WeaveContentFilter"
         private const val PREFS_VAULT_KEY = "content-filter/preferences-v1.json"
         const val IMAGE_SAFETY_MODEL_ASSET = "content_filter/image_safety_xs.onnx"
         const val TOXIC_MODEL_ASSET = "content_filter/toxic_minilm_int8.onnx"
@@ -230,9 +306,21 @@ private class OnnxImageSafetyClassifier(private val context: Context) {
     private var session: OrtSession? = null
     private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
 
-    suspend fun classify(bitmap: Bitmap): ContentScores = withContext(Dispatchers.Default) {
-        val active = ensureSession() ?: return@withContext ContentScores()
-        mutex.withLock { classifyLocked(active, bitmap) }
+    suspend fun classify(contentId: String, bitmap: Bitmap): ContentScores = withContext(Dispatchers.Default) {
+        val active = ensureSession() ?: run {
+            diagnostic("IMAGE_MODEL_UNAVAILABLE content=${contentId.take(96)} result=zeros")
+            return@withContext ContentScores()
+        }
+        mutex.withLock {
+            runCatching { classifyLocked(active, bitmap) }
+                .onFailure {
+                    diagnostic(
+                        "IMAGE_CLASSIFY_FAILED content=${contentId.take(96)} " +
+                            "exception=${it::class.java.simpleName}:${it.message.orEmpty().replace('\n', ' ').take(180)}"
+                    )
+                }
+                .getOrDefault(ContentScores())
+        }
     }
 
     private fun ensureSession(): OrtSession? {
@@ -240,8 +328,19 @@ private class OnnxImageSafetyClassifier(private val context: Context) {
         if (attempted) return null
         attempted = true
         session = runCatching {
+            diagnostic("IMAGE_MODEL_LOAD_BEGIN asset=${ContentFilter.IMAGE_SAFETY_MODEL_ASSET}")
             val bytes = context.assets.open(ContentFilter.IMAGE_SAFETY_MODEL_ASSET).use { it.readBytes() }
-            OrtSession.SessionOptions().use { options -> env.createSession(bytes, options) }
+            OrtSession.SessionOptions().use { options -> env.createSession(bytes, options) }.also { loaded ->
+                diagnostic(
+                    "IMAGE_MODEL_LOAD_OK bytes=${bytes.size} inputs=${loaded.inputNames.joinToString(",")} " +
+                        "outputs=${loaded.outputNames.joinToString(",")}"
+                )
+            }
+        }.onFailure {
+            diagnostic(
+                "IMAGE_MODEL_LOAD_FAILED asset=${ContentFilter.IMAGE_SAFETY_MODEL_ASSET} " +
+                    "exception=${it::class.java.simpleName}:${it.message.orEmpty().replace('\n', ' ').take(180)}"
+            )
         }.getOrNull()
         return session
     }
@@ -286,7 +385,15 @@ private class OnnxImageSafetyClassifier(private val context: Context) {
         OnnxTensor.createTensor(env, FloatBuffer.wrap(data), tensorShape).use { tensor ->
             active.run(mapOf(input.key to tensor)).use { result ->
                 val probabilities = floatsFromValue(result[0].value)
-                if (probabilities.size < 3) return ContentScores()
+                if (probabilities.size < 3) {
+                    diagnostic("IMAGE_MODEL_BAD_OUTPUT count=${probabilities.size} expected_at_least=3")
+                    return ContentScores()
+                }
+                diagnostic(
+                    "IMAGE_MODEL_RAW nsfl=${format(probabilities[0])} " +
+                        "nsfw=${format(probabilities[1])} sfw=${format(probabilities[2])} " +
+                        "input=${w}x${h} layout=${if (nchw) "NCHW" else "NHWC"}"
+                )
                 // OwenElliott canonical order: NSFL, NSFW, SFW.
                 return ContentScores(
                     gore = probabilities[0].coerceIn(0f, 1f),
@@ -295,6 +402,13 @@ private class OnnxImageSafetyClassifier(private val context: Context) {
             }
         }
     }
+
+    private fun diagnostic(message: String) {
+        Log.d("WeaveContentFilter", message)
+        WeaveDiagnostics.event(context, "CONTENT_FILTER", message)
+    }
+
+    private fun format(value: Float): String = String.format(Locale.US, "%.4f", value)
 }
 
 private class OnnxToxicTextClassifier(private val context: Context) {
