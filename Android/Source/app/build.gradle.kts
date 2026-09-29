@@ -5,6 +5,13 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+// Normal prototype builds remain debug-signed for easy local installation.
+// F-Droid can pass -PweaveFdroidBuild=true so the release APK is left unsigned
+// for F-Droid's own signing pipeline.
+val weaveFdroidBuild = providers.gradleProperty("weaveFdroidBuild")
+    .map { it.equals("true", ignoreCase = true) || it == "1" || it.isEmpty() }
+    .orElse(false)
+
 android {
     namespace = "app.weave"
     compileSdk { version = release(36) { minorApiLevel = 1 } }
@@ -32,10 +39,14 @@ android {
     }
     buildTypes {
         getByName("release") {
-            // Prototype performance build: optimized runtime, but signed with the
-            // normal debug key so it stays easy to install while iterating.
+            // Prototype performance builds stay easy to install while iterating.
+            // F-Droid builds deliberately omit the local signing configuration.
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            if (!weaveFdroidBuild.get()) {
+                signingConfig = signingConfigs.getByName("debug")
+            } else {
+                signingConfig = null
+            }
             ndk { debugSymbolLevel = "none" }
         }
     }
