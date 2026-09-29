@@ -8,6 +8,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -85,13 +87,13 @@ fun HomeScreen(
             if (suggested.isNotEmpty()) {
                 item {
                     Text(
-                        "Suggested people",
+                        tr("Suggested people"),
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.Bold,
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
                     )
                     Text(
-                        "A small mix of people whose MinHash interests look similar to yours, with some rotation so the list is not always identical.",
+                        tr("A small mix of people whose MinHash interests look similar to yours, with some rotation so the list is not always identical."),
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 4.dp),
@@ -175,11 +177,12 @@ fun ProfileRow(hint: ProfileHint, enabled: Boolean, onClick: () -> Unit) {
  * named person", which is a claim Weave never makes. These describe how the record
  * reached you, which is what the tiers actually encode.
  */
+@Composable
 fun provenanceLabel(state: VerificationState): String = when (state) {
-    VerificationState.DHT_VERIFIED -> "Read from source"
-    VerificationState.APP_ROOT_CONFIRMED -> "Confirmed at root"
-    VerificationState.MULTI_SOURCE_HINT -> "Seen via several peers"
-    VerificationState.GOSSIP_HINT -> "Heard via gossip"
+    VerificationState.DHT_VERIFIED -> tr("Read from source")
+    VerificationState.APP_ROOT_CONFIRMED -> tr("Confirmed at root")
+    VerificationState.MULTI_SOURCE_HINT -> tr("Seen via several peers")
+    VerificationState.GOSSIP_HINT -> tr("Heard via gossip")
 }
 
 @Composable
@@ -210,7 +213,13 @@ fun SearchScreen(controller: SocialNetworkController, onOpen: (String) -> Unit) 
                     TextButton(onClick = { controller.clearExamples() }) { Text(tr("Clear examples")) }
                     TextButton(onClick = { showStats = true }) { Text(tr("Librarian data")) }
                     Spacer(Modifier.width(8.dp))
-                    Button(onClick = { controller.search() }) { Text(tr("Search")) }
+                    Button(
+                        onClick = { controller.search() },
+                        modifier = Modifier.size(48.dp),
+                        contentPadding = PaddingValues(0.dp),
+                    ) {
+                        Icon(Icons.Default.Search, contentDescription = tr("Search"))
+                    }
                 }
             }
         }

@@ -1,0 +1,31 @@
+WEAVE PHASE 6.11 EMBEDDED VEILKNIT - STATIC VALIDATION
+Date: 2026-09-24
+
+[PASS] Manifest parses as XML
+[PASS] Cargo.toml parses as TOML :: {'name': 'veilknit_daemon', 'path': 'src/lib.rs', 'crate-type': ['rlib', 'cdylib']}
+[PASS] Foreground service declared
+[PASS] Persistent notification defaults on at daemon start
+[PASS] No external Binder API service in manifest
+[PASS] No AIDL source remains
+[PASS] Weave no longer imports Binder daemon API
+[PASS] Rust embedded direct request bridge present
+[PASS] Rust embedded subscription bridge present
+[PASS] Standalone local API listener preserved
+[PASS] JNI direct request exposed
+[PASS] JNI direct subscriptions exposed
+[PASS] Weave uses direct native transport
+[PASS] Bundled Weave self-authorizes
+[PASS] Bundled Weave approval notification suppressed
+[PASS] Daemon login is root before Weave
+[PASS] Live daemon startup gate is root
+[PASS] Startup state tracks Veilid attach
+[PASS] Startup state tracks DHT/mailbox
+[PASS] Hidden daemon GUI destination exists
+[PASS] 5 entries / 5 seconds gesture exists
+[PASS] Rust Android build wired to Gradle
+[PASS] Native ABI targets configured
+[PASS] JNI embedded function names match Kotlin/Rust :: Kotlin=['nativeEmbeddedDrainSubscription', 'nativeEmbeddedSubscribe', 'nativeEmbeddedSubscriptionActive', 'nativeEmbeddedTransact', 'nativeEmbeddedUnsubscribe'] Rust=['nativeEmbeddedDrainSubscription', 'nativeEmbeddedSubscribe', 'nativeEmbeddedSubscriptionActive', 'nativeEmbeddedTransact', 'nativeEmbeddedUnsubscribe']
+
+Checks: 24 total, 0 failed
+
+Environment limitation: this container does not have Cargo/Rust or Android SDK/NDK, and the Gradle 9.4.1 wrapper distribution is not cached. Network access is disabled, so a real Android/Rust compile could not be performed here. Kotlin parser-only probing found no syntax-style diagnostics, but unresolved Android/Compose symbols are expected without the Android classpath.

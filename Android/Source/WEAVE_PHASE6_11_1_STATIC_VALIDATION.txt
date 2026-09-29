@@ -1,0 +1,24 @@
+Phase 6.11.1 static validation
+
+PASS - Rust stream classifier contains SubscribeEvents
+PASS - Rust stream classifier contains SubscribeMessages
+PASS - Rust stream classifier contains SubscribeServiceRequests
+PASS - Rust stream classifier contains SubscribeGossip
+PASS - Rust stream classifier contains SubscribeStreams
+PASS - Embedded subscription no longer half-closes writer
+PASS - Rust exposes embedded profile id
+PASS - JNI exposes nativeEmbeddedProfileId
+PASS - Kotlin declares nativeEmbeddedProfileId
+PASS - DaemonClient prefers live embedded profile id
+PASS - DaemonClient exposes subscription health
+PASS - Profile UI waits for application-layer readiness
+PASS - Profile store has bounded retry
+PASS - Live subscriptions self-heal
+PASS - Periodic gossip cannot tear down session
+PASS - Custody recovery cannot tear down session
+PASS - Group directory publication is nonfatal
+PASS - Username text explicitly light
+PASS - Login fields explicitly dark
+PASS - Password visibility icon explicitly light
+
+20/20 checks passed.

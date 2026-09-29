@@ -16,6 +16,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 
 val LocalContentFilter = staticCompositionLocalOf<ContentFilter> {
     error("ContentFilter was not provided")
@@ -23,9 +24,9 @@ val LocalContentFilter = staticCompositionLocalOf<ContentFilter> {
 
 @Composable
 fun ContentFilterSettingsSection(filter: ContentFilter = LocalContentFilter.current) {
-    Text("Content filtering", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+    Text(tr("Content filtering"), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
     Text(
-        "These filters run on this device for you. They do not report people, remove posts, or change what anyone else sees.",
+        tr("These filters run on this device for you. They do not report people, remove posts, or change what anyone else sees."),
         style = MaterialTheme.typography.labelSmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         modifier = Modifier.padding(top = 4.dp, bottom = 10.dp),
@@ -34,7 +35,7 @@ fun ContentFilterSettingsSection(filter: ContentFilter = LocalContentFilter.curr
     FilterPreferenceRow(
         category = ContentFilterCategory.Sexual,
         preference = filter.preferences.sexual,
-        status = if (filter.sexualImageModelReady) "Image model ready" else "Image model NOT installed — images cannot be classified",
+        status = if (filter.sexualImageModelReady) tr("Image model ready") else tr("Image model NOT installed — images cannot be classified"),
         statusIsError = !filter.sexualImageModelReady,
         onSensitivity = { filter.update(ContentFilterCategory.Sexual, sensitivity = it) },
         onAction = { filter.update(ContentFilterCategory.Sexual, action = it) },
@@ -42,7 +43,7 @@ fun ContentFilterSettingsSection(filter: ContentFilter = LocalContentFilter.curr
     FilterPreferenceRow(
         category = ContentFilterCategory.Gore,
         preference = filter.preferences.gore,
-        status = if (filter.goreImageModelReady) "Image model ready" else "Image model NOT installed — images cannot be classified",
+        status = if (filter.goreImageModelReady) tr("Image model ready") else tr("Image model NOT installed — images cannot be classified"),
         statusIsError = !filter.goreImageModelReady,
         onSensitivity = { filter.update(ContentFilterCategory.Gore, sensitivity = it) },
         onAction = { filter.update(ContentFilterCategory.Gore, action = it) },
@@ -50,14 +51,14 @@ fun ContentFilterSettingsSection(filter: ContentFilter = LocalContentFilter.curr
     FilterPreferenceRow(
         category = ContentFilterCategory.Aggression,
         preference = filter.preferences.aggression,
-        status = if (filter.aggressionTextModelReady) "Comment model ready" else "Comment model not installed (explicit-threat fallback only)",
+        status = if (filter.aggressionTextModelReady) tr("Comment model ready") else tr("Comment model not installed (explicit-threat fallback only)"),
         statusIsError = false,
         onSensitivity = { filter.update(ContentFilterCategory.Aggression, sensitivity = it) },
         onAction = { filter.update(ContentFilterCategory.Aggression, action = it) },
     )
 
     Text(
-        "Sensitivity changes how readily something is flagged. The action controls what Weave does after your filter flags it. All filters are off by default.",
+        tr("Sensitivity changes how readily something is flagged. The action controls what Weave does after your filter flags it. All filters are off by default."),
         style = MaterialTheme.typography.labelSmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         modifier = Modifier.padding(top = 8.dp),
@@ -75,7 +76,7 @@ private fun FilterPreferenceRow(
 ) {
     ElevatedCard(Modifier.fillMaxWidth().padding(vertical = 5.dp)) {
         Column(Modifier.padding(12.dp)) {
-            Text(category.label, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+            Text(tr(category.label), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
             Text(
                 status,
                 style = MaterialTheme.typography.labelSmall,
@@ -87,15 +88,15 @@ private fun FilterPreferenceRow(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 EnumDropDown(
-                    label = "Sensitivity",
-                    selected = preference.sensitivity.label,
-                    options = FilterSensitivity.entries.map { it.label to { onSensitivity(it) } },
+                    label = tr("Sensitivity"),
+                    selected = tr(preference.sensitivity.label),
+                    options = FilterSensitivity.entries.map { tr(it.label) to { onSensitivity(it) } },
                     modifier = Modifier.weight(1f),
                 )
                 EnumDropDown(
-                    label = "When detected",
-                    selected = preference.action.label,
-                    options = FilterAction.entries.map { it.label to { onAction(it) } },
+                    label = tr("When detected"),
+                    selected = tr(preference.action.label),
+                    options = FilterAction.entries.map { tr(it.label) to { onAction(it) } },
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -240,7 +241,7 @@ private fun FilterCheckingPlaceholder(modifier: Modifier = Modifier, compact: Bo
             CircularProgressIndicator(Modifier.size(if (compact) 12.dp else 14.dp), strokeWidth = 2.dp)
             if (!compact) {
                 Spacer(Modifier.width(8.dp))
-                Text("Checking your content filters…", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(tr("Checking your content filters…"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
@@ -290,10 +291,10 @@ private fun FilterGate(
                     verticalArrangement = Arrangement.Center,
                 ) {
                     if (compact) {
-                        Text("Filtered", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold)
+                        Text(tr("Filtered"), fontSize = 9.sp, lineHeight = 10.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
                     } else {
-                        Text("Blurred by your $category filter", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
-                        Text("Tap to show anyway", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                        Text("${tr("Blurred by your")} ${tr(category)} ${tr("filter")}", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                        Text(tr("Tap to show anyway"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
                     }
                 }
             }
@@ -305,7 +306,7 @@ private fun FilterGate(
                 color = MaterialTheme.colorScheme.surfaceVariant,
             ) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("Hidden", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold)
+                    Text(tr("Hidden"), fontSize = 9.sp, lineHeight = 10.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
                 }
             }
         } else Surface(
@@ -313,7 +314,7 @@ private fun FilterGate(
             shape = RoundedCornerShape(8.dp),
             color = MaterialTheme.colorScheme.surfaceVariant,
         ) {
-            FilterNotice("Hidden by your $category filter.", true) {
+            FilterNotice("${tr("Hidden by your")} ${tr(category)} ${tr("filter")}.", true) {
                 filter.reveal(contentId)
             }
         }
@@ -332,6 +333,6 @@ private fun FilterNotice(text: String, prominent: Boolean, onReveal: () -> Unit)
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.weight(1f),
         )
-        TextButton(onClick = onReveal) { Text("Show anyway") }
+        TextButton(onClick = onReveal) { Text(tr("Show anyway")) }
     }
 }

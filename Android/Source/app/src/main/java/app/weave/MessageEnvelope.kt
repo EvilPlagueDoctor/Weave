@@ -166,7 +166,12 @@ data class MessagePreview(
         .put("audio", hasAudio)
         .apply {
             curatedBy?.takeIf { it.isNotBlank() }?.let { put("curated_by", it) }
-            thumbnailBase64?.takeIf { it.isNotBlank() }?.let { put("thumbnail", it) }
+            // A Pulse is a compact index, not the media store. Older builds could copy a very
+            // large post thumbnail here and make a single DHT value exceed 32 KiB. Keep a bounded
+            // inline thumbnail for list rendering; the full message/media ref remains available.
+            thumbnailBase64
+                ?.takeIf { it.isNotBlank() && it.length <= MAX_PULSE_THUMBNAIL_BASE64_CHARS }
+                ?.let { put("thumbnail", it) }
             fullMessage?.let { put("ref", it.toJson()) }
         }
 
@@ -184,6 +189,8 @@ data class MessagePreview(
             hasAudio = o.optBoolean("audio"),
             curatedBy = o.optString("curated_by").takeIf { it.isNotBlank() },
         )
+
+        const val MAX_PULSE_THUMBNAIL_BASE64_CHARS = 20_000
     }
 }
 

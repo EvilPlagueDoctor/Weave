@@ -1,0 +1,22 @@
+Weave Phase 6.11.4 embedded startup recovery static validation
+
+[PASS] Kotlin JNI declaration exists
+[PASS] Kotlin recovery wrapper exists
+[PASS] Rust JNI symbol exists
+[PASS] Rust JNI calls embedded recovery
+[PASS] Rust embedded recovery function exists
+[PASS] Recovery rotates existing credential
+[PASS] Recovery returns secret and generation
+[PASS] Weave handles already registered
+[PASS] Weave persists recovered credential
+[PASS] App Directory has independent attempts
+[PASS] App Directory starts before optional budget
+[PASS] Old shared-budget directory timeout removed
+[PASS] Startup UI receives application-services phrase
+[PASS] Kotlin parser found no syntax/expecting errors
+[PASS] Version code bumped
+[PASS] Version name updated
+
+Result: 16/16 checks passed.
+
+Compile limitation: Gradle 9.4.1 is not cached in this environment and network access is blocked; Cargo/Rust and the Android SDK are also unavailable here. Kotlin parser smoke-test produced only expected unresolved Android/dependency references, with no syntax errors in the modified files.

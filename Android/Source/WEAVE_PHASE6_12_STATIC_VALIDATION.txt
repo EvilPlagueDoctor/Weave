@@ -1,0 +1,32 @@
+Weave Phase 6.12 Advanced Editor Redesign — static validation
+
+PASS 01 - versionCode is 38.
+PASS 02 - versionName is 0.11.0-advanced-editor-redesign.
+PASS 03 - active Advanced editor header no longer displays profileName.
+PASS 04 - active Advanced editor header still displays the current page name.
+PASS 05 - active Advanced editor header has no current-mode badge beside Done.
+PASS 06 - side-panel title strip contains only the collapse control; no Inspector/Page subtitle UI remains there.
+PASS 07 - Delete/Copy/Undo appear before Pages & layers.
+PASS 08 - Undo still restores a saved document snapshot and retains the pre-existing history mechanism.
+PASS 09 - Delete, Copy, and Undo all use matching oval RoundedCornerShape(999.dp) buttons.
+PASS 10 - bottom strip contains Previous / Background / Foreground / Next navigation.
+PASS 11 - Previous is disabled when no previous page exists.
+PASS 12 - Next navigates to an existing next page.
+PASS 13 - Next on the last page opens the create-page/name dialog while another page may be created.
+PASS 14 - page creation respects VspfLimits.MAX_PAGES.
+PASS 15 - Foreground tool set no longer exposes Block/Page creation.
+PASS 16 - newly added foreground elements are parented directly to the page root.
+PASS 17 - imported images are root-level Media elements using LocalMediaStore content hashes.
+PASS 18 - imported audio is root-level Media using LocalMediaStore content hashes.
+PASS 19 - Advanced editor uses Android PickVisualMedia for image selection.
+PASS 20 - Advanced editor uses Android GetContent(audio/*) for audio selection.
+PASS 21 - WeaveApp passes LocalMediaStore into EditorScreen.
+PASS 22 - Advanced profile canvas resolves imported image hashes through LocalMediaStore.
+PASS 23 - legacy Block elements remain supported for existing profiles, but Boxes is mapped to Foreground in the active UI.
+PASS 24 - default starter profile uses direct root-level Text elements and no child Block containers.
+PASS 25 - ProfileEditorApp.kt string/comment-aware delimiter scan is balanced.
+PASS 26 - every R.string reference in ProfileEditorApp.kt exists in default values/strings.xml.
+PASS 27 - values, values-fr, values-es, values-ru, and values-zh-rCN strings.xml all parse as valid XML.
+
+Full Android compile note:
+A Gradle compile was attempted in this environment, but the Gradle 9.4.1 wrapper distribution is not cached and services.gradle.org cannot be resolved from the sandbox. The source therefore has not been claimed as a full Android build; the user's development machine remains the compiler/runtime check.

@@ -268,7 +268,7 @@ fun WidgetStudioScreen(repo: WidgetRepository, onBack: () -> Unit) {
                 Spacer(Modifier.height(14.dp))
                 Text(state.loadingMessage, style = MaterialTheme.typography.bodyMedium)
                 Text(
-                    "Large widgets such as Chess can take a moment to prepare.",
+                    tr("Large widgets such as Chess can take a moment to prepare."),
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 6.dp),
@@ -929,11 +929,11 @@ private fun WidgetLibraryDialog(state: WidgetStudioState) {
             Column(Modifier.heightIn(max = 470.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Button(onClick = { state.newWidget(); state.showLibrary = false }, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.widget_new)) }
                 when {
-                    loadError != null -> Text("Could not load the widget library: $loadError", color = MaterialTheme.colorScheme.error)
+                    loadError != null -> Text("${tr("Could not load the widget library:")} $loadError", color = MaterialTheme.colorScheme.error)
                     all == null -> Row(verticalAlignment = Alignment.CenterVertically) {
                         CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
                         Spacer(Modifier.width(10.dp))
-                        Text("Loading widget library…")
+                        Text(tr("Loading widget library…"))
                     }
                     else -> all.orEmpty().forEach { pkg ->
                         Surface(

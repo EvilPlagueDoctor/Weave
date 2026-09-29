@@ -30,6 +30,8 @@ class GroupBranchNetwork(
         val eventChain: CommentChain.Link,
         val indexStoreId: String,
         val indexRecordKey: String,
+        val pulseStoreId: String,
+        val pulseRecordKey: String,
     )
 
     fun publishOriginal(group: GroupRecord, pulse: GroupPulse, ownerMainDht: String): Pair<GroupRecord, GroupBranchHeader> {
@@ -52,6 +54,7 @@ class GroupBranchNetwork(
             branchRoot = owned.recordKey,
             eventRoot = owned.eventChain.recordKey,
             indexRoot = owned.indexRecordKey,
+            pulseRoot = owned.pulseRecordKey,
             generation = (previous?.generation ?: 0L) + 1L,
             featured = previous?.featured ?: publicGroup.featured,
             pinnedPostIds = previous?.pinnedPostIds.orEmpty(),
@@ -66,7 +69,7 @@ class GroupBranchNetwork(
             ),
         )
         writeHeader(owned.storeId, header)
-        writePulse(owned.storeId, pulse)
+        writePulse(owned.pulseStoreId, pulse)
         if (previous == null) {
             appendEvent(
                 owned,
@@ -109,6 +112,7 @@ class GroupBranchNetwork(
             branchRoot = owned.recordKey,
             eventRoot = owned.eventChain.recordKey,
             indexRoot = owned.indexRecordKey,
+            pulseRoot = owned.pulseRecordKey,
             generation = 1,
             featured = creatorHeader.featured,
             pinnedPostIds = creatorHeader.pinnedPostIds,
@@ -124,7 +128,7 @@ class GroupBranchNetwork(
             generation = 1,
             updatedAt = now,
         )
-        writePulse(owned.storeId, initialPulse)
+        writePulse(owned.pulseStoreId, initialPulse)
         store.upsertPulse(initialPulse, branchId)
 
         appendEvent(
@@ -164,8 +168,8 @@ class GroupBranchNetwork(
         return header
     }
 
-    fun readHeader(branchRoot: String): GroupBranchHeader? = runCatching {
-        val result = client.readPublicStore(branchRoot, listOf(HEADER_SUBKEY), true)
+    fun readHeader(branchRoot: String, force: Boolean = true): GroupBranchHeader? = runCatching {
+        val result = client.readPublicStore(branchRoot, listOf(HEADER_SUBKEY), force)
         val bytes = CommentChain.decodeValue(result.optJSONArray("values")?.optJSONObject(0)) ?: return null
         GroupBranchHeader.fromJson(JSONObject(bytes.decodeToString()))
     }.getOrNull()
@@ -177,9 +181,49 @@ class GroupBranchNetwork(
      * branch root usually stays the same while subkey 1 changes as posts/comments are accepted.
      */
     fun readPulse(branchRoot: String, force: Boolean = true): GroupPulse? = runCatching {
-        val result = client.readPublicStore(branchRoot, listOf(PULSE_SUBKEY), force)
-        val bytes = CommentChain.decodeValue(result.optJSONArray("values")?.optJSONObject(0)) ?: return null
-        GroupPulse.fromJson(JSONObject(bytes.decodeToString()))
+        val header = readHeader(branchRoot, force)
+        val pulseRoot = header?.pulseRoot.orEmpty()
+
+        // Backwards compatibility: pre-paging branches stored one monolithic Pulse at branch
+        // subkey 1. Once an owner publishes again, publishPulse() lazily migrates that branch to
+        // the dedicated paged Pulse store advertised by pulse_root.
+        if (pulseRoot.isBlank()) {
+            val result = client.readPublicStore(branchRoot, listOf(PULSE_SUBKEY), force)
+            val bytes = CommentChain.decodeValue(result.optJSONArray("values")?.optJSONObject(0)) ?: return null
+            return@runCatching GroupPulse.fromJson(JSONObject(bytes.decodeToString()))
+        }
+
+        val firstResult = client.readPublicStore(pulseRoot, listOf(0), force)
+        val firstBytes = CommentChain.decodeValue(firstResult.optJSONArray("values")?.optJSONObject(0)) ?: return null
+        val first = GroupPulse.fromJson(JSONObject(firstBytes.decodeToString()))
+        val pageCount = first.pageCount.coerceIn(1, PULSE_STORE_SUBKEYS)
+        if (pageCount == 1) return@runCatching first.copy(page = 0, pageCount = 1)
+
+        val remaining = client.readPublicStore(pulseRoot, (1 until pageCount).toList(), force)
+            .optJSONArray("values")
+        val pages = mutableListOf(first)
+        if (remaining != null) {
+            for (i in 0 until remaining.length()) {
+                val bytes = CommentChain.decodeValue(remaining.optJSONObject(i)) ?: continue
+                val page = runCatching { GroupPulse.fromJson(JSONObject(bytes.decodeToString())) }.getOrNull() ?: continue
+                if (page.groupId == first.groupId && page.generation == first.generation) pages += page
+            }
+        }
+        GroupPulse(
+            groupId = first.groupId,
+            generation = first.generation,
+            updatedAt = first.updatedAt,
+            page = 0,
+            pageCount = pageCount,
+            conversations = pages.flatMap { it.conversations }
+                .distinctBy { it.conversation.objectId }
+                .sortedByDescending { it.lastActivity }
+                .take(GroupPulse.MAX_PULSE_CONVERSATIONS),
+            removedPosts = pages.flatMap { it.removedPosts }
+                .distinctBy { it.postId }
+                .sortedByDescending { it.removedAt }
+                .take(GroupPulse.MAX_REMOVED_POST_NOTICES),
+        )
     }.getOrNull()
 
     fun readEvents(branchRoot: String, maxEntries: Int = 512): List<GroupEvent> {
@@ -326,7 +370,18 @@ class GroupBranchNetwork(
             "Only this branch owner may publish its Pulse"
         }
         val owned = resolveOwned(header)
-        writePulse(owned.storeId, pulse)
+        // Populate the new store before advertising it from the branch header. Readers that see
+        // pulse_root should therefore have a valid first page available immediately.
+        writePulse(owned.pulseStoreId, pulse)
+        if (header.pulseRoot != owned.pulseRecordKey) {
+            val migrated = header.copy(
+                pulseRoot = owned.pulseRecordKey,
+                generation = header.generation + 1,
+            )
+            writeHeader(owned.storeId, migrated)
+            store.rememberBranchHeader(migrated)
+            logger("groups: migrated branch ${shortBranch(header.branchId)} to paged Pulse store ${shortBranch(owned.pulseRecordKey)}")
+        }
         store.upsertPulse(pulse, header.branchId)
     }
 
@@ -781,12 +836,15 @@ class GroupBranchNetwork(
         val branchStore = findOrCreate("weave_group_${safeGroup}_${safeBranch}_branch", BRANCH_SUBKEYS)
         val events = CommentChain.ensureOwnedStore(client, "weave_group_${safeGroup}_${safeBranch}_events")
         val index = findOrCreate("weave_group_${safeGroup}_${safeBranch}_index", INDEX_SUBKEYS)
+        val pulse = findOrCreate("weave_group_${safeGroup}_${safeBranch}_pulse", PULSE_STORE_SUBKEYS)
         return OwnedBranch(
             storeId = branchStore.first,
             recordKey = branchStore.second,
             eventChain = events,
             indexStoreId = index.first,
             indexRecordKey = index.second,
+            pulseStoreId = pulse.first,
+            pulseRecordKey = pulse.second,
         )
     }
 
@@ -817,7 +875,79 @@ class GroupBranchNetwork(
     }.getOrNull()
 
     private fun writePulse(storeId: String, pulse: GroupPulse) {
-        client.writeStore(storeId, PULSE_SUBKEY, pulse.toJson().toString().encodeToByteArray())
+        val pages = encodePulsePages(pulse)
+        pages.forEachIndexed { index, bytes ->
+            client.writeStore(storeId, index, bytes)
+        }
+        logger(
+            "groups: Pulse published generation=${pulse.generation} pages=${pages.size} " +
+                "bytes=${pages.sumOf { it.size }} max_page=${pages.maxOfOrNull { it.size } ?: 0}"
+        )
+    }
+
+    /**
+     * Split the current view by encoded byte size, not by item count. Thumbnails make Pulse
+     * entries variable-sized, so count-only pagination can still cross the daemon's 32 KiB
+     * per-value ceiling. 30 KiB leaves headroom for JSON/version growth.
+     */
+    private fun encodePulsePages(pulse: GroupPulse): List<ByteArray> {
+        data class Page(
+            val conversations: MutableList<GroupConversationPreview> = mutableListOf(),
+            val removed: MutableList<GroupRemovedPostNotice> = mutableListOf(),
+        )
+
+        val pages = mutableListOf(Page())
+
+        fun encoded(page: Page, pageIndex: Int, pageCount: Int): ByteArray = pulse.copy(
+            page = pageIndex,
+            pageCount = pageCount,
+            conversations = page.conversations,
+            removedPosts = page.removed,
+        ).toJson().toString().encodeToByteArray()
+
+        fun ensureFits(add: (Page) -> Unit, remove: (Page) -> Unit) {
+            var page = pages.last()
+            add(page)
+            if (encoded(page, pages.lastIndex, PULSE_STORE_SUBKEYS).size <= MAX_PULSE_PAGE_BYTES) return
+            remove(page)
+            require(pages.size < PULSE_STORE_SUBKEYS) {
+                "Group Pulse requires more than $PULSE_STORE_SUBKEYS pages; compact old previews before publishing"
+            }
+            page = Page()
+            pages += page
+            add(page)
+            require(encoded(page, pages.lastIndex, PULSE_STORE_SUBKEYS).size <= MAX_PULSE_PAGE_BYTES) {
+                "One Group Pulse item exceeds the safe ${MAX_PULSE_PAGE_BYTES}-byte page size"
+            }
+        }
+
+        pulse.conversations
+            .sortedByDescending { it.lastActivity }
+            .take(GroupPulse.MAX_PULSE_CONVERSATIONS)
+            .forEach { conversation ->
+                ensureFits(
+                    add = { it.conversations += conversation },
+                    remove = { it.conversations.removeAt(it.conversations.lastIndex) },
+                )
+            }
+        pulse.removedPosts
+            .sortedByDescending { it.removedAt }
+            .take(GroupPulse.MAX_REMOVED_POST_NOTICES)
+            .forEach { notice ->
+                ensureFits(
+                    add = { it.removed += notice },
+                    remove = { it.removed.removeAt(it.removed.lastIndex) },
+                )
+            }
+
+        val count = pages.size
+        return pages.mapIndexed { index, page ->
+            encoded(page, index, count).also { bytes ->
+                require(bytes.size <= MAX_PULSE_PAGE_BYTES) {
+                    "Group Pulse page ${index + 1}/$count is ${bytes.size} bytes; safe maximum is $MAX_PULSE_PAGE_BYTES"
+                }
+            }
+        }
     }
 
     private fun appendEvent(owned: OwnedBranch, event: GroupEvent) {
@@ -855,6 +985,8 @@ class GroupBranchNetwork(
         const val BRANCH_SUBKEYS = 8
         const val HEADER_SUBKEY = 0
         const val PULSE_SUBKEY = 1
+        const val PULSE_STORE_SUBKEYS = 32
+        const val MAX_PULSE_PAGE_BYTES = 30 * 1024
 
         const val INDEX_SUBKEYS = 64
         const val MAX_INDEX_BUCKET_ENTRIES = 128
@@ -897,6 +1029,9 @@ class GroupBranchNetwork(
 
         private fun safe(value: String): String =
             value.replace(Regex("[^A-Za-z0-9]"), "").take(28)
+
+        private fun shortBranch(value: String): String =
+            if (value.length <= 18) value else "${value.take(8)}…${value.takeLast(6)}"
 
         private fun mergeBranches(
             existing: List<GroupBranchPointer>,

@@ -475,7 +475,7 @@ private fun ProfileGroupsSection(
     onOpenGroup: (String) -> Unit,
 ) {
     Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
-        Text("Groups", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+        Text(tr("Groups"), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
         groups.take(12).forEach { group ->
             Surface(
                 modifier = Modifier.fillMaxWidth().padding(top = 6.dp).clickable { onOpenGroup(group.groupId) },

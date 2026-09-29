@@ -31,7 +31,7 @@ fun SocialNetworkScreen(
     var tab by remember { mutableIntStateOf(0) }
     Column(Modifier.fillMaxSize().safeDrawingPadding().padding(10.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = onBack) { Text("← Profile") }
+            TextButton(onClick = onBack) { Text(tr("← Profile")) }
             Column(Modifier.weight(1f)) {
                 Text("Weave", style = MaterialTheme.typography.titleLarge)
                 SelectionContainer { Text(state.status, style = MaterialTheme.typography.labelMedium) }
@@ -39,7 +39,7 @@ fun SocialNetworkScreen(
         }
         Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             listOf("Recent 50", "Publish", "Discovery Lab", "Network / Debug").forEachIndexed { index, label ->
-                FilterChip(selected = tab == index, onClick = { tab = index }, label = { Text(label) })
+                FilterChip(selected = tab == index, onClick = { tab = index }, label = { Text(tr(label)) })
             }
         }
         HorizontalDivider(Modifier.padding(vertical = 7.dp))
@@ -56,8 +56,8 @@ fun SocialNetworkScreen(
 private fun SocialRecentTab(state: SocialUiState, controller: SocialNetworkController, onOpenRemote: (String, String, String) -> Unit) {
     if (state.recent.isEmpty()) {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("No other profile pages discovered yet. VeilKnit app discovery supplies bootstrap peers; Weave gossip fills this list as profiles are encountered.")
-            Button(onClick = { controller.refreshNow() }) { Text("Refresh peers") }
+            Text(tr("No other profile pages discovered yet. VeilKnit app discovery supplies bootstrap peers; Weave gossip fills this list as profiles are encountered."))
+            Button(onClick = { controller.refreshNow() }) { Text(tr("Refresh peers")) }
         }
         return
     }
@@ -79,26 +79,26 @@ private fun SocialRecentTab(state: SocialUiState, controller: SocialNetworkContr
 private fun SocialPublishTab(state: SocialUiState, controller: SocialNetworkController, ownProfileText: () -> String, ownProfileName: () -> String) {
     val clipboard = LocalClipboardManager.current
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("The decorated VSPF page is the public profile. These fields are discovery metadata used by MinHash/search; the profile name is still excluded from the MinHash signature.")
+        Text(tr("The decorated VSPF page is the public profile. These fields are discovery metadata used by MinHash/search; the profile name is still excluded from the MinHash signature."))
         OutlinedTextField(
             value = state.discoveryName,
             onValueChange = controller::setDiscoveryName,
-            label = { Text("Discovery/display name (blank = Profile Page name)") },
+            label = { Text(tr("Discovery/display name (blank = Profile Page name)")) },
             modifier = Modifier.fillMaxWidth(), singleLine = true
         )
-        OutlinedTextField(state.discoveryDescription, controller::setDiscoveryDescription, label = { Text("Discovery description") }, minLines = 4, modifier = Modifier.fillMaxWidth())
-        OutlinedTextField(state.featuresText, controller::setFeatures, label = { Text("Skills / interests / tags (comma, semicolon, or new line)") }, minLines = 3, modifier = Modifier.fillMaxWidth())
-        Button(onClick = { controller.publishProfile(ownProfileText(), ownProfileName()) }) { Text("Publish current Profile Page") }
-        Text("The VSPF document is uploaded through the daemon blob store; this app-root DHT holds only its descriptor/hash and discovery metadata.", style = MaterialTheme.typography.bodySmall)
+        OutlinedTextField(state.discoveryDescription, controller::setDiscoveryDescription, label = { Text(tr("Discovery description")) }, minLines = 4, modifier = Modifier.fillMaxWidth())
+        OutlinedTextField(state.featuresText, controller::setFeatures, label = { Text(tr("Skills / interests / tags (comma, semicolon, or new line)")) }, minLines = 3, modifier = Modifier.fillMaxWidth())
+        Button(onClick = { controller.publishProfile(ownProfileText(), ownProfileName()) }) { Text(tr("Publish current Profile Page")) }
+        Text(tr("The VSPF document is uploaded through the daemon blob store; this app-root DHT holds only its descriptor/hash and discovery metadata."), style = MaterialTheme.typography.bodySmall)
         SelectionContainer {
             Column {
-                Text("Main DHT: ${state.mainDht}", fontFamily = FontFamily.Monospace)
-                Text("Profile root: ${state.profileRoot}", fontFamily = FontFamily.Monospace)
+                Text("${tr("Main DHT")}: ${state.mainDht}", fontFamily = FontFamily.Monospace)
+                Text("${tr("Profile root")}: ${state.profileRoot}", fontFamily = FontFamily.Monospace)
             }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            TextButton(onClick = { clipboard.setText(AnnotatedString(state.mainDht)) }) { Text("Copy main DHT") }
-            TextButton(onClick = { clipboard.setText(AnnotatedString(state.profileRoot)) }) { Text("Copy profile root") }
+            TextButton(onClick = { clipboard.setText(AnnotatedString(state.mainDht)) }) { Text(tr("Copy main DHT")) }
+            TextButton(onClick = { clipboard.setText(AnnotatedString(state.profileRoot)) }) { Text(tr("Copy profile root")) }
         }
     }
 }
@@ -107,23 +107,23 @@ private fun SocialPublishTab(state: SocialUiState, controller: SocialNetworkCont
 private fun SocialDiscoveryTab(state: SocialUiState, controller: SocialNetworkController, onOpenRemote: (String, String, String) -> Unit) {
     Column(Modifier.fillMaxSize()) {
         Column(Modifier.verticalScroll(rememberScrollState()).heightIn(max = 390.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-            OutlinedTextField(state.nameQuery, controller::setNameQuery, label = { Text("Name / prefix search (e.g. bob)") }, modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(state.query, controller::setQuery, label = { Text("Feature/keyword seed (e.g. woodworking)") }, modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(state.positiveMainDht, controller::setPositive, label = { Text("More-like profile main DHT (optional)") }, modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(state.negativeMainDht, controller::setNegative, label = { Text("Avoid-like profile main DHT (optional)") }, modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(state.nameQuery, controller::setNameQuery, label = { Text(tr("Name / prefix search (e.g. bob)")) }, modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(state.query, controller::setQuery, label = { Text(tr("Feature/keyword seed (e.g. woodworking)")) }, modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(state.positiveMainDht, controller::setPositive, label = { Text(tr("More-like profile main DHT (optional)")) }, modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(state.negativeMainDht, controller::setNegative, label = { Text(tr("Avoid-like profile main DHT (optional)")) }, modifier = Modifier.fillMaxWidth())
             SocialSlider("Avoidance strength", state.avoidance, 0f..1.5f, controller::setAvoidance)
             SocialSlider("Common-word penalty", state.commonPenalty, 0f..1f, controller::setCommonPenalty)
             SocialSlider("Stuffing penalty", state.stuffingPenalty, 0f..1f, controller::setStuffingPenalty)
             SocialSlider("Novelty / exploration", state.novelty, 0f..0.75f, controller::setNovelty)
             Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Button(onClick = { controller.search() }) { Text("Run / continue search") }
-                Button(onClick = { controller.clearExamples() }) { Text("Clear examples") }
-                Button(onClick = { controller.refreshNow() }) { Text("Refresh peers") }
-                Button(onClick = { controller.gossipNow() }) { Text("Gossip now") }
+                Button(onClick = { controller.search() }) { Text(tr("Run / continue search")) }
+                Button(onClick = { controller.clearExamples() }) { Text(tr("Clear examples")) }
+                Button(onClick = { controller.refreshNow() }) { Text(tr("Refresh peers")) }
+                Button(onClick = { controller.gossipNow() }) { Text(tr("Gossip now")) }
             }
         }
         HorizontalDivider(Modifier.padding(vertical = 6.dp))
-        Text("Results (${state.searchResults.size})")
+        Text("${tr("Results")} (${state.searchResults.size})")
         LazyColumn(verticalArrangement = Arrangement.spacedBy(5.dp), modifier = Modifier.weight(1f)) {
             items(state.searchResults, key = { it.hint.mainDht }) { result -> SearchResultCard(result, controller, onOpenRemote) }
         }
@@ -137,15 +137,15 @@ private fun SearchResultCard(result: ScoredProfile, controller: SocialNetworkCon
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             SelectionContainer {
-                Text("${result.hint.name.ifBlank { "(unnamed)" }}  score=${"%.3f".format(result.score)}  name=${"%.2f".format(result.nameScore)}  +sim=${"%.2f".format(result.positiveSimilarity)}  -sim=${"%.2f".format(result.negativeSimilarity)}  novelty=${"%.2f".format(result.noveltyBonus)}\n${result.hint.mainDht}")
+                Text("${result.hint.name.ifBlank { tr("(unnamed)") }}  score=${"%.3f".format(result.score)}  name=${"%.2f".format(result.nameScore)}  +sim=${"%.2f".format(result.positiveSimilarity)}  -sim=${"%.2f".format(result.negativeSimilarity)}  novelty=${"%.2f".format(result.noveltyBonus)}\n${result.hint.mainDht}")
             }
             Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                 Button(onClick = {
                     if (text != null) onOpenRemote(result.hint.mainDht, result.hint.name, text) else controller.ensureProfileAvailable(result.hint.mainDht)
-                }) { Text(if (text != null) "Open page" else "Fetch + verify") }
-                TextButton(onClick = { controller.moreLike(result.hint.mainDht) }) { Text("More like") }
-                TextButton(onClick = { controller.avoidLike(result.hint.mainDht) }) { Text("Avoid like") }
-                TextButton(onClick = { clipboard.setText(AnnotatedString(result.hint.mainDht)) }) { Text("Copy DHT") }
+                }) { Text(tr(if (text != null) "Open page" else "Fetch + verify")) }
+                TextButton(onClick = { controller.moreLike(result.hint.mainDht) }) { Text(tr("More like")) }
+                TextButton(onClick = { controller.avoidLike(result.hint.mainDht) }) { Text(tr("Avoid like")) }
+                TextButton(onClick = { clipboard.setText(AnnotatedString(result.hint.mainDht)) }) { Text(tr("Copy DHT")) }
             }
         }
     }
@@ -162,19 +162,19 @@ private fun ProfileDiscoveryCard(
         Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
             SelectionContainer {
                 Column {
-                    Text(name.ifBlank { "(unnamed profile)" }, style = MaterialTheme.typography.titleMedium)
+                    Text(name.ifBlank { tr("(unnamed profile)") }, style = MaterialTheme.typography.titleMedium)
                     if (description.isNotBlank()) Text(description)
-                    if (features.isNotEmpty()) Text("Skills/interests: ${features.joinToString(", ")}")
-                    Text("State: ${verification.name.lowercase()} • signature: $signature", style = MaterialTheme.typography.labelSmall)
+                    if (features.isNotEmpty()) Text("${tr("Skills/interests")}: ${features.joinToString(", ")}")
+                    Text("${tr("State")}: ${tr(verification.name.lowercase())} • ${tr("signature")}: $signature", style = MaterialTheme.typography.labelSmall)
                     Text(mainDht, style = MaterialTheme.typography.labelSmall, fontFamily = FontFamily.Monospace)
                 }
             }
             Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                Button(onClick = onOpen) { Text(if (openable) "Open page" else "Fetch + verify") }
-                TextButton(onClick = onMore) { Text("More like") }
-                TextButton(onClick = onAvoid) { Text("Avoid like") }
-                TextButton(onClick = { clipboard.setText(AnnotatedString(mainDht)) }) { Text("Copy DHT") }
-                TextButton(onClick = { clipboard.setText(AnnotatedString(root)) }) { Text("Copy root") }
+                Button(onClick = onOpen) { Text(tr(if (openable) "Open page" else "Fetch + verify")) }
+                TextButton(onClick = onMore) { Text(tr("More like")) }
+                TextButton(onClick = onAvoid) { Text(tr("Avoid like")) }
+                TextButton(onClick = { clipboard.setText(AnnotatedString(mainDht)) }) { Text(tr("Copy DHT")) }
+                TextButton(onClick = { clipboard.setText(AnnotatedString(root)) }) { Text(tr("Copy root")) }
             }
         }
     }
@@ -185,17 +185,17 @@ private fun SocialDebugTab(state: SocialUiState, controller: SocialNetworkContro
     val clipboard = LocalClipboardManager.current
     Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(7.dp)) {
         SelectionContainer {
-            Text("Peers=${state.peers}   DHT/blob-verified=${state.verified}   gossip sent=${state.gossipSent}   gossip received=${state.gossipReceived}\nMain DHT=${state.mainDht}\nProfile root=${state.profileRoot}")
+            Text("${tr("Peers")}=${state.peers}   ${tr("DHT/blob-verified")}=${state.verified}   ${tr("gossip sent")}=${state.gossipSent}   ${tr("gossip received")}=${state.gossipReceived}\n${tr("Main DHT")}=${state.mainDht}\n${tr("Profile root")}=${state.profileRoot}")
         }
         Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            Button(onClick = { controller.refreshNow() }) { Text("Refresh") }
-            Button(onClick = { controller.gossipNow() }) { Text("Gossip now") }
-            Button(onClick = { clipboard.setText(AnnotatedString(state.clusterText)) }) { Text("Copy clusters") }
-            Button(onClick = { clipboard.setText(AnnotatedString(state.debugLog)) }) { Text("Copy debug log") }
+            Button(onClick = { controller.refreshNow() }) { Text(tr("Refresh")) }
+            Button(onClick = { controller.gossipNow() }) { Text(tr("Gossip now")) }
+            Button(onClick = { clipboard.setText(AnnotatedString(state.clusterText)) }) { Text(tr("Copy clusters")) }
+            Button(onClick = { clipboard.setText(AnnotatedString(state.debugLog)) }) { Text(tr("Copy debug log")) }
         }
-        Text("Cluster map / rotating record table")
+        Text(tr("Cluster map / rotating record table"))
         OutlinedTextField(state.clusterText, {}, readOnly = true, modifier = Modifier.fillMaxWidth().heightIn(min = 115.dp), textStyle = LocalTextStyle.current.copy(fontFamily = FontFamily.Monospace))
-        Text("Daemon + Weave debug log")
+        Text(tr("Daemon + Weave debug log"))
         OutlinedTextField(state.debugLog, {}, readOnly = true, modifier = Modifier.fillMaxWidth().weight(1f), textStyle = LocalTextStyle.current.copy(fontFamily = FontFamily.Monospace))
     }
 }
@@ -203,7 +203,7 @@ private fun SocialDebugTab(state: SocialUiState, controller: SocialNetworkContro
 @Composable
 private fun SocialSlider(label: String, value: Float, range: ClosedFloatingPointRange<Float>, setter: (Float) -> Unit) {
     Column {
-        Text("$label: ${"%.2f".format(value)}", style = MaterialTheme.typography.labelMedium)
+        Text("${tr(label)}: ${"%.2f".format(value)}", style = MaterialTheme.typography.labelMedium)
         Slider(value = value, onValueChange = setter, valueRange = range)
     }
 }

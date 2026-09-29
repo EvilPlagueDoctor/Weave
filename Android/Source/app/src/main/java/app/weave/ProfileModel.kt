@@ -169,36 +169,24 @@ fun makeDefaultProfile(): ProfileDocument {
         stampDecoration = DecorationRef(builtinName = "Star1", basedOnBuiltin = "Star1"), rotationDegrees = 23f, opacity = .75f
     )
 
-    val header = Element(
-        type = ElementType.Block, id = makeId("block"), name = "Header Box",
-        rect = RectSpec(.07f, .055f, .86f, .13f, 2),
-        background = BackgroundSpec(solidArgb = 0x00FFFFFF),
-        border = DecorationRef(builtinName = "None", basedOnBuiltin = "None")
-    )
-    header.children += Element(
+    // New profiles use freeform root-level foreground items. Blocks remain in the
+    // wire format so older profiles continue to render/edit, but they are no longer
+    // required as containers by the Advanced editor.
+    root.children += Element(
         type = ElementType.Text, id = makeId("text"), name = "Profile Title",
-        rect = RectSpec(.02f, .12f, .96f, .70f, 1), text = "My Weave Page",
+        rect = RectSpec(.09f, .07f, .82f, .10f, 2), text = "My Weave Page",
         fontSize = 30f, bold = true, textAlign = TextAlignMode.Center
     )
-    root.children += header
-
-    val box = Element(
-        type = ElementType.Block, id = makeId("block"), name = "Welcome Box",
-        rect = RectSpec(.10f, .22f, .80f, .58f, 3),
-        background = BackgroundSpec(solidArgb = 0xFFFFFFFF.toInt()),
-        border = DecorationRef(builtinName = "Thin1", basedOnBuiltin = "Thin1"), borderThickness = 2f
-    )
-    box.children += Element(
+    root.children += Element(
         type = ElementType.Text, id = makeId("text"), name = "Welcome Text",
-        rect = RectSpec(.07f, .08f, .86f, .34f, 1),
+        rect = RectSpec(.15f, .27f, .70f, .20f, 3),
         text = "Drag, resize and decorate this page. The profile document stays non-executable; compiled widgets run only inside their own sandboxed rectangles.",
         fontSize = 17f
     )
-    box.children += Element(
+    root.children += Element(
         type = ElementType.Widget, id = makeId("widget"), name = "Widget Placeholder",
-        rect = RectSpec(.18f, .52f, .64f, .35f, 2), widgetLabel = "Future Widget"
+        rect = RectSpec(.24f, .54f, .52f, .20f, 4), widgetLabel = "Future Widget"
     )
-    root.children += box
 
     return ProfileDocument(
         profileName = "My Profile", defaultPageId = "home",

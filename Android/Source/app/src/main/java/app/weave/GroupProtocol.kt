@@ -348,6 +348,11 @@ data class GroupBranchHeader(
     val branchRoot: String,
     val eventRoot: String,
     val indexRoot: String,
+    /**
+     * Optional paged Pulse store. Older branches kept their entire Pulse in branch subkey 1;
+     * readers deliberately fall back to that layout when this field is absent.
+     */
+    val pulseRoot: String = "",
     val generation: Long,
     val featured: FeaturedSlot = FeaturedSlot(),
     val pinnedPostIds: List<String> = emptyList(),
@@ -375,6 +380,7 @@ data class GroupBranchHeader(
         .put("branch_root", branchRoot)
         .put("event_root", eventRoot)
         .put("index_root", indexRoot)
+        .apply { pulseRoot.takeIf { it.isNotBlank() }?.let { put("pulse_root", it) } }
         .put("generation", generation)
         .put("featured", featured.toJson())
         .put("pinned_posts", JSONArray(pinnedPostIds.distinct().take(100)))
@@ -411,6 +417,7 @@ data class GroupBranchHeader(
                 branchRoot = o.getString("branch_root"),
                 eventRoot = o.getString("event_root"),
                 indexRoot = o.getString("index_root"),
+                pulseRoot = o.optString("pulse_root"),
                 generation = o.optLong("generation"),
                 featured = FeaturedSlot.fromJson(o.optJSONObject("featured")).let {
                     if (it.kind == FeaturedKind.None && !o.has("featured")) group.featured else it

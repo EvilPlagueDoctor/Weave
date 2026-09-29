@@ -1,0 +1,19 @@
+[PASS] claim settings busy state
+[PASS] claim settings spinner
+[PASS] group claim spinner
+[PASS] group search prefetch callback
+[PASS] group row thumbnail prefetch
+[PASS] controller branch refresh wired
+[PASS] profile search icon
+[PASS] compact filtered font 9sp
+[PASS] shared Weave language pref
+[PASS] shared daemon language pref
+[PASS] daemon language listener
+[PASS] daemon display field explicit colors
+[PASS] version code 34
+[PASS] version name 0.10.3
+[PASS] Weave tr literal coverage (347 keys)
+[PASS] Daemon translated helper/literal coverage (134 keys)
+[PASS] no obvious untranslated static Text literals in Weave
+
+Passed 17/17 checks.

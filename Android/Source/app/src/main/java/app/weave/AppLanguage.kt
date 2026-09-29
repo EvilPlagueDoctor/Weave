@@ -1,7 +1,12 @@
 package app.weave
 
+import android.app.LocaleManager
 import android.content.Context
+import android.content.res.Configuration
+import android.os.Build
+import android.os.LocaleList
 import androidx.compose.runtime.*
+import java.util.Locale
 
 /** App chrome language only. Profile/page text is never passed through this translator. */
 enum class AppLanguage(val code: String, val label: String) {
@@ -12,28 +17,91 @@ enum class AppLanguage(val code: String, val label: String) {
     ChineseSimplified("zh-CN", "简体中文");
 
     companion object {
-        fun fromCode(code: String?) = entries.firstOrNull { it.code.equals(code, true) } ?: English
+        fun fromCode(code: String?): AppLanguage {
+            if (code.equals("zh", true) || code.equals("zh-CN", true) || code.equals("zh_CN", true)) {
+                return ChineseSimplified
+            }
+            return entries.firstOrNull { it.code.equals(code, true) } ?: English
+        }
     }
 }
 
 val LocalAppLanguage = staticCompositionLocalOf { AppLanguage.English }
 
 class AppLanguageState(context: Context) : PrivateVault.Participant {
-    private val vault = PrivateVault.get(context.applicationContext)
-    var current by mutableStateOf(AppLanguage.English)
-        private set
-
-    init { vault.register(this) }
-
-    override fun onVaultAttached() {
-        current = AppLanguage.fromCode(vault.getText("ui/language.txt"))
+    private val appContext = context.applicationContext
+    private val vault = PrivateVault.get(appContext)
+    private val shared = appContext.getSharedPreferences(SHARED_LANGUAGE_FILE, Context.MODE_PRIVATE)
+    private val legacyDaemon = appContext.getSharedPreferences("veilknit_ui", Context.MODE_PRIVATE)
+    private val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == SHARED_LANGUAGE_KEY) {
+            applySharedLanguage(AppLanguage.fromCode(shared.getString(SHARED_LANGUAGE_KEY, "en")), persistVault = true)
+        }
     }
 
-    override fun onVaultDetached() { current = AppLanguage.English }
+    var current by mutableStateOf(
+        AppLanguage.fromCode(
+            shared.getString(SHARED_LANGUAGE_KEY, null)
+                ?: legacyDaemon.getString("language", null)
+                ?: "en"
+        )
+    )
+        private set
+
+    init {
+        shared.registerOnSharedPreferenceChangeListener(listener)
+        vault.register(this)
+        applyPlatformLocale(appContext, current.code)
+    }
+
+    override fun onVaultAttached() {
+        val sharedCode = shared.getString(SHARED_LANGUAGE_KEY, null)
+        val legacyCode = legacyDaemon.getString("language", null)
+        val vaultCode = vault.getText("ui/language.txt")
+        val resolved = AppLanguage.fromCode(sharedCode ?: legacyCode ?: vaultCode ?: "en")
+        if (sharedCode == null) {
+            shared.edit().putString(SHARED_LANGUAGE_KEY, resolved.code).apply()
+        }
+        applySharedLanguage(resolved, persistVault = true)
+    }
+
+    // Language is now an app-wide preference shared with the embedded VeilKnit GUI, so logging
+    // out of one VeilKnit identity must not unexpectedly switch the UI back to English.
+    override fun onVaultDetached() = Unit
 
     fun select(language: AppLanguage) {
+        applySharedLanguage(language, persistVault = true)
+        shared.edit().putString(SHARED_LANGUAGE_KEY, language.code).apply()
+        // Keep the old daemon preference populated for standalone/older builds during migration.
+        legacyDaemon.edit().putString("language", language.code).apply()
+    }
+
+    private fun applySharedLanguage(language: AppLanguage, persistVault: Boolean) {
         current = language
-        if (vault.attached) vault.putText("ui/language.txt", language.code)
+        if (persistVault && vault.attached) {
+            runCatching { vault.putText("ui/language.txt", language.code) }
+        }
+        applyPlatformLocale(appContext, language.code)
+    }
+}
+
+private const val SHARED_LANGUAGE_FILE = "weave_veilknit_ui"
+private const val SHARED_LANGUAGE_KEY = "language"
+
+/** Keep Android string resources (not just tr()) on the same language as Weave/VeilKnit. */
+private fun applyPlatformLocale(context: Context, code: String) {
+    val tag = if (code.equals("zh", true)) "zh-CN" else code
+    runCatching {
+        if (Build.VERSION.SDK_INT >= 33) {
+            context.getSystemService(LocaleManager::class.java)?.applicationLocales = LocaleList.forLanguageTags(tag)
+        } else {
+            @Suppress("DEPRECATION")
+            val resources = context.resources
+            @Suppress("DEPRECATION")
+            val config = Configuration(resources.configuration).apply { setLocale(Locale.forLanguageTag(tag)) }
+            @Suppress("DEPRECATION")
+            resources.updateConfiguration(config, resources.displayMetrics)
+        }
     }
 }
 
@@ -110,8 +178,51 @@ private val UI_TRANSLATIONS = mapOf(
     "Activity" to arrayOf("Activité", "Actividad", "Активность", "动态"),
     "Me" to arrayOf("Moi", "Yo", "Я", "我"),
     "Home" to arrayOf("Accueil", "Inicio", "Главная", "主页"),
-    "Connecting to the VeilKnit daemon. A cold start takes a minute or two while the node finds peers." to arrayOf("Connexion au démon VeilKnit. Un démarrage à froid peut prendre une ou deux minutes pendant que le nœud trouve des pairs.", "Conectando con el daemon de VeilKnit. Un arranque en frío puede tardar uno o dos minutos mientras el nodo encuentra pares.", "Подключение к демону VeilKnit. При холодном запуске узлу может понадобиться одна-две минуты, чтобы найти пиры.", "正在连接 VeilKnit 守护程序。冷启动时，节点寻找对等方可能需要一两分钟。"),
-    "Can't reach the daemon" to arrayOf("Impossible de joindre le démon", "No se puede conectar con el daemon", "Не удаётся связаться с демоном", "无法连接守护程序"),
+    "Don't forget to publish your profile!" to arrayOf("N'oubliez pas de publier votre profil !", "¡No olvides publicar tu perfil!", "Не забудьте опубликовать свой профиль!", "别忘了发布你的个人资料！"),
+    "Your profile stays unpublished until you choose to publish it." to arrayOf("Votre profil reste non publié jusqu'à ce que vous choisissiez de le publier.", "Tu perfil permanece sin publicar hasta que decidas publicarlo.", "Ваш профиль останется неопубликованным, пока вы сами его не опубликуете.", "在你主动发布之前，你的个人资料会保持未发布状态。"),
+    "You can switch between Basic and Advanced profile editing at any time." to arrayOf("Vous pouvez passer de l'éditeur Basique à l'éditeur Avancé à tout moment.", "Puedes cambiar entre la edición Básica y Avanzada en cualquier momento.", "Вы можете в любой момент переключаться между простым и расширенным редактором профиля.", "你可以随时在基础和高级个人资料编辑器之间切换。"),
+    "Advanced profiles can use multiple pages." to arrayOf("Les profils avancés peuvent utiliser plusieurs pages.", "Los perfiles avanzados pueden usar varias páginas.", "Расширенные профили могут содержать несколько страниц.", "高级个人资料可以使用多个页面。"),
+    "Use Pages & Layers to change which elements appear in front." to arrayOf("Utilisez Pages et calques pour choisir quels éléments apparaissent devant.", "Usa Páginas y capas para cambiar qué elementos aparecen delante.", "Используйте «Страницы и слои», чтобы менять, какие элементы отображаются поверх других.", "使用“页面与图层”可以调整哪些元素显示在前面。"),
+    "Long-press a page or layer to move it." to arrayOf("Appuyez longuement sur une page ou un calque pour le déplacer.", "Mantén pulsada una página o capa para moverla.", "Нажмите и удерживайте страницу или слой, чтобы переместить его.", "长按页面或图层即可移动它。"),
+    "Your profile can include images, audio, widgets, links, and more." to arrayOf("Votre profil peut contenir des images, de l'audio, des widgets, des liens et plus encore.", "Tu perfil puede incluir imágenes, audio, widgets, enlaces y más.", "В профиль можно добавлять изображения, аудио, виджеты, ссылки и многое другое.", "你的个人资料可以包含图片、音频、小组件、链接等内容。"),
+    "Widgets only load when you choose to open them." to arrayOf("Les widgets ne se chargent que lorsque vous choisissez de les ouvrir.", "Los widgets solo se cargan cuando decides abrirlos.", "Виджеты загружаются только когда вы сами решаете их открыть.", "小组件只有在你选择打开时才会加载。"),
+    "You can disable widget loading in Settings." to arrayOf("Vous pouvez désactiver le chargement des widgets dans les paramètres.", "Puedes desactivar la carga de widgets en Ajustes.", "Загрузку виджетов можно отключить в настройках.", "你可以在设置中关闭小组件加载。"),
+    "External links show a warning before opening your browser." to arrayOf("Les liens externes affichent un avertissement avant d'ouvrir votre navigateur.", "Los enlaces externos muestran una advertencia antes de abrir el navegador.", "Перед открытием внешней ссылки в браузере появляется предупреждение.", "外部链接会在打开浏览器前显示警告。"),
+    "Images are filtered locally on your device according to your settings." to arrayOf("Les images sont filtrées localement sur votre appareil selon vos réglages.", "Las imágenes se filtran localmente en tu dispositivo según tus ajustes.", "Изображения фильтруются локально на вашем устройстве согласно настройкам.", "图片会根据你的设置在本机进行过滤。"),
+    "Content filtering does not require uploading your images to a moderation server." to arrayOf("Le filtrage du contenu ne nécessite pas d'envoyer vos images à un serveur de modération.", "El filtrado de contenido no requiere subir tus imágenes a un servidor de moderación.", "Для фильтрации контента не нужно загружать изображения на сервер модерации.", "内容过滤不需要把你的图片上传到审核服务器。"),
+    "You can adjust content-filter sensitivity in Settings." to arrayOf("Vous pouvez régler la sensibilité du filtre de contenu dans les paramètres.", "Puedes ajustar la sensibilidad del filtro de contenido en Ajustes.", "Чувствительность фильтра контента можно изменить в настройках.", "你可以在设置中调整内容过滤的灵敏度。"),
+    "Group moderation is branch-based — you can choose which moderation branch you follow." to arrayOf("La modération des groupes fonctionne par branches — vous pouvez choisir celle que vous suivez.", "La moderación de grupos usa ramas: puedes elegir qué rama de moderación seguir.", "Модерация групп основана на ветках — вы можете выбрать, за какой веткой модерации следовать.", "群组管理采用分支机制——你可以选择要跟随的管理分支。"),
+    "If a group's original moderator disappears, another user can claim a moderation branch." to arrayOf("Si le modérateur d'origine d'un groupe disparaît, un autre utilisateur peut revendiquer une branche de modération.", "Si desaparece el moderador original de un grupo, otro usuario puede reclamar una rama de moderación.", "Если исходный модератор группы исчезнет, другой пользователь может заявить ветку модерации.", "如果群组的原始管理员消失，其他用户可以认领一个管理分支。"),
+    "Tap a group's Original/Claim label to switch moderation branches." to arrayOf("Touchez l'étiquette Original/Revendication d'un groupe pour changer de branche de modération.", "Toca la etiqueta Original/Reclamación de un grupo para cambiar de rama de moderación.", "Нажмите метку Original/Claim группы, чтобы переключить ветку модерации.", "点击群组的 Original/Claim 标签即可切换管理分支。"),
+    "Posts can contain images and audio." to arrayOf("Les publications peuvent contenir des images et de l'audio.", "Las publicaciones pueden contener imágenes y audio.", "Публикации могут содержать изображения и аудио.", "帖子可以包含图片和音频。"),
+    "Full-size media is only fetched when you open it." to arrayOf("Les médias en taille réelle ne sont récupérés que lorsque vous les ouvrez.", "El contenido multimedia a tamaño completo solo se descarga cuando lo abres.", "Медиафайлы полного размера загружаются только когда вы их открываете.", "完整尺寸的媒体只有在你打开时才会获取。"),
+    "Comments on your profile can take a little while to arrive." to arrayOf("Les commentaires sur votre profil peuvent mettre un peu de temps à arriver.", "Los comentarios de tu perfil pueden tardar un poco en llegar.", "Комментарии к вашему профилю могут приходить с небольшой задержкой.", "个人资料评论可能需要一点时间才会到达。"),
+    "Weave has no private-message system — conversations are meant to stay visible." to arrayOf("Weave n'a pas de messagerie privée — les conversations sont conçues pour rester visibles.", "Weave no tiene mensajes privados: las conversaciones están pensadas para permanecer visibles.", "В Weave нет личных сообщений — разговоры задуманы как открытые.", "Weave 没有私信系统——对话本来就是公开可见的。"),
+    "Search can discover people, groups, and related content." to arrayOf("La recherche peut découvrir des personnes, des groupes et du contenu associé.", "La búsqueda puede descubrir personas, grupos y contenido relacionado.", "Поиск помогает находить людей, группы и связанный контент.", "搜索可以发现用户、群组和相关内容。"),
+    "Your device helps carry public network information for other users." to arrayOf("Votre appareil aide à transporter des informations publiques du réseau pour d'autres utilisateurs.", "Tu dispositivo ayuda a transportar información pública de la red para otros usuarios.", "Ваше устройство помогает передавать публичную сетевую информацию для других пользователей.", "你的设备会帮助其他用户传递公开的网络信息。"),
+    "Custody helps keep group submissions alive while moderators are offline." to arrayOf("La garde aide à conserver les soumissions de groupe pendant que les modérateurs sont hors ligne.", "La custodia ayuda a mantener las publicaciones del grupo mientras los moderadores están desconectados.", "Механизм хранения помогает сохранять материалы группы, пока модераторы не в сети.", "托管机制可在管理员离线时帮助保留群组提交内容。"),
+    "Your account can be backed up from Settings → This identity." to arrayOf("Vous pouvez sauvegarder votre compte depuis Paramètres → Cette identité.", "Puedes hacer una copia de seguridad de tu cuenta desde Ajustes → Esta identidad.", "Резервную копию аккаунта можно создать в Настройки → Эта личность.", "你可以从“设置 → 此身份”备份账户。"),
+    "Make an account backup before moving to a new device." to arrayOf("Créez une sauvegarde du compte avant de passer à un nouvel appareil.", "Haz una copia de seguridad de tu cuenta antes de cambiar de dispositivo.", "Сделайте резервную копию аккаунта перед переходом на новое устройство.", "更换设备前请先备份账户。"),
+    "Your Weave identity is tied to your VeilKnit account." to arrayOf("Votre identité Weave est liée à votre compte VeilKnit.", "Tu identidad de Weave está vinculada a tu cuenta de VeilKnit.", "Ваша личность Weave связана с аккаунтом VeilKnit.", "你的 Weave 身份与 VeilKnit 账户绑定。"),
+    "You can copy group links and share them directly." to arrayOf("Vous pouvez copier les liens de groupe et les partager directement.", "Puedes copiar enlaces de grupos y compartirlos directamente.", "Ссылки на группы можно копировать и отправлять напрямую.", "你可以复制群组链接并直接分享。"),
+    "A group can have several moderation branches without changing the original group." to arrayOf("Un groupe peut avoir plusieurs branches de modération sans modifier le groupe d'origine.", "Un grupo puede tener varias ramas de moderación sin cambiar el grupo original.", "У группы может быть несколько веток модерации без изменения исходной группы.", "一个群组可以拥有多个管理分支，而不改变原始群组。"),
+    "Profile comments can be kept or rejected by the profile owner." to arrayOf("Les commentaires de profil peuvent être conservés ou rejetés par le propriétaire du profil.", "El propietario del perfil puede conservar o rechazar los comentarios del perfil.", "Владелец профиля может сохранить или отклонить комментарии к профилю.", "个人资料所有者可以保留或拒绝评论。"),
+    "You can unpublish your profile later from Settings." to arrayOf("Vous pouvez dépublier votre profil plus tard depuis les paramètres.", "Puedes retirar tu perfil más tarde desde Ajustes.", "Позже профиль можно снять с публикации в настройках.", "你之后可以在设置中取消发布个人资料。"),
+    "The Advanced editor remembers whether you left its sidebar open or closed." to arrayOf("L'éditeur Avancé se souvient si vous avez laissé sa barre latérale ouverte ou fermée.", "El editor Avanzado recuerda si dejaste abierta o cerrada su barra lateral.", "Расширенный редактор запоминает, оставили ли вы боковую панель открытой или закрытой.", "高级编辑器会记住你上次把侧栏保持为展开还是收起。"),
+    "Use Undo if you move or resize something by accident." to arrayOf("Utilisez Annuler si vous déplacez ou redimensionnez quelque chose par accident.", "Usa Deshacer si mueves o cambias el tamaño de algo por accidente.", "Используйте «Отменить», если случайно переместили или изменили размер элемента.", "如果不小心移动或调整了某个元素，请使用撤销。"),
+    "Profile pages are ordered — Previous and Next follow the order shown in Pages & Layers." to arrayOf("Les pages du profil sont ordonnées — Précédent et Suivant suivent l'ordre affiché dans Pages et calques.", "Las páginas del perfil están ordenadas: Anterior y Siguiente siguen el orden de Páginas y capas.", "Страницы профиля упорядочены — кнопки «Назад» и «Далее» следуют порядку в «Страницы и слои».", "个人资料页面有顺序——上一页和下一页会按照“页面与图层”中的顺序导航。"),
+    "Not everything has to be serious. Make your profile weird." to arrayOf("Tout n'a pas besoin d'être sérieux. Rendez votre profil bizarre.", "No todo tiene que ser serio. Haz que tu perfil sea raro.", "Не всё должно быть серьёзным. Сделайте свой профиль странным.", "不是所有东西都得严肃。把你的个人资料做得怪一点吧。"),
+    "Old-school profile customization is encouraged." to arrayOf("La personnalisation de profil à l'ancienne est encouragée.", "Se recomienda la personalización de perfiles a la vieja escuela.", "Старая добрая кастомизация профиля приветствуется.", "欢迎使用老派的个人资料自定义风格。"),
+    "Your profile does not have to look like everyone else's." to arrayOf("Votre profil n'a pas besoin de ressembler à celui des autres.", "Tu perfil no tiene que parecerse al de los demás.", "Ваш профиль не обязан выглядеть как у всех остальных.", "你的个人资料不需要和别人的长得一样。"),
+    "Try making more than one profile page." to arrayOf("Essayez de créer plusieurs pages de profil.", "Prueba a crear más de una página de perfil.", "Попробуйте сделать больше одной страницы профиля.", "试试创建不止一个个人资料页面。"),
+    "A quiet network is still a network — discovery improves as more peers come online." to arrayOf("Un réseau calme reste un réseau — la découverte s'améliore à mesure que davantage de pairs se connectent.", "Una red tranquila sigue siendo una red: el descubrimiento mejora a medida que se conectan más pares.", "Тихая сеть всё равно остаётся сетью — обнаружение улучшается, когда подключается больше узлов.", "安静的网络仍然是网络——随着更多节点上线，发现效果会变得更好。"),
+    "Yes, you can make your profile ugly on purpose." to arrayOf("Oui, vous pouvez rendre votre profil moche exprès.", "Sí, puedes hacer que tu perfil sea feo a propósito.", "Да, вы можете специально сделать свой профиль некрасивым.", "是的，你完全可以故意把个人资料做得很丑。"),
+    "Please do not teach the widgets to become sentient." to arrayOf("Merci de ne pas apprendre aux widgets à devenir conscients.", "Por favor, no enseñes a los widgets a volverse conscientes.", "Пожалуйста, не учите виджеты обретать самосознание.", "请不要教小组件产生自我意识。"),
+    "Moderation branches: because apparently one argument wasn't enough." to arrayOf("Branches de modération : parce qu'apparemment une seule dispute ne suffisait pas.", "Ramas de moderación: porque al parecer una sola discusión no era suficiente.", "Ветки модерации: потому что одного спора, видимо, было недостаточно.", "管理分支：因为显然一次争论还不够。"),
+    "VeilKnit is starting inside Weave. This status is reported directly by the networking core while it restores your DHTs, prepares the mailbox, and connects to Veilid." to arrayOf("VeilKnit démarre dans Weave. Cet état provient directement du cœur réseau pendant qu’il restaure vos DHT, prépare la boîte aux lettres et se connecte à Veilid.", "VeilKnit se está iniciando dentro de Weave. Este estado viene directamente del núcleo de red mientras restaura tus DHT, prepara el buzón y se conecta a Veilid.", "VeilKnit запускается внутри Weave. Этот статус поступает прямо из сетевого ядра, пока оно восстанавливает DHT, подготавливает почтовый ящик и подключается к Veilid.", "VeilKnit 正在 Weave 内启动。此状态由网络核心直接报告，它会恢复 DHT、准备邮箱并连接到 Veilid。"),
+    "Connecting to VeilKnit. A cold start can take a little while as the node restores state and finds peers." to arrayOf("Connexion à VeilKnit. Un démarrage à froid peut prendre un peu de temps pendant que le nœud restaure son état et trouve des pairs.", "Conectando con VeilKnit. Un arranque en frío puede tardar un poco mientras el nodo restaura su estado y encuentra pares.", "Подключение к VeilKnit. Холодный запуск может занять некоторое время, пока узел восстанавливает состояние и находит пиры.", "正在连接 VeilKnit。冷启动时，节点恢复状态并寻找对等节点可能需要一些时间。"),
+    "VeilKnit startup needs attention" to arrayOf("Le démarrage de VeilKnit nécessite votre attention", "El inicio de VeilKnit necesita atención", "Запуск VeilKnit требует внимания", "VeilKnit 启动需要处理"),
+    "Can't reach VeilKnit" to arrayOf("Impossible de joindre VeilKnit", "No se puede conectar con VeilKnit", "Не удаётся связаться с VeilKnit", "无法连接 VeilKnit"),
     "Try again" to arrayOf("Réessayer", "Intentar de nuevo", "Повторить", "重试"),
     "Couldn't publish" to arrayOf("Publication impossible", "No se pudo publicar", "Не удалось опубликовать", "无法发布"),
     "Dismiss" to arrayOf("Fermer", "Descartar", "Закрыть", "关闭"),
@@ -135,6 +246,8 @@ private val UI_TRANSLATIONS = mapOf(
     "Peers" to arrayOf("Pairs", "Pares", "Пиры", "对等方"),
     "verified" to arrayOf("vérifiés", "verificados", "проверено", "已验证"),
     "Reusing images or widgets across identities links them: identical bytes have an identical hash no matter who publishes them." to arrayOf("Réutiliser les mêmes images ou widgets entre plusieurs identités crée un lien entre elles : des octets identiques ont le même hachage, quel que soit le compte qui les publie.", "Reutilizar imágenes o widgets entre identidades las vincula: los mismos bytes producen el mismo hash sin importar quién los publique.", "Повторное использование изображений или виджетов между личностями связывает их: одинаковые байты имеют одинаковый хеш независимо от того, кто их публикует.", "在不同身份之间重复使用图片或小组件会把它们关联起来：相同字节始终具有相同哈希值，与发布者无关。"),
+    "Setup account backup" to arrayOf("Configurer la sauvegarde du compte", "Configurar copia de seguridad de la cuenta", "Настроить резервную копию аккаунта", "设置账户备份"),
+    "Create an encrypted VeilKnit identity backup and optional network recovery copy." to arrayOf("Créez une sauvegarde chiffrée de votre identité VeilKnit et, si vous le souhaitez, une copie de récupération réseau.", "Crea una copia cifrada de tu identidad de VeilKnit y, opcionalmente, una copia de recuperación en red.", "Создайте зашифрованную резервную копию личности VeilKnit и, при желании, сетевую копию для восстановления.", "创建加密的 VeilKnit 身份备份，并可选择创建网络恢复副本。"),
     "The blurb people see beside your name in search comes from the text at the top of your home page, so it always matches what is actually there. What you search for and what you avoid stays on this device and is never published." to arrayOf("Le résumé affiché à côté de votre nom dans la recherche vient du texte en haut de votre page d’accueil, afin qu’il corresponde toujours au contenu réel. Vos recherches et éléments à éviter restent sur cet appareil et ne sont jamais publiés.", "El resumen que aparece junto a tu nombre en la búsqueda proviene del texto de la parte superior de tu página principal, así que siempre coincide con lo que realmente hay allí. Lo que buscas y lo que evitas permanece en este dispositivo y nunca se publica.", "Краткое описание рядом с вашим именем в поиске берётся из текста вверху главной страницы, поэтому оно всегда соответствует реальному содержимому. То, что вы ищете и чего избегаете, остаётся на этом устройстве и не публикуется.", "搜索结果中姓名旁的简介来自主页顶部的文字，因此会始终与实际内容一致。你的搜索内容和避开内容只保存在此设备上，不会发布。"),
     "Interests, comma separated" to arrayOf("Centres d’intérêt, séparés par des virgules", "Intereses, separados por comas", "Интересы через запятую", "兴趣，用逗号分隔"),
     "Comments on your profile" to arrayOf("Commentaires sur votre profil", "Comentarios en tu perfil", "Комментарии к вашему профилю", "你个人资料上的评论"),
@@ -242,5 +355,311 @@ private val UI_TRANSLATIONS = mapOf(
     "Sent, awaiting confirmation" to arrayOf("Envoyé, en attente de confirmation", "Enviado, esperando confirmación", "Отправлено, ожидается подтверждение", "已发送，等待确认"),
     "Waiting for approval" to arrayOf("En attente d’approbation", "Esperando aprobación", "Ожидает одобрения", "等待审核"),
     "Comments attach to this page after the owner approves them." to arrayOf("Les commentaires sont attachés à cette page après approbation par le propriétaire.", "Los comentarios se adjuntan a esta página después de que el propietario los apruebe.", "Комментарии появляются на этой странице после одобрения владельцем.", "评论会在页面所有者审核通过后显示在此页面。"),
+
+    " · 🎵 Audio" to arrayOf(" · 🎵 Audio", " · 🎵 Audio", " · 🎵 Аудио", " · 🎵 音频"),
+    "+ Audio" to arrayOf("+ Audio", "+ Audio", "+ Аудио", "+ 音频"),
+    "+ Create group" to arrayOf("+ Créer un groupe", "+ Crear grupo", "+ Создать группу", "+ 创建群组"),
+    "A quick view of the conversations moving across your groups." to arrayOf("Un aperçu rapide des conversations actives dans vos groupes.", "Una vista rápida de las conversaciones activas en tus grupos.", "Краткий обзор обсуждений в ваших группах。", "快速查看你各个群组中的活跃讨论。"),
+    "A small embedded thumbnail helps distinguish groups without loading a full-size image." to arrayOf("Une petite miniature intégrée permet de distinguer les groupes sans charger l’image en taille réelle.", "Una miniatura incrustada ayuda a distinguir los grupos sin cargar la imagen completa.", "Небольшая встроенная миниатюра помогает различать группы без загрузки полноразмерного изображения.", "内嵌的小缩略图可帮助区分群组，无需加载完整图片。"),
+    "Add" to arrayOf("Ajouter", "Añadir", "Добавить", "添加"),
+    "Add branch moderator" to arrayOf("Ajouter un modérateur de branche", "Añadir moderador de rama", "Добавить модератора ветки", "添加分支版主"),
+    "Aggressive / hostile text" to arrayOf("Texte agressif / hostile", "Texto agresivo / hostil", "Агрессивный / враждебный текст", "攻击性 / 敌意文字"),
+    "Approve / Keep" to arrayOf("Approuver / Conserver", "Aprobar / Conservar", "Одобрить / Сохранить", "批准 / 保留"),
+    "Ask to join" to arrayOf("Demander à rejoindre", "Solicitar unirse", "Запросить вступление", "申请加入"),
+    "Audio title" to arrayOf("Titre audio", "Título del audio", "Название аудио", "音频标题"),
+    "Ban user" to arrayOf("Bannir l’utilisateur", "Bloquear usuario", "Заблокировать пользователя", "封禁用户"),
+    "Ban user from this branch?" to arrayOf("Bannir l’utilisateur de cette branche ?", "¿Bloquear al usuario en esta rama?", "Заблокировать пользователя в этой ветке?", "从此分支封禁该用户？"),
+    "Blur until tapped" to arrayOf("Flouter jusqu’à l’appui", "Desenfocar hasta tocar", "Размывать до нажатия", "点击前模糊"),
+    "Blurred by your" to arrayOf("Flouté par votre", "Desenfocado por tu", "Размыто вашим", "已被你的"),
+    "Checking your content filters…" to arrayOf("Vérification de vos filtres de contenu…", "Comprobando tus filtros de contenido…", "Проверка фильтров содержимого…", "正在检查内容过滤器…"),
+    "Claim moderation of a public group by pasting its Weave group link. Claiming creates your own moderation branch; it does not fork the group." to arrayOf("Réclamez la modération d’un groupe public en collant son lien Weave. Cela crée votre propre branche de modération sans dupliquer le groupe.", "Reclama la moderación de un grupo público pegando su enlace de Weave. Esto crea tu propia rama de moderación; no bifurca el grupo.", "Возьмите модерацию публичной группы, вставив её ссылку Weave. Будет создана ваша собственная ветка модерации, без создания отдельной группы.", "粘贴 Weave 群组链接即可认领公开群组的管理权。这会创建你自己的管理分支，而不会复制该群组。"),
+    "Claim moderation of group" to arrayOf("Réclamer la modération du groupe", "Reclamar moderación del grupo", "Взять модерацию группы", "认领群组管理"),
+    "Claim moderation of this group?" to arrayOf("Réclamer la modération de ce groupe ?", "¿Reclamar la moderación de este grupo?", "Взять модерацию этой группы?", "认领此群组的管理权？"),
+    "Claiming…" to arrayOf("Réclamation…", "Reclamando…", "Создание ветки…", "正在认领…"),
+    "Clear featured area" to arrayOf("Effacer la zone mise en avant", "Borrar área destacada", "Очистить выделенную область", "清除精选区域"),
+    "Comment model not installed (explicit-threat fallback only)" to arrayOf("Modèle de commentaires non installé (détection de menaces explicites uniquement)", "Modelo de comentarios no instalado (solo detección de amenazas explícitas)", "Модель комментариев не установлена (только явные угрозы)", "未安装评论模型（仅检测明确威胁）"),
+    "Comment model ready" to arrayOf("Modèle de commentaires prêt", "Modelo de comentarios listo", "Модель комментариев готова", "评论模型已就绪"),
+    "Content filtering" to arrayOf("Filtrage du contenu", "Filtrado de contenido", "Фильтрация содержимого", "内容过滤"),
+    "Copied recent log (trimmed)" to arrayOf("Journal récent copié (tronqué)", "Registro reciente copiado (recortado)", "Недавний журнал скопирован (сокращён)", "已复制最近日志（已截断）"),
+    "Copies Weave's timestamped diagnostic history, lifecycle/editor breadcrumbs, slow/failed daemon RPC metadata, and current network/group state. It can contain public profile/DHT keys, group names and moderation activity, but never app session tokens, request payloads, profile text, authentication proofs, or media contents." to arrayOf("Copie l’historique de diagnostic horodaté de Weave, les traces de cycle de vie/éditeur, les métadonnées des RPC du démon lentes ou échouées et l’état actuel du réseau/des groupes. Il peut contenir des clés publiques de profil/DHT, des noms de groupes et l’activité de modération, mais jamais de jetons de session, de contenus de requêtes, de texte de profil, de preuves d’authentification ou de médias.", "Copia el historial de diagnóstico con marcas de tiempo de Weave, rastros del ciclo de vida/editor, metadatos de RPC lentas o fallidas del daemon y el estado actual de red/grupos. Puede contener claves públicas de perfil/DHT, nombres de grupos y actividad de moderación, pero nunca tokens de sesión, cargas de solicitudes, texto de perfil, pruebas de autenticación ni contenido multimedia.", "Копирует журнал диагностики Weave с отметками времени, события жизненного цикла/редактора, сведения о медленных или неудачных RPC демона и текущее состояние сети/групп. Может содержать публичные ключи профиля/DHT, названия групп и действия модерации, но не токены сессии, содержимое запросов, текст профиля, доказательства аутентификации или медиа.", "复制带时间戳的 Weave 诊断历史、生命周期/编辑器记录、缓慢或失败的守护程序 RPC 元数据以及当前网络/群组状态。它可能包含公开的个人资料/DHT 密钥、群组名称和管理活动，但不会包含应用会话令牌、请求内容、个人资料文本、身份验证证明或媒体内容。"),
+    "Copy failed" to arrayOf("Échec de la copie", "Error al copiar", "Не удалось скопировать", "复制失败"),
+    "Copy image link" to arrayOf("Copier le lien de l’image", "Copiar enlace de imagen", "Копировать ссылку на изображение", "复制图片链接"),
+    "Create Claim" to arrayOf("Créer la branche", "Crear rama", "Создать ветку", "创建分支"),
+    "Create a post" to arrayOf("Créer une publication", "Crear una publicación", "Создать публикацию", "创建帖子"),
+    "Fetching group information…" to arrayOf("Chargement des informations du groupe…", "Cargando información del grupo…", "Загрузка информации о группе…", "正在获取群组信息…"),
+    "Weave is loading the group's current moderation branch and recent posts." to arrayOf("Weave charge la branche de modération actuelle du groupe et ses publications récentes.", "Weave está cargando la rama de moderación actual del grupo y sus publicaciones recientes.", "Weave загружает текущую ветку модерации группы и недавние публикации.", "Weave 正在加载该群组当前的管理分支和最近帖子。"),
+    "Create independent Claim" to arrayOf("Créer une branche indépendante", "Crear una rama independiente", "Создать независимую ветку", "创建独立管理分支"),
+    "Create, manage and moderate groups from here." to arrayOf("Créez, gérez et modérez vos groupes ici.", "Crea, administra y modera grupos desde aquí.", "Создавайте группы, управляйте ими и модерируйте их здесь.", "在这里创建、管理和审核群组。"),
+    "Creating…" to arrayOf("Création…", "Creando…", "Создание…", "正在创建…"),
+    "Curator" to arrayOf("Curateur", "Curador", "Куратор", "策展人"),
+    "Custom message" to arrayOf("Message personnalisé", "Mensaje personalizado", "Пользовательское сообщение", "自定义消息"),
+    "Custom title" to arrayOf("Titre personnalisé", "Título personalizado", "Пользовательский заголовок", "自定义标题"),
+    "Delete this post" to arrayOf("Supprimer cette publication", "Eliminar esta publicación", "Удалить эту публикацию", "删除此帖子"),
+    "Feature" to arrayOf("Mettre en avant", "Destacar", "Выделить", "精选"),
+    "Featured area" to arrayOf("Zone mise en avant", "Área destacada", "Выделенная область", "精选区域"),
+    "Featured text / note" to arrayOf("Texte / note mise en avant", "Texto / nota destacada", "Выделенный текст / заметка", "精选文字 / 备注"),
+    "Featured title" to arrayOf("Titre mis en avant", "Título destacado", "Выделенный заголовок", "精选标题"),
+    "Filtered" to arrayOf("Filtré", "Filtrado", "Отфильтровано", "已过滤"),
+    "Gore / graphic content" to arrayOf("Violence graphique / gore", "Gore / contenido gráfico", "Жестокий / графический контент", "血腥 / 强烈画面"),
+    "Group claimed" to arrayOf("Modération du groupe réclamée", "Moderación del grupo reclamada", "Модерация группы принята", "已认领群组管理"),
+    "Group moderation" to arrayOf("Modération du groupe", "Moderación del grupo", "Модерация группы", "群组管理"),
+    "Group name, topic, tag or Weave link" to arrayOf("Nom du groupe, sujet, tag ou lien Weave", "Nombre del grupo, tema, etiqueta o enlace de Weave", "Название группы, тема, тег или ссылка Weave", "群组名称、主题、标签或 Weave 链接"),
+    "Group unavailable" to arrayOf("Groupe indisponible", "Grupo no disponible", "Группа недоступна", "群组不可用"),
+    "Groups" to arrayOf("Groupes", "Grupos", "Группы", "群组"),
+    "Groups learned from people appear here. You can also paste a Weave group link." to arrayOf("Les groupes découverts via des personnes apparaissent ici. Vous pouvez aussi coller un lien de groupe Weave.", "Los grupos descubiertos a través de personas aparecen aquí. También puedes pegar un enlace de grupo de Weave.", "Здесь появляются группы, найденные через людей. Также можно вставить ссылку на группу Weave.", "通过用户发现的群组会显示在这里。你也可以粘贴 Weave 群组链接。"),
+    "Groups you join will appear here." to arrayOf("Les groupes que vous rejoignez apparaîtront ici.", "Los grupos a los que te unas aparecerán aquí.", "Группы, в которые вы вступите, появятся здесь.", "你加入的群组会显示在这里。"),
+    "Hidden" to arrayOf("Masqué", "Oculto", "Скрыто", "已隐藏"),
+    "Hidden by your" to arrayOf("Masqué par votre", "Oculto por tu", "Скрыто вашим", "已被你的"),
+    "Hide until tapped" to arrayOf("Masquer jusqu’à l’appui", "Ocultar hasta tocar", "Скрывать до нажатия", "点击前隐藏"),
+    "High" to arrayOf("Élevée", "Alta", "Высокая", "高"),
+    "Image model NOT installed — images cannot be classified" to arrayOf("Modèle d’image NON installé — les images ne peuvent pas être classées", "Modelo de imagen NO instalado: no se pueden clasificar imágenes", "Модель изображений НЕ установлена — изображения нельзя классифицировать", "未安装图片模型——无法分类图片"),
+    "Image model ready" to arrayOf("Modèle d’image prêt", "Modelo de imagen listo", "Модель изображений готова", "图片模型已就绪"),
+    "Invite only" to arrayOf("Sur invitation", "Solo por invitación", "Только по приглашению", "仅限邀请"),
+    "It may remain unreviewed until the selected branch accepts it." to arrayOf("Elle peut rester non examinée jusqu’à ce que la branche sélectionnée l’accepte.", "Puede quedar sin revisar hasta que la rama seleccionada la acepte.", "Она может оставаться непроверенной, пока выбранная ветка её не примет.", "在所选管理分支接受之前，它可能保持未审核状态。"),
+    "Join" to arrayOf("Rejoindre", "Unirse", "Вступить", "加入"),
+    "Joined groups" to arrayOf("Groupes rejoints", "Grupos unidos", "Группы, в которые вы вступили", "已加入的群组"),
+    "Leave group" to arrayOf("Quitter le groupe", "Salir del grupo", "Покинуть группу", "退出群组"),
+    "Load image" to arrayOf("Charger l’image", "Cargar imagen", "Загрузить изображение", "加载图片"),
+    "Loading full image…" to arrayOf("Chargement de l’image complète…", "Cargando imagen completa…", "Загрузка полного изображения…", "正在加载完整图片…"),
+    "Loading image…" to arrayOf("Chargement de l’image…", "Cargando imagen…", "Загрузка изображения…", "正在加载图片…"),
+    "Loading post…" to arrayOf("Chargement de la publication…", "Cargando publicación…", "Загрузка публикации…", "正在加载帖子…"),
+    "Loading widget library…" to arrayOf("Chargement de la bibliothèque de widgets…", "Cargando biblioteca de widgets…", "Загрузка библиотеки виджетов…", "正在加载小组件库…"),
+    "Low" to arrayOf("Faible", "Baja", "Низкая", "低"),
+    "Manage" to arrayOf("Gérer", "Administrar", "Управлять", "管理"),
+    "Media is uploaded first, then the post is delivered to the group's moderation branches." to arrayOf("Le média est d’abord téléversé, puis la publication est envoyée aux branches de modération du groupe.", "Primero se sube el contenido multimedia y luego la publicación se envía a las ramas de moderación del grupo.", "Сначала загружается медиафайл, затем публикация доставляется в ветки модерации группы.", "媒体会先上传，然后帖子再发送到群组的管理分支。"),
+    "Medium" to arrayOf("Moyenne", "Media", "Средняя", "中"),
+    "Moderation continuity" to arrayOf("Continuité de la modération", "Continuidad de moderación", "Непрерывность модерации", "管理连续性"),
+    "Moderator main DHT" to arrayOf("DHT principal du modérateur", "DHT principal del moderador", "Основной DHT модератора", "版主主 DHT"),
+    "Moderators" to arrayOf("Modérateurs", "Moderadores", "Модераторы", "版主"),
+    "Modified for this curated version · original source unchanged" to arrayOf("Modifié pour cette version organisée · source originale inchangée", "Modificado para esta versión curada · fuente original sin cambios", "Изменено для этой курируемой версии · исходник не изменён", "已为此策展版本修改 · 原始来源未更改"),
+    "Modified for this curated version · source post unchanged" to arrayOf("Modifié pour cette version organisée · publication source inchangée", "Modificado para esta versión curada · publicación original sin cambios", "Изменено для этой курируемой версии · исходная публикация не изменена", "已为此策展版本修改 · 原帖子未更改"),
+    "Modify for this curated version" to arrayOf("Modifier pour cette version organisée", "Modificar para esta versión curada", "Изменить для курируемой версии", "为此策展版本修改"),
+    "Modify this post" to arrayOf("Modifier cette publication", "Modificar esta publicación", "Изменить эту публикацию", "修改此帖子"),
+    "Name" to arrayOf("Nom", "Nombre", "Имя", "名称"),
+    "Needs attention" to arrayOf("Nécessite votre attention", "Necesita atención", "Требует внимания", "需要处理"),
+    "No comments yet." to arrayOf("Aucun commentaire pour le moment.", "Aún no hay comentarios.", "Комментариев пока нет.", "还没有评论。"),
+    "No groups yet" to arrayOf("Aucun groupe pour le moment", "Aún no hay grupos", "Групп пока нет", "还没有群组"),
+    "No posts yet." to arrayOf("Aucune publication pour le moment.", "Aún no hay publicaciones.", "Публикаций пока нет.", "还没有帖子。"),
+    "No retained post submissions are available on this device." to arrayOf("Aucune soumission de publication conservée n’est disponible sur cet appareil.", "No hay envíos de publicaciones retenidos disponibles en este dispositivo.", "На этом устройстве нет сохранённых отправок публикаций.", "此设备上没有保留的帖子提交。"),
+    "Nothing featured yet." to arrayOf("Rien de mis en avant pour le moment.", "Aún no hay nada destacado.", "Пока ничего не выделено.", "还没有精选内容。"),
+    "Nothing needs attention" to arrayOf("Rien ne nécessite votre attention", "Nada necesita atención", "Ничего не требует внимания", "没有需要处理的内容"),
+    "OK" to arrayOf("OK", "Aceptar", "ОК", "确定"),
+    "Off" to arrayOf("Désactivée", "Desactivada", "Выкл.", "关闭"),
+    "Open" to arrayOf("Ouvrir", "Abrir", "Открыть", "打开"),
+    "Open browser" to arrayOf("Ouvrir le navigateur", "Abrir navegador", "Открыть браузер", "打开浏览器"),
+    "Open external link?" to arrayOf("Ouvrir le lien externe ?", "¿Abrir enlace externo?", "Открыть внешнюю ссылку?", "打开外部链接？"),
+    "Or feature a post/comment" to arrayOf("Ou mettre en avant une publication/un commentaire", "O destacar una publicación/comentario", "Или выделить публикацию/комментарий", "或精选帖子/评论"),
+    "Original" to arrayOf("Original", "Original", "Оригинал", "原始"),
+    "Paste a copied Weave image link or the image's raw DHT record key." to arrayOf("Collez un lien d’image Weave copié ou la clé DHT brute de l’image.", "Pega un enlace de imagen de Weave copiado o la clave DHT sin procesar de la imagen.", "Вставьте скопированную ссылку Weave на изображение или необработанный ключ DHT изображения.", "粘贴已复制的 Weave 图片链接或图片的原始 DHT 记录密钥。"),
+    "Preparing media…" to arrayOf("Préparation du média…", "Preparando contenido multimedia…", "Подготовка медиа…", "正在准备媒体…"),
+    "Preparing…" to arrayOf("Préparation…", "Preparando…", "Подготовка…", "正在准备…"),
+    "Profile storage needs attention" to arrayOf("Le stockage du profil nécessite votre attention", "El almacenamiento del perfil necesita atención", "Хранилище профиля требует внимания", "个人资料存储需要处理"),
+    "Public reason (optional)" to arrayOf("Motif public (facultatif)", "Motivo público (opcional)", "Публичная причина (необязательно)", "公开原因（可选）"),
+    "Reconnecting to VeilKnit…" to arrayOf("Reconnexion à VeilKnit…", "Reconectando con VeilKnit…", "Повторное подключение к VeilKnit…", "正在重新连接 VeilKnit…"),
+    "Reject / Drop" to arrayOf("Refuser / Rejeter", "Rechazar / Descartar", "Отклонить / Удалить", "拒绝 / 丢弃"),
+    "Remove" to arrayOf("Retirer", "Quitar", "Удалить", "移除"),
+    "Remove this post?" to arrayOf("Retirer cette publication ?", "¿Quitar esta publicación?", "Удалить эту публикацию?", "移除此帖子？"),
+    "Removed on this branch" to arrayOf("Retiré sur cette branche", "Eliminado en esta rama", "Удалено в этой ветке", "已从此分支移除"),
+    "Reports, join requests and quarantined posts will appear here." to arrayOf("Les signalements, demandes d’adhésion et publications en quarantaine apparaîtront ici.", "Los reportes, solicitudes de ingreso y publicaciones en cuarentena aparecerán aquí.", "Здесь появятся жалобы, запросы на вступление и публикации в карантине.", "举报、加入请求和隔离帖子会显示在这里。"),
+    "Retained and pending submissions" to arrayOf("Soumissions conservées et en attente", "Envíos retenidos y pendientes", "Сохранённые и ожидающие отправки", "保留和待处理的提交"),
+    "Review profile comments and profile activity that needs your attention." to arrayOf("Consultez les commentaires du profil et l’activité nécessitant votre attention.", "Revisa los comentarios del perfil y la actividad que necesita tu atención.", "Просматривайте комментарии профиля и действия, требующие внимания.", "查看个人资料评论和需要你处理的动态。"),
+    "Sensitivity" to arrayOf("Sensibilité", "Sensibilidad", "Чувствительность", "敏感度"),
+    "Sensitivity changes how readily something is flagged. The action controls what Weave does after your filter flags it. All filters are off by default." to arrayOf("La sensibilité détermine la facilité avec laquelle un contenu est signalé. L’action détermine ce que fait Weave après un signalement. Tous les filtres sont désactivés par défaut.", "La sensibilidad cambia la facilidad con la que se marca algo. La acción controla lo que hace Weave después de marcarlo. Todos los filtros están desactivados de forma predeterminada.", "Чувствительность определяет, насколько легко контент помечается. Действие определяет, что делает Weave после срабатывания фильтра. По умолчанию все фильтры выключены.", "敏感度决定内容多容易被标记；操作决定过滤器标记后 Weave 如何处理。所有过滤器默认关闭。"),
+    "Sexual content" to arrayOf("Contenu sexuel", "Contenido sexual", "Сексуальный контент", "色情内容"),
+    "Show normally" to arrayOf("Afficher normalement", "Mostrar normalmente", "Показывать обычно", "正常显示"),
+    "Show warning" to arrayOf("Afficher un avertissement", "Mostrar advertencia", "Показывать предупреждение", "显示警告"),
+    "Simple controls" to arrayOf("Contrôles simples", "Controles simples", "Простые настройки", "简单控制"),
+    "Snapshot" to arrayOf("Aperçu", "Resumen", "Обзор", "快照"),
+    "Tap to show anyway" to arrayOf("Appuyez pour afficher quand même", "Toca para mostrar de todos modos", "Нажмите, чтобы всё равно показать", "点击仍然显示"),
+    "Temporary intake activity is shown separately until the selected moderation branch accepts or removes it." to arrayOf("L’activité temporaire reçue est affichée séparément jusqu’à ce que la branche de modération sélectionnée l’accepte ou la retire.", "La actividad temporal recibida se muestra por separado hasta que la rama de moderación seleccionada la acepte o elimine.", "Временная входящая активность показывается отдельно, пока выбранная ветка модерации не примет или не удалит её.", "临时接收的活动会单独显示，直到所选管理分支接受或移除它。"),
+    "The reason is shown with the removal notice so viewers can see why this branch removed it." to arrayOf("Le motif accompagne l’avis de retrait afin que les lecteurs sachent pourquoi cette branche l’a retirée.", "El motivo se muestra junto al aviso de eliminación para que los lectores sepan por qué esta rama lo quitó.", "Причина показывается вместе с уведомлением об удалении, чтобы было видно, почему ветка удалила материал.", "原因会与移除提示一起显示，让查看者知道该分支为何移除它。"),
+    "The retained event is known, but its payload is not currently available or failed hash verification." to arrayOf("L’événement conservé est connu, mais son contenu n’est pas disponible actuellement ou a échoué à la vérification du hachage.", "El evento retenido es conocido, pero su contenido no está disponible o falló la verificación del hash.", "Сохранённое событие известно, но его содержимое сейчас недоступно или не прошло проверку хэша.", "已知该保留事件，但其内容当前不可用或哈希验证失败。"),
+    "The source post is not destroyed. It is removed from this moderation branch." to arrayOf("La publication source n’est pas détruite. Elle est seulement retirée de cette branche de modération.", "La publicación original no se destruye. Solo se elimina de esta rama de moderación.", "Исходная публикация не уничтожается. Она удаляется только из этой ветки модерации.", "原帖子不会被销毁，只会从此管理分支中移除。"),
+    "These filters run on this device for you. They do not report people, remove posts, or change what anyone else sees." to arrayOf("Ces filtres s’exécutent uniquement sur cet appareil pour vous. Ils ne signalent personne, ne suppriment aucune publication et ne modifient pas ce que les autres voient.", "Estos filtros se ejecutan en este dispositivo solo para ti. No reportan personas, eliminan publicaciones ni cambian lo que ven los demás.", "Эти фильтры работают только на вашем устройстве. Они не отправляют жалобы, не удаляют публикации и не меняют то, что видят другие.", "这些过滤器只在你的设备上运行。它们不会举报用户、删除帖子或改变其他人看到的内容。"),
+    "This Weave log is kept across reconnects and records editor/navigation transitions plus Java/Kotlin fatal exceptions, so intermittent failures can be inspected afterward. Very large reports are trimmed for Android clipboard safety while preserving the report summary and newest log history. The daemon keeps a separate lower-level network/API log; for connection problems, copying both is useful." to arrayOf("Ce journal Weave est conservé lors des reconnexions et enregistre les transitions de l’éditeur/navigation ainsi que les exceptions fatales Java/Kotlin. Les très grands rapports sont tronqués pour le presse-papiers Android tout en conservant le résumé et les lignes les plus récentes. Le démon garde un journal réseau/API distinct ; pour les problèmes de connexion, copier les deux est utile.", "Este registro de Weave se conserva entre reconexiones y registra transiciones del editor/navegación y excepciones fatales de Java/Kotlin. Los informes muy grandes se recortan para proteger el portapapeles de Android, conservando el resumen y el historial más reciente. El daemon mantiene un registro separado de red/API; para problemas de conexión conviene copiar ambos.", "Этот журнал Weave сохраняется при переподключениях и записывает переходы редактора/навигации и критические исключения Java/Kotlin. Очень большие отчёты сокращаются для безопасной работы буфера Android, сохраняя сводку и самые новые записи. Демон ведёт отдельный низкоуровневый журнал сети/API; при проблемах подключения полезно копировать оба.", "此 Weave 日志会跨重连保留，并记录编辑器/导航切换以及 Java/Kotlin 致命异常。非常大的报告会为 Android 剪贴板安全而截断，同时保留摘要和最新日志。守护程序另有底层网络/API 日志；连接问题时同时复制两份日志会更有帮助。"),
+    "This cached group entry no longer exists." to arrayOf("Cette entrée de groupe en cache n’existe plus.", "Esta entrada de grupo en caché ya no existe.", "Этой записи группы в кэше больше нет.", "此缓存群组条目已不存在。"),
+    "This creates a branch-local curated copy. The author's original source object is not modified." to arrayOf("Cela crée une copie organisée propre à cette branche. L’objet source original de l’auteur n’est pas modifié.", "Esto crea una copia curada local de la rama. El objeto original del autor no se modifica.", "Создаётся курируемая копия только для этой ветки. Исходный объект автора не изменяется.", "这会创建仅属于此分支的策展副本，不会修改作者的原始对象。"),
+    "This creates your own independent moderation branch. It does not replace, revoke, or take control of the Original branch. People can choose which moderation branch they want to view." to arrayOf("Cela crée votre propre branche de modération indépendante. Elle ne remplace pas, ne révoque pas et ne prend pas le contrôle de la branche Originale. Chacun peut choisir la branche de modération qu’il souhaite consulter.", "Esto crea tu propia rama de moderación independiente. No reemplaza, revoca ni toma el control de la rama Original. Cada persona puede elegir qué rama de moderación quiere ver.", "Создаётся ваша независимая ветка модерации. Она не заменяет, не отзывает и не захватывает Оригинальную ветку. Пользователи сами выбирают, какую ветку модерации просматривать.", "这会创建你自己的独立管理分支。它不会替换、撤销或接管原始分支；用户可以自行选择要查看的管理分支。"),
+    "This link leaves Weave and opens another app or browser." to arrayOf("Ce lien quitte Weave et ouvre une autre application ou un navigateur.", "Este enlace sale de Weave y abre otra aplicación o navegador.", "Эта ссылка покидает Weave и открывает другое приложение или браузер.", "此链接会离开 Weave，并打开其他应用或浏览器。"),
+    "This view shows post submissions still retained by this device's curator/custody layer, including items that a moderation branch has not exposed." to arrayOf("Cette vue affiche les publications encore conservées par la couche de curation/garde de cet appareil, y compris celles qu’une branche de modération n’a pas encore exposées.", "Esta vista muestra envíos de publicaciones aún retenidos por la capa de curaduría/custodia del dispositivo, incluidos elementos que una rama de moderación aún no ha mostrado.", "Здесь показаны отправки публикаций, всё ещё хранимые кураторским/кастодиальным слоем устройства, включая материалы, которые ветка модерации ещё не показала.", "此视图显示仍由本设备策展/托管层保留的帖子提交，包括管理分支尚未公开的内容。"),
+    "Title" to arrayOf("Titre", "Título", "Заголовок", "标题"),
+    "Topics / tags" to arrayOf("Sujets / tags", "Temas / etiquetas", "Темы / теги", "主题 / 标签"),
+    "Use Search to find groups, or Me to create one." to arrayOf("Utilisez Recherche pour trouver des groupes, ou Moi pour en créer un.", "Usa Buscar para encontrar grupos, o Yo para crear uno.", "Используйте Поиск, чтобы найти группы, или Я, чтобы создать группу.", "使用“搜索”查找群组，或在“我”中创建群组。"),
+    "Use custom message" to arrayOf("Utiliser le message personnalisé", "Usar mensaje personalizado", "Использовать своё сообщение", "使用自定义消息"),
+    "Weave group" to arrayOf("Groupe Weave", "Grupo de Weave", "Группа Weave", "Weave 群组"),
+    "Weave group link" to arrayOf("Lien de groupe Weave", "Enlace de grupo de Weave", "Ссылка на группу Weave", "Weave 群组链接"),
+    "Weave image" to arrayOf("Image Weave", "Imagen de Weave", "Изображение Weave", "Weave 图片"),
+    "Weave post" to arrayOf("Publication Weave", "Publicación de Weave", "Публикация Weave", "Weave 帖子"),
+    "When detected" to arrayOf("Lors de la détection", "Al detectar", "При обнаружении", "检测到时"),
+    "You haven't created or moderated any groups yet." to arrayOf("Vous n’avez encore créé ou modéré aucun groupe.", "Aún no has creado ni moderado ningún grupo.", "Вы ещё не создали и не модерируете ни одной группы.", "你还没有创建或管理任何群组。"),
+    "Your current screen and unsaved editor changes are being kept in memory." to arrayOf("Votre écran actuel et les modifications non enregistrées de l’éditeur sont conservés en mémoire.", "La pantalla actual y los cambios sin guardar del editor se conservan en memoria.", "Текущий экран и несохранённые изменения редактора сохраняются в памяти.", "当前页面和未保存的编辑器更改会保留在内存中。"),
+    "Your groups" to arrayOf("Vos groupes", "Tus grupos", "Ваши группы", "你的群组"),
+    "content" to arrayOf("contenu", "contenido", "контент", "内容"),
+    "filter" to arrayOf("filtre", "filtro", "фильтром", "过滤器"),
+    "This media link type is not supported." to arrayOf("Ce type de lien média n’est pas pris en charge.", "Este tipo de enlace multimedia no es compatible.", "Этот тип медиа-ссылки не поддерживается.", "不支持此媒体链接类型。"),
+    "The full image is fetched only when you ask for it." to arrayOf("L’image complète n’est récupérée que lorsque vous la demandez.", "La imagen completa solo se descarga cuando la solicitas.", "Полное изображение загружается только по вашему запросу.", "只有在你请求时才会获取完整图片。"),
+    "Large widgets such as Chess can take a moment to prepare." to arrayOf("Les grands widgets comme Échecs peuvent prendre un moment à préparer.", "Los widgets grandes, como Ajedrez, pueden tardar un momento en prepararse.", "Крупные виджеты, например Шахматы, могут готовиться некоторое время.", "大型小组件（如国际象棋）可能需要一些时间准备。"),
+    "member" to arrayOf("membre", "miembro", "участник", "成员"),
+    "members" to arrayOf("membres", "miembros", "участников", "成员"),
+    "unreviewed item" to arrayOf("élément non examiné", "elemento sin revisar", "непроверенный элемент", "未审核项目"),
+    "unreviewed items" to arrayOf("éléments non examinés", "elementos sin revisar", "непроверенных элементов", "未审核项目"),
+    "comment" to arrayOf("commentaire", "comentario", "комментарий", "条评论"),
+    "comments" to arrayOf("commentaires", "comentarios", "комментариев", "条评论"),
+    "Originally posted by" to arrayOf("Publié à l’origine par", "Publicado originalmente por", "Изначально опубликовано пользователем", "最初发布者："),
+    "active" to arrayOf("actifs", "activos", "активных", "活跃"),
+    "participants" to arrayOf("participants", "participantes", "участников", "参与者"),
+    "Public" to arrayOf("Public", "Público", "Публичная", "公开"),
+    "Unlisted" to arrayOf("Non répertorié", "No listado", "По ссылке", "不公开列出"),
+    "Members Only" to arrayOf("Membres uniquement", "Solo miembros", "Только для участников", "仅成员"),
+    "Request" to arrayOf("Sur demande", "Por solicitud", "По запросу", "需申请"),
+    "Invite" to arrayOf("Sur invitation", "Por invitación", "По приглашению", "邀请制"),
+    "Established" to arrayOf("Membres établis", "Miembros establecidos", "Проверенные участники", "已建立成员"),
+    "Approval" to arrayOf("Avec approbation", "Con aprobación", "С одобрением", "需审核"),
+    "Relaxed" to arrayOf("Souple", "Relajada", "Мягкая", "宽松"),
+    "Balanced" to arrayOf("Équilibrée", "Equilibrada", "Сбалансированная", "平衡"),
+    "Strict" to arrayOf("Stricte", "Estricta", "Строгая", "严格"),
+    "Custom" to arrayOf("Personnalisée", "Personalizada", "Настраиваемая", "自定义"),
+    "Creator" to arrayOf("Créateur", "Creador", "Создатель", "创建者"),
+    "Claimer" to arrayOf("Réclamant", "Reclamante", "Владелец ветки", "认领者"),
+    "Admin" to arrayOf("Administrateur", "Administrador", "Администратор", "管理员"),
+    "Moderator" to arrayOf("Modérateur", "Moderador", "Модератор", "版主"),
+    "Member" to arrayOf("Membre", "Miembro", "Участник", "成员"),
+    "None" to arrayOf("Aucun", "Ninguno", "Нет", "无"),
+    "Widget" to arrayOf("Widget", "Widget", "Виджет", "小组件"),
+    "Message" to arrayOf("Message", "Mensaje", "Сообщение", "消息"),
+    "Report" to arrayOf("Signalement", "Reporte", "Жалоба", "举报"),
+    "Join Request" to arrayOf("Demande d’adhésion", "Solicitud de ingreso", "Запрос на вступление", "加入请求"),
+    "Appeal" to arrayOf("Appel", "Apelación", "Апелляция", "申诉"),
+    "Quarantined Post" to arrayOf("Publication en quarantaine", "Publicación en cuarentena", "Публикация в карантине", "隔离帖子"),
+    "Pending" to arrayOf("En attente", "Pendiente", "Ожидает", "待处理"),
+    "Kept" to arrayOf("Conservé", "Conservado", "Сохранено", "已保留"),
+    "Approved" to arrayOf("Approuvé", "Aprobado", "Одобрено", "已批准"),
+    "Rejected" to arrayOf("Refusé", "Rechazado", "Отклонено", "已拒绝"),
+    "A small mix of people whose MinHash interests look similar to yours, with some rotation so the list is not always identical." to arrayOf("Un petit mélange de personnes dont les intérêts MinHash ressemblent aux vôtres, avec un peu de rotation pour que la liste ne soit pas toujours identique.", "Una pequeña mezcla de personas cuyos intereses MinHash se parecen a los tuyos, con algo de rotación para que la lista no sea siempre idéntica.", "Небольшая подборка людей с похожими MinHash-интересами, с некоторой ротацией, чтобы список не был всегда одинаковым.", "一小组 MinHash 兴趣与你相似的人，并进行一定轮换，这样列表不会总是完全相同。"),
+    "Audio" to arrayOf("Audio", "Audio", "Аудио", "音频"),
+    "Confirmed at root" to arrayOf("Confirmé à la racine", "Confirmado en la raíz", "Подтверждено в корне", "已在根记录确认"),
+    "Could not load the widget library:" to arrayOf("Impossible de charger la bibliothèque de widgets :", "No se pudo cargar la biblioteca de widgets:", "Не удалось загрузить библиотеку виджетов:", "无法加载小组件库："),
+    "Heard via gossip" to arrayOf("Reçu via gossip", "Recibido por gossip", "Получено через gossip", "通过 gossip 获知"),
+    "Image unavailable." to arrayOf("Image indisponible.", "Imagen no disponible.", "Изображение недоступно.", "图片不可用。"),
+    "Linked audio" to arrayOf("Audio lié", "Audio enlazado", "Связанное аудио", "链接音频"),
+    "Linked image" to arrayOf("Image liée", "Imagen enlazada", "Связанное изображение", "链接图片"),
+    "Read from source" to arrayOf("Lu depuis la source", "Leído desde la fuente", "Прочитано из источника", "从来源读取"),
+    "Seen via several peers" to arrayOf("Vu via plusieurs pairs", "Visto a través de varios pares", "Получено от нескольких пиров", "通过多个对等节点看到"),
+    "Show anyway" to arrayOf("Afficher quand même", "Mostrar de todos modos", "Всё равно показать", "仍然显示"),    "Suggested people" to arrayOf("Personnes suggérées", "Personas sugeridas", "Рекомендуемые люди", "推荐用户"),
+    "Basic" to arrayOf("Basique", "Básique", "Базовый", "基础"),
+    "Social" to arrayOf("Social", "Social", "Социальное", "社交"),
+    "Loading widget details…" to arrayOf("Chargement des détails du widget…", "Cargando detalles del widget…", "Загрузка сведений о виджете…", "正在加载小组件详情…"),
+    "Sanitized AAC/M4A" to arrayOf("AAC/M4A nettoyé", "AAC/M4A sanitizado", "Очищенный AAC/M4A", "已清理的 AAC/M4A"),
+    "← Profile" to arrayOf("← Profil", "← Perfil", "← Профиль", "← 个人资料"),
+    "No other profile pages discovered yet. VeilKnit app discovery supplies bootstrap peers; Weave gossip fills this list as profiles are encountered." to arrayOf("Aucune autre page de profil découverte pour l’instant. La découverte d’applications VeilKnit fournit les pairs de démarrage ; le gossip Weave remplit cette liste au fil des profils rencontrés.", "Aún no se han descubierto otras páginas de perfil. El descubrimiento de aplicaciones de VeilKnit aporta pares iniciales; el gossip de Weave llena esta lista a medida que encuentra perfiles.", "Другие страницы профилей пока не обнаружены. Обнаружение приложений VeilKnit даёт начальных пиров, а gossip Weave заполняет список по мере встречи профилей.", "尚未发现其他个人资料页面。VeilKnit 应用发现提供初始对等节点；Weave gossip 会在遇到个人资料时填充此列表。"),
+    "Refresh peers" to arrayOf("Actualiser les pairs", "Actualizar pares", "Обновить пиры", "刷新对等节点"),
+    "The decorated VSPF page is the public profile. These fields are discovery metadata used by MinHash/search; the profile name is still excluded from the MinHash signature." to arrayOf("La page VSPF décorée est le profil public. Ces champs sont des métadonnées de découverte utilisées par MinHash/la recherche ; le nom du profil reste exclu de la signature MinHash.", "La página VSPF decorada es el perfil público. Estos campos son metadatos de descubrimiento usados por MinHash/búsqueda; el nombre del perfil sigue excluido de la firma MinHash.", "Оформленная страница VSPF — это публичный профиль. Эти поля являются метаданными обнаружения для MinHash/поиска; имя профиля по-прежнему не входит в сигнатуру MinHash.", "经过装饰的 VSPF 页面就是公开个人资料。这些字段是 MinHash/搜索使用的发现元数据；个人资料名称仍不会进入 MinHash 签名。"),
+    "Discovery/display name (blank = Profile Page name)" to arrayOf("Nom de découverte/affichage (vide = nom de la page de profil)", "Nombre de descubrimiento/visible (vacío = nombre de la página de perfil)", "Имя для обнаружения/отображения (пусто = имя страницы профиля)", "发现/显示名称（留空 = 个人资料页面名称）"),
+    "Discovery description" to arrayOf("Description de découverte", "Descripción de descubrimiento", "Описание для обнаружения", "发现描述"),
+    "Skills / interests / tags (comma, semicolon, or new line)" to arrayOf("Compétences / intérêts / tags (virgule, point-virgule ou nouvelle ligne)", "Habilidades / intereses / etiquetas (coma, punto y coma o nueva línea)", "Навыки / интересы / теги (запятая, точка с запятой или новая строка)", "技能 / 兴趣 / 标签（逗号、分号或换行）"),
+    "Publish current Profile Page" to arrayOf("Publier la page de profil actuelle", "Publicar la página de perfil actual", "Опубликовать текущую страницу профиля", "发布当前个人资料页面"),
+    "The VSPF document is uploaded through the daemon blob store; this app-root DHT holds only its descriptor/hash and discovery metadata." to arrayOf("Le document VSPF est téléversé via le stockage blob du démon ; cette DHT racine d’application ne contient que son descripteur/hash et les métadonnées de découverte.", "El documento VSPF se sube mediante el almacén blob del daemon; esta DHT raíz de la aplicación solo contiene su descriptor/hash y metadatos de descubrimiento.", "Документ VSPF загружается через blob-хранилище демона; эта корневая DHT приложения содержит только его дескриптор/хэш и метаданные обнаружения.", "VSPF 文档通过守护程序的 blob 存储上传；此应用根 DHT 只保存其描述符/哈希和发现元数据。"),
+    "Main DHT" to arrayOf("DHT principale", "DHT principal", "Основная DHT", "主 DHT"),
+    "Profile root" to arrayOf("Racine du profil", "Raíz del perfil", "Корень профиля", "个人资料根"),
+    "Copy main DHT" to arrayOf("Copier la DHT principale", "Copiar DHT principal", "Копировать основную DHT", "复制主 DHT"),
+    "Copy profile root" to arrayOf("Copier la racine du profil", "Copiar raíz del perfil", "Копировать корень профиля", "复制个人资料根"),
+    "Name / prefix search (e.g. bob)" to arrayOf("Recherche par nom / préfixe (ex. bob)", "Búsqueda por nombre / prefijo (p. ej. bob)", "Поиск по имени / префиксу (например bob)", "名称 / 前缀搜索（例如 bob）"),
+    "Feature/keyword seed (e.g. woodworking)" to arrayOf("Point de départ caractéristique/mot-clé (ex. menuiserie)", "Semilla de característica/palabra clave (p. ej. carpintería)", "Начальный признак/ключевое слово (например деревообработка)", "特征/关键词种子（例如 木工）"),
+    "More-like profile main DHT (optional)" to arrayOf("DHT principale du profil similaire (facultatif)", "DHT principal de perfil similar (opcional)", "Основная DHT похожего профиля (необязательно)", "相似个人资料的主 DHT（可选）"),
+    "Avoid-like profile main DHT (optional)" to arrayOf("DHT principale du profil à éviter (facultatif)", "DHT principal del perfil a evitar (opcional)", "Основная DHT нежелательного похожего профиля (необязательно)", "要避开的相似个人资料主 DHT（可选）"),
+    "Run / continue search" to arrayOf("Lancer / continuer la recherche", "Ejecutar / continuar búsqueda", "Запустить / продолжить поиск", "运行 / 继续搜索"),
+    "Gossip now" to arrayOf("Gossip maintenant", "Gossip ahora", "Запустить gossip", "立即 gossip"),
+    "Results" to arrayOf("Résultats", "Resultados", "Результаты", "结果"),
+    "(unnamed)" to arrayOf("(sans nom)", "(sin nombre)", "(без имени)", "（未命名）"),
+    "(unnamed profile)" to arrayOf("(profil sans nom)", "(perfil sin nombre)", "(профиль без имени)", "（未命名个人资料）"),
+    "More like" to arrayOf("Plus similaire", "Más parecido", "Больше похожего", "更多类似"),
+    "Avoid like" to arrayOf("Éviter les similaires", "Evitar similares", "Избегать похожего", "减少类似"),
+    "Copy DHT" to arrayOf("Copier la DHT", "Copiar DHT", "Копировать DHT", "复制 DHT"),
+    "Copy root" to arrayOf("Copier la racine", "Copiar raíz", "Копировать корень", "复制根"),
+    "Skills/interests" to arrayOf("Compétences/intérêts", "Habilidades/intereses", "Навыки/интересы", "技能/兴趣"),
+    "State" to arrayOf("État", "Estado", "Состояние", "状态"),
+    "signature" to arrayOf("signature", "firma", "сигнатура", "签名"),
+    "Cluster map / rotating record table" to arrayOf("Carte des grappes / table tournante des enregistrements", "Mapa de clústeres / tabla rotativa de registros", "Карта кластеров / вращающаяся таблица записей", "集群图 / 轮换记录表"),
+    "Daemon + Weave debug log" to arrayOf("Journal de débogage démon + Weave", "Registro de depuración daemon + Weave", "Журнал отладки демона + Weave", "守护程序 + Weave 调试日志"),
+    "Copy clusters" to arrayOf("Copier les grappes", "Copiar clústeres", "Копировать кластеры", "复制集群"),
+    "Copy debug log" to arrayOf("Copier le journal de débogage", "Copiar registro de depuración", "Копировать журнал отладки", "复制调试日志"),
+    "Recent 50" to arrayOf("50 récents", "50 recientes", "Последние 50", "最近 50 个"),
+    "Discovery Lab" to arrayOf("Labo de découverte", "Laboratorio de descubrimiento", "Лаборатория обнаружения", "发现实验室"),
+    "Network / Debug" to arrayOf("Réseau / Débogage", "Red / Depuración", "Сеть / Отладка", "网络 / 调试"),
+    "Avoidance strength" to arrayOf("Force d’évitement", "Fuerza de evitación", "Сила избегания", "规避强度"),
+    "Common-word penalty" to arrayOf("Pénalité des mots courants", "Penalización de palabras comunes", "Штраф за частые слова", "常用词惩罚"),
+    "Stuffing penalty" to arrayOf("Pénalité de bourrage", "Penalización por relleno", "Штраф за набивку ключевыми словами", "堆砌惩罚"),
+    "Novelty / exploration" to arrayOf("Nouveauté / exploration", "Novedad / exploración", "Новизна / исследование", "新颖度 / 探索"),
+    "Open page" to arrayOf("Ouvrir la page", "Abrir página", "Открыть страницу", "打开页面"),
+    "Fetch + verify" to arrayOf("Récupérer + vérifier", "Obtener + verificar", "Получить + проверить", "获取 + 验证"),
+    "DHT/blob-verified" to arrayOf("DHT/blob vérifiés", "DHT/blob verificados", "DHT/blob проверено", "DHT/blob 已验证"),
+    "gossip sent" to arrayOf("gossip envoyé", "gossip enviado", "gossip отправлено", "已发送 gossip"),
+    "gossip received" to arrayOf("gossip reçu", "gossip recibido", "gossip получено", "已接收 gossip"),
+    "gossip_hint" to arrayOf("indice gossip", "indicio gossip", "подсказка gossip", "gossip 提示"),
+    "multi_source_hint" to arrayOf("indice multi-source", "indicio de varias fuentes", "подсказка из нескольких источников", "多来源提示"),
+    "app_root_confirmed" to arrayOf("racine d’application confirmée", "raíz de aplicación confirmada", "корень приложения подтверждён", "应用根已确认"),
+    "dht_verified" to arrayOf("DHT vérifiée", "DHT verificada", "DHT проверено", "DHT 已验证"),
+    "Couldn't load the full image." to arrayOf("Impossible de charger l’image complète.", "No se pudo cargar la imagen completa.", "Не удалось загрузить полное изображение.", "无法加载完整图片。"),
+    "Couldn't load the source post." to arrayOf("Impossible de charger la publication source.", "No se pudo cargar la publicación original.", "Не удалось загрузить исходную публикацию.", "无法加载源帖子。"),
+    "Featured" to arrayOf("À la une", "Destacado", "Избранное", "精选"),
+    "Featured comment" to arrayOf("Commentaire à la une", "Comentario destacado", "Избранный комментарий", "精选评论"),
+    "Featured post" to arrayOf("Publication à la une", "Publicación destacada", "Избранная публикация", "精选帖子"),
+    "Featured widget" to arrayOf("Widget à la une", "Widget destacado", "Избранный виджет", "精选小组件"),
+    "Message thumbnail" to arrayOf("Miniature du message", "Miniatura del mensaje", "Миниатюра сообщения", "消息缩略图"),
+    "No cached conversation activity yet." to arrayOf("Aucune activité de conversation en cache pour l’instant.", "Aún no hay actividad de conversación en caché.", "В кэше пока нет активности бесед.", "尚无缓存的对话活动。"),
+    "Post image" to arrayOf("Image de la publication", "Imagen de la publicación", "Изображение публикации", "帖子图片"),
+    "Post image thumbnail" to arrayOf("Miniature de l’image de la publication", "Miniatura de la imagen de la publicación", "Миниатюра изображения публикации", "帖子图片缩略图"),
+    "Removed" to arrayOf("Retiré", "Eliminado", "Удалено", "已移除"),
+    "Removed by this moderation branch." to arrayOf("Retiré par cette branche de modération.", "Eliminado por esta rama de moderación.", "Удалено этой веткой модерации.", "已被此管理分支移除。"),
+    "Removed post" to arrayOf("Publication retirée", "Publicación eliminada", "Удалённая публикация", "已移除的帖子"),
+    "Retained post" to arrayOf("Publication conservée", "Publicación conservada", "Сохранённая публикация", "保留的帖子"),
+    "Selected post image" to arrayOf("Image de publication sélectionnée", "Imagen de publicación seleccionada", "Выбранное изображение публикации", "已选择的帖子图片"),
+    "This user" to arrayOf("Cet utilisateur", "Este usuario", "Этот пользователь", "此用户"),
+    "group thumbnail" to arrayOf("miniature du groupe", "miniatura del grupo", "миниатюра группы", "群组缩略图"),
+    "will have new submissions rejected by this moderation branch. Other branches remain independent." to arrayOf("verra ses nouvelles soumissions rejetées par cette branche de modération. Les autres branches restent indépendantes.", "tendrá sus nuevos envíos rechazados por esta rama de moderación. Las demás ramas siguen siendo independientes.", "будет получать отказ на новые отправки в этой ветке модерации. Другие ветки остаются независимыми.", "的新提交将被此管理分支拒绝。其他分支仍然独立。"),
+    "Claim" to arrayOf("Réclamation", "Reclamación", "Ветка-заявка", "认领分支"),
+    "Curator-held posts" to arrayOf("Publications conservées par le curateur", "Publicaciones retenidas por el curador", "Публикации у куратора", "策展者保留的帖子"),
+    "Posts" to arrayOf("Publications", "Publicaciones", "Публикации", "帖子"),
+    "Uploading your post…" to arrayOf("Téléversement de votre publication…", "Subiendo tu publicación…", "Загрузка вашей публикации…", "正在上传你的帖子…"),
+    "Add picture" to arrayOf("Ajouter une image", "Añadir imagen", "Добавить изображение", "添加图片"),
+    "Change picture" to arrayOf("Changer l’image", "Cambiar imagen", "Сменить изображение", "更换图片"),
+    "Add audio" to arrayOf("Ajouter un audio", "Añadir audio", "Добавить аудио", "添加音频"),
+    "Change audio" to arrayOf("Changer l’audio", "Cambiar audio", "Сменить аудио", "更换音频"),
+    "Banning…" to arrayOf("Bannissement…", "Bloqueando…", "Блокировка…", "正在封禁…"),
+    "Removing…" to arrayOf("Retrait…", "Eliminando…", "Удаление…", "正在移除…"),
+    "Remove post" to arrayOf("Retirer la publication", "Eliminar publicación", "Удалить публикацию", "移除帖子"),
+    "Saving…" to arrayOf("Enregistrement…", "Guardando…", "Сохранение…", "正在保存…"),
+    "Save curated copy" to arrayOf("Enregistrer la copie organisée", "Guardar copia curada", "Сохранить курируемую копию", "保存策展副本"),
+    "Unpin" to arrayOf("Désépingler", "Desfijar", "Открепить", "取消置顶"),
+    "Pin" to arrayOf("Épingler", "Fijar", "Закрепить", "置顶"),
+    "Tap to load image" to arrayOf("Touchez pour charger l’image", "Toca para cargar la imagen", "Нажмите, чтобы загрузить изображение", "点按以加载图片"),
+    "Tap thumbnail to load full image" to arrayOf("Touchez la miniature pour charger l’image complète", "Toca la miniatura para cargar la imagen completa", "Нажмите миниатюру, чтобы загрузить полное изображение", "点按缩略图以加载完整图片"),
+    "Create group" to arrayOf("Créer un groupe", "Crear grupo", "Создать группу", "创建群组"),
+    "Manage group" to arrayOf("Gérer le groupe", "Administrar grupo", "Управление группой", "管理群组"),
+    "Add group picture" to arrayOf("Ajouter une image de groupe", "Añadir imagen de grupo", "Добавить изображение группы", "添加群组图片"),
+    "Change group picture" to arrayOf("Changer l’image du groupe", "Cambiar imagen del grupo", "Сменить изображение группы", "更换群组图片"),
+    "Hide advanced" to arrayOf("Masquer les options avancées", "Ocultar opciones avanzadas", "Скрыть расширенные настройки", "隐藏高级选项"),
+    "Save changes" to arrayOf("Enregistrer les modifications", "Guardar cambios", "Сохранить изменения", "保存更改"),
+    "Approve members" to arrayOf("Approuver les membres", "Aprobar miembros", "Одобрять участников", "批准成员"),
+    "Edit featured area" to arrayOf("Modifier la zone à la une", "Editar área destacada", "Редактировать избранную область", "编辑精选区域"),
+    "Excessive-posting protection" to arrayOf("Protection contre les publications excessives", "Protección contra publicaciones excesivas", "Защита от чрезмерных публикаций", "过量发帖保护"),
+    "Handle reports" to arrayOf("Traiter les signalements", "Gestionar reportes", "Обрабатывать жалобы", "处理举报"),
+    "Joining" to arrayOf("Adhésion", "Ingreso", "Вступление", "加入"),
+    "Moderate posts/comments" to arrayOf("Modérer les publications/commentaires", "Moderar publicaciones/comentarios", "Модерировать публикации/комментарии", "管理帖子/评论"),
+    "Moderation" to arrayOf("Modération", "Moderación", "Модерация", "管理"),
+    "Pin comments" to arrayOf("Épingler les commentaires", "Fijar comentarios", "Закреплять комментарии", "置顶评论"),
+    "Posting" to arrayOf("Publication", "Publicación", "Публикация", "发帖"),
+    "Quarantine new members" to arrayOf("Mettre les nouveaux membres en quarantaine", "Poner nuevos miembros en cuarentena", "Помещать новых участников в карантин", "隔离新成员"),
+    "Repeated-message protection" to arrayOf("Protection contre les messages répétés", "Protección contra mensajes repetidos", "Защита от повторяющихся сообщений", "重复消息保护"),
+    "Type" to arrayOf("Type", "Tipo", "Тип", "类型"),
+    "Visibility" to arrayOf("Visibilité", "Visibilidad", "Видимость", "可见性"),
+    "Post is now visible on this moderation branch." to arrayOf("La publication est maintenant visible sur cette branche de modération.", "La publicación ya es visible en esta rama de moderación.", "Публикация теперь видна в этой ветке модерации.", "帖子现在已在此管理分支中可见。"),
+    "Uploading…" to arrayOf("Téléversement…", "Subiendo…", "Загрузка…", "正在上传…"),
+    "Not visible yet · waiting for the selected moderation branch" to arrayOf("Pas encore visible · en attente de la branche de modération sélectionnée", "Aún no visible · esperando la rama de moderación seleccionada", "Пока не видно · ожидание выбранной ветки модерации", "尚不可见 · 正在等待所选管理分支"),
+    "Post uploaded and submitted." to arrayOf("Publication téléversée et soumise.", "Publicación subida y enviada.", "Публикация загружена и отправлена.", "帖子已上传并提交。"),
+    "Upload failed · reopen the composer to try again" to arrayOf("Échec du téléversement · rouvrez l’éditeur pour réessayer", "Falló la subida · vuelve a abrir el editor para intentarlo de nuevo", "Ошибка загрузки · снова откройте редактор и повторите попытку", "上传失败 · 重新打开编辑器以重试"),
+    "Post upload failed. Your draft is still here if you reopen the composer." to arrayOf("Échec du téléversement. Votre brouillon sera toujours là si vous rouvrez l’éditeur.", "Falló la subida. Tu borrador seguirá aquí si vuelves a abrir el editor.", "Не удалось загрузить публикацию. Черновик останется здесь, если снова открыть редактор.", "帖子上传失败。重新打开编辑器后草稿仍会保留。"),
+    "A post/widget ObjectRef can be selected from the group after it has been published." to arrayOf("Un ObjectRef de publication/widget peut être sélectionné dans le groupe après sa publication.", "Se puede seleccionar un ObjectRef de publicación/widget desde el grupo después de publicarlo.", "ObjectRef публикации/виджета можно выбрать в группе после публикации.", "帖子/小组件的 ObjectRef 发布后可从群组中选择。"),
+    "This stays deliberately short so the actual conversations remain above the fold." to arrayOf("Cette zone reste volontairement courte afin que les conversations réelles restent visibles sans défilement.", "Esto se mantiene intencionalmente corto para que las conversaciones reales sigan visibles sin desplazarse.", "Этот блок намеренно короткий, чтобы реальные беседы оставались выше сгиба.", "这里特意保持简短，让实际对话尽量保持在首屏。"),
 
 )

@@ -1,3 +1,17 @@
+# Phase 6.12 Advanced editor redesign
+
+The Advanced profile editor now uses a flat **Background / Foreground** workflow: the header and inspector have been simplified, page navigation lives in the bottom strip, Next can create/name a new page, Undo has a matching oval control, and new foreground text/media/widgets are placed directly on the page instead of requiring boxes. Existing boxed profiles remain supported for compatibility. See `WEAVE_PHASE6_12_ADVANCED_EDITOR_REDESIGN.md`.
+
+# Phase 6.11.7 account-backup + group-continuity fix
+
+Weave Settings now exposes the existing embedded VeilKnit account backup flow, group-detail navigation shows a bounded loading spinner while the first branch/header is fetched, and Groups-v2 now repairs the race where a post can be retained in a new claimer's custody while remaining pending only on a dead Original branch. See `WEAVE_PHASE6_11_7_BACKUP_GROUP_CONTINUITY.md`.
+
+# Phase 6.11.5 service-startup fix
+
+Embedded VeilKnit services now have independent bounded startup windows instead of sharing one 30-second deadline. See `WEAVE_PHASE6_11_5_SERVICE_STARTUP_FIX.md`.
+
+> **Phase 6.11 embedded VeilKnit build (2026-09-24):** the Android VeilKnit Rust daemon/core is now packaged inside Weave. Startup begins with the VeilKnit sign-in/create-account screen, then Weave shows live Rust startup state while Veilid/DHT/mailbox/application services come online. Weave uses an in-process JNI + Tokio duplex bridge over the existing protocol-v3 dispatcher instead of Android Binder/local-socket IPC. The foreground daemon notification remains enabled by default. Enter Weave Settings five times within five seconds (backing out between entries) to open the full embedded VeilKnit management GUI. See `WEAVE_PHASE6_11_EMBEDDED_VEILKNIT.md`.
+
 > **Phase 6.10.2 startup/Studio load fix (2026-09-18):** established profiles no longer fall through to Create profile during a transient vault reconnect, local widget source compilation is removed from Canvas/main-thread rendering, Widget Studio now has explicit loading/progress UI for large widgets such as Chess, and high-frequency diagnostic-log mirroring is throttled to stop startup GC/recomposition churn. See `WEAVE_PHASE6_10_2_STARTUP_STUDIO_LOAD_FIX.md`.
 
 > **Phase 6.10.1 Chess load fix (2026-09-17):** large built-in widgets such as the full Chess example are now compiled/verified and persisted off the Compose main thread, local template saves reuse the already verified program instead of recompiling immediately, the Widget Library loads in the background, and the built-in-template button has a stronger outline. See `WEAVE_PHASE6_10_1_CHESS_LOAD_FIX.md`.
@@ -14,7 +28,9 @@
 
 Jetpack Compose implementation.
 
-Build debug APK:
+This build also requires the Android NDK plus Rust/cargo-ndk because the VeilKnit core is compiled as a native `cdylib`. The build scripts check/install cargo-ndk and add the `aarch64-linux-android` and `x86_64-linux-android` Rust targets.
+
+Build the optimized prototype APK:
 
 ```
 build_project.bat
@@ -25,6 +41,8 @@ or
 ```
 ./build_project.sh
 ```
+
+Use `build_debug.bat` / `./build_debug.sh` for a debug APK.
 
 Clean with `clean_project.bat` / `clean_project.sh`.
 
@@ -109,3 +127,6 @@ Phase 6 adds compact narrow-screen actions, supplied icon-only People/Groups nav
 Phase 6.8 raises the public-widget input declaration ceiling to 32 while preserving the strict two-input limit for any one network action. In a paired session, up to five input actions may now be outstanding before Weave waits for acknowledgements. This lets a turn-based widget submit a short multi-step move (for example chess FROM square then TO square) without requiring a network round trip between taps. Each action is still separately canonicalized, hashed, range-checked, and acknowledged by exact event hash.
 
 Activated widgets now have a host-owned **X** control at the top-right. The widget source cannot hide or override it. Pressing X stops the local runtime/network host, clears pending invitation/action state, discards runtime state, and returns the page to the inert pre-load placeholder. Reopening the widget starts from its source-defined initial state. Already-published DHT history is not erased by closing a local runtime.
+
+## Phase 6.12.2 — Advanced Editor sidebar/layers
+The Advanced Editor now starts collapsed on first use, remembers the sidebar state afterward, uses red collapse/expand affordances, supports long-press page and layer reordering in Pages & Layers, removes the visible Depth section, and uses a collapsible vertical Add section.

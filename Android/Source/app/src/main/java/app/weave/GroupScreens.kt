@@ -86,6 +86,7 @@ fun GroupSearchScreen(
     store: GroupStore,
     onOpen: (String) -> Unit,
     onResolveLink: (String) -> Unit = {},
+    onPrefetchGroup: (GroupRecord) -> Unit = {},
 ) {
     var query by remember { mutableStateOf("") }
     var lastResolvedLink by remember { mutableStateOf("") }
@@ -115,7 +116,7 @@ fun GroupSearchScreen(
             value = query,
             onValueChange = { query = it.take(1200) },
             modifier = Modifier.fillMaxWidth().padding(16.dp),
-            label = { Text("Group name, topic, tag or Weave link") },
+            label = { Text(tr("Group name, topic, tag or Weave link")) },
             singleLine = true,
         )
         if (results.isEmpty()) {
@@ -131,7 +132,11 @@ fun GroupSearchScreen(
         } else {
             LazyColumn(Modifier.fillMaxSize()) {
                 items(results, key = { it.groupId }) { group ->
-                    GroupRow(group, onClick = { onOpen(group.groupId) })
+                    GroupRow(
+                        group,
+                        onClick = { onOpen(group.groupId) },
+                        onNeedThumbnail = { onPrefetchGroup(group) },
+                    )
                     HorizontalDivider()
                 }
             }
@@ -171,9 +176,8 @@ fun GroupMeScreen(
                         Identicon(ownKey, size = 42.dp)
                     }
                     Column(Modifier.weight(1f)) {
-                        Text("Curator", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                        Text(
-                            "Create, manage and moderate groups from here.",
+                        Text(tr("Curator"), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        Text(tr("Create, manage and moderate groups from here."),
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -189,19 +193,19 @@ fun GroupMeScreen(
                         Modifier.fillMaxWidth().padding(16.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Needs attention", fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                        Text(tr("Needs attention"), fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
                         Text("$pending", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
                     }
                 }
             }
             Button(onClick = onCreate, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
-                Text("+ Create group")
+                Text(tr("+ Create group"))
             }
             SectionLabel("Your groups")
         }
 
         if (owned.isEmpty()) {
-            item { HintText("You haven't created or moderated any groups yet.") }
+            item { HintText(tr("You haven't created or moderated any groups yet.")) }
         } else {
             items(owned, key = { "owned:${it.groupId}" }) { group ->
                 val canEditMetadata = group.role == GroupRole.Creator || group.ownerId == ownKey
@@ -215,13 +219,53 @@ fun GroupMeScreen(
 
         item { SectionLabel("Joined groups") }
         if (joined.isEmpty()) {
-            item { HintText("Groups you join will appear here.") }
+            item { HintText(tr("Groups you join will appear here.")) }
         } else {
             items(joined, key = { "joined:${it.groupId}" }) { group ->
                 GroupRow(group, onClick = { onOpen(group.groupId) })
             }
         }
         item { Spacer(Modifier.height(24.dp)) }
+    }
+}
+
+@Composable
+private fun GroupFetchLoadingState(group: GroupRecord, onBack: () -> Unit) {
+    Column(Modifier.fillMaxSize()) {
+        Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 2.dp) {
+            Row(
+                Modifier.fillMaxWidth().height(58.dp).padding(horizontal = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextButton(onClick = onBack) { Text("\u2190") }
+                GroupThumbnail(group.thumbnailBase64, group.groupId, group.name, size = 40.dp)
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    group.name.ifBlank { tr("Group") },
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                CircularProgressIndicator()
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    tr("Fetching group information…"),
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    tr("Weave is loading the group's current moderation branch and recent posts."),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 28.dp, vertical = 6.dp),
+                )
+            }
+        }
     }
 }
 
@@ -252,6 +296,11 @@ fun GroupDetailScreen(
     onBanAuthor: ((String, (Boolean, String) -> Unit) -> Unit)? = null,
 ) {
     val context = LocalContext.current
+    // Capture translated strings while we are in composition. Event/callback lambdas are not
+    // composable contexts, so calling tr() from inside them is a compiler error.
+    val weaveGroupClipboardLabel = tr("Weave group")
+    val couldntLoadSourcePostText = tr("Couldn't load the source post.")
+    val featuredCommentLabel = tr("Featured comment")
     val revision = store.revision
     val group = remember(revision, groupId) { store.byId(groupId) }
     val branchList = remember(revision, groupId) { store.branchesFor(groupId) }
@@ -264,13 +313,47 @@ fun GroupDetailScreen(
 
     // A group's branch root is long-lived while its Pulse (subkey 1) changes as new posts and
     // comments are accepted. Force an immediate refresh whenever this screen/branch becomes active,
-    // then poll only while the group is actually on screen. Leaving the composable cancels this
-    // LaunchedEffect automatically, so known groups are not continuously polled in the background.
+    // then poll only while the group is actually on screen. If this device only has a directory/
+    // search hint so far, keep a visible loading state up while the first authoritative branch read
+    // is in flight instead of briefly showing a half-empty group.
     val currentRefreshBranch by rememberUpdatedState(onRefreshBranch)
-    LaunchedEffect(groupId, selected?.branchId, selected?.branchRoot) {
-        val branch = selected ?: return@LaunchedEffect
+    val latestSelectedHeader by rememberUpdatedState(selectedHeader)
+    val latestPulse by rememberUpdatedState(pulse)
+    var initialGroupFetchBusy by remember(groupId) {
+        mutableStateOf(selectedHeader == null && pulse == null)
+    }
+    LaunchedEffect(selectedHeader, pulse) {
+        if (selectedHeader != null || pulse != null) initialGroupFetchBusy = false
+    }
+    LaunchedEffect(groupId, selected?.branchId, selected?.branchRoot, group?.rootRecordKey) {
+        val branch = selected ?: group?.rootRecordKey?.takeIf { it.isNotBlank() }?.let {
+            GroupBranchPointer(
+                groupId = groupId,
+                branchId = GroupBranchNetwork.originalBranchId(groupId),
+                branchRoot = it,
+                ownerMainDht = group.ownerId,
+                kind = GroupBranchKind.Original,
+                creatorRoot = it,
+                updatedAt = group.updatedAt,
+            )
+        } ?: return@LaunchedEffect
         val refresh = currentRefreshBranch ?: return@LaunchedEffect
+        if (latestSelectedHeader == null && latestPulse == null) {
+            initialGroupFetchBusy = true
+        }
         refresh(branch)
+
+        // Do not leave a spinner up forever if the remote branch is offline. Once the timeout
+        // expires, fall back to whatever cached directory/group data we already have.
+        if (initialGroupFetchBusy) {
+            var waited = 0
+            while (waited < 60 && latestSelectedHeader == null && latestPulse == null) {
+                delay(250)
+                waited++
+            }
+            initialGroupFetchBusy = false
+        }
+
         while (true) {
             delay(GROUP_OPEN_REFRESH_MS)
             currentRefreshBranch?.invoke(branch)
@@ -334,23 +417,13 @@ fun GroupDetailScreen(
         }
     }
 
-    LaunchedEffect(selected?.branchRoot, group?.rootRecordKey) {
-        val branch = selected ?: group?.rootRecordKey?.takeIf { it.isNotBlank() }?.let {
-            GroupBranchPointer(
-                groupId = groupId,
-                branchId = GroupBranchNetwork.originalBranchId(groupId),
-                branchRoot = it,
-                ownerMainDht = group.ownerId,
-                kind = GroupBranchKind.Original,
-                creatorRoot = it,
-                updatedAt = group.updatedAt,
-            )
-        }
-        branch?.let { onRefreshBranch?.invoke(it) }
-    }
-
     if (group == null) {
         EmptyGroupState("Group unavailable", "This cached group entry no longer exists.")
+        return
+    }
+
+    if (initialGroupFetchBusy && selectedHeader == null && pulse == null) {
+        GroupFetchLoadingState(group = group, onBack = onBack)
         return
     }
 
@@ -375,9 +448,9 @@ fun GroupDetailScreen(
         }.distinctBy { it.branchId }
             .sortedWith(compareBy<GroupBranchPointer> { it.kind != GroupBranchKind.Original }.thenByDescending { it.updatedAt })
     }
-    val moderationKindLabel = if (selected?.kind == GroupBranchKind.Claim) "Claim" else "Original"
+    val moderationKindLabel = tr(if (selected?.kind == GroupBranchKind.Claim) "Claim" else "Original")
     val selectedOwnerName = selected?.ownerMainDht?.let(branchOwnerName)?.takeIf { it.isNotBlank() }
-    val moderationLabel = if (curatorView) "Curator" else
+    val moderationLabel = if (curatorView) tr("Curator") else
         selectedOwnerName?.let { "$moderationKindLabel · $it" } ?: moderationKindLabel
     val groupLink = remember(group.groupId, group.rootRecordKey) { GroupLink.forGroup(group)?.encode() }
     val canPost = group.joined || group.ownerId == ownMainDht
@@ -432,7 +505,7 @@ fun GroupDetailScreen(
                     )
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
-                            "${group.approximateMembers} member${if (group.approximateMembers == 1) "" else "s"} \u00B7 ${group.policy.visibility.pretty()} \u00B7",
+                            "${group.approximateMembers} ${tr(if (group.approximateMembers == 1) "member" else "members")} \u00B7 ${tr(group.policy.visibility.pretty())} \u00B7",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1,
@@ -455,7 +528,7 @@ fun GroupDetailScreen(
                             DropdownMenu(expanded = branchMenu, onDismissRequest = { branchMenu = false }) {
                                 if (menuBranches.isEmpty()) {
                                     DropdownMenuItem(
-                                        text = { Text("Original") },
+                                        text = { Text(tr("Original")) },
                                         enabled = false,
                                         onClick = {},
                                     )
@@ -464,7 +537,7 @@ fun GroupDetailScreen(
                                     DropdownMenuItem(
                                         text = {
                                             Column {
-                                                Text(if (branch.kind == GroupBranchKind.Original) "Original" else "Claim")
+                                                Text(tr(if (branch.kind == GroupBranchKind.Original) "Original" else "Claim"))
                                                 Text(
                                                     branchOwnerName(branch.ownerMainDht)?.takeIf { it.isNotBlank() }
                                                         ?: shortBranchOwner(branch.ownerMainDht),
@@ -486,9 +559,8 @@ fun GroupDetailScreen(
                                 DropdownMenuItem(
                                     text = {
                                         Column {
-                                            Text("Curator")
-                                            Text(
-                                                "Retained and pending submissions",
+                                            Text(tr("Curator"))
+                                            Text(tr("Retained and pending submissions"),
                                                 style = MaterialTheme.typography.labelSmall,
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                             )
@@ -508,7 +580,7 @@ fun GroupDetailScreen(
                     IconButton(
                         onClick = {
                             val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                            clipboard.setPrimaryClip(ClipData.newPlainText("Weave group", groupLink))
+                            clipboard.setPrimaryClip(ClipData.newPlainText(weaveGroupClipboardLabel, groupLink))
                         }
                     ) { Text("\uD83D\uDD17") }
                 }
@@ -517,22 +589,21 @@ fun GroupDetailScreen(
                     Column(horizontalAlignment = Alignment.End) {
                         if (group.joined) {
                             TextButton(onClick = { onLeave?.invoke() }) {
-                                Text("Leave group", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
+                                Text(tr("Leave group"), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
                             }
                         } else {
                             when (group.policy.join) {
-                                GroupJoinPolicy.Invite -> Text(
-                                    "Invite only",
+                                GroupJoinPolicy.Invite -> Text(tr("Invite only"),
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     maxLines = 1,
                                     softWrap = false,
                                 )
                                 GroupJoinPolicy.Open -> Button(onClick = { onJoin?.invoke() }) {
-                                    Text("Join", maxLines = 1, softWrap = false)
+                                    Text(tr("Join"), maxLines = 1, softWrap = false)
                                 }
                                 GroupJoinPolicy.Request -> OutlinedButton(onClick = { onJoin?.invoke() }) {
-                                    Text("Ask to join", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
+                                    Text(tr("Ask to join"), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
                                 }
                             }
                         }
@@ -570,7 +641,7 @@ fun GroupDetailScreen(
                 GroupAuthorityContinuityLevelV2.ClaimRecommended -> item {
                     ElevatedCard(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
                         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Text("Moderation continuity", fontWeight = FontWeight.SemiBold)
+                            Text(tr("Moderation continuity"), fontWeight = FontWeight.SemiBold)
                             Text(
                                 authorityContinuity.message,
                                 style = MaterialTheme.typography.bodySmall,
@@ -580,7 +651,7 @@ fun GroupDetailScreen(
                                 Button(
                                     onClick = { showClaimConfirm = true },
                                     enabled = !claimingModeration,
-                                ) { Text("Create independent Claim") }
+                                ) { Text(tr("Create independent Claim")) }
                             }
                         }
                     }
@@ -619,26 +690,24 @@ fun GroupDetailScreen(
                             }
                             Column(Modifier.weight(1f)) {
                                 Text(
-                                    if (submissionUi.uploading) "Uploading your post…" else submissionUi.notice.orEmpty(),
+                                    tr(if (submissionUi.uploading) "Uploading your post…" else submissionUi.notice.orEmpty()),
                                     fontWeight = FontWeight.SemiBold,
                                     color = if (submissionUi.failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
                                 )
                                 if (submissionUi.uploading) {
-                                    Text(
-                                        "Media is uploaded first, then the post is delivered to the group's moderation branches.",
+                                    Text(tr("Media is uploaded first, then the post is delivered to the group's moderation branches."),
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )
                                 } else if (!submissionUi.failed && submissionUi.submittedConversationId != null) {
-                                    Text(
-                                        "It may remain unreviewed until the selected branch accepts it.",
+                                    Text(tr("It may remain unreviewed until the selected branch accepts it."),
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )
                                 }
                             }
                             if (!submissionUi.uploading) {
-                                TextButton(onClick = { submissionUi.notice = null; submissionUi.failed = false }) { Text("Dismiss") }
+                                TextButton(onClick = { submissionUi.notice = null; submissionUi.failed = false }) { Text(tr("Dismiss")) }
                             }
                         }
                     }
@@ -650,9 +719,8 @@ fun GroupDetailScreen(
                     ElevatedCard(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)) {
                         Column(Modifier.padding(12.dp)) {
                             val count = pendingPublic + pendingEncrypted
-                            Text("$count unreviewed item${if (count == 1) "" else "s"}", fontWeight = FontWeight.SemiBold)
-                            Text(
-                                "Temporary intake activity is shown separately until the selected moderation branch accepts or removes it.",
+                            Text("$count ${tr(if (count == 1) "unreviewed item" else "unreviewed items")}", fontWeight = FontWeight.SemiBold)
+                            Text(tr("Temporary intake activity is shown separately until the selected moderation branch accepts or removes it."),
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -667,20 +735,20 @@ fun GroupDetailScreen(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
-                        if (curatorView) "Curator-held posts" else "Posts",
+                        tr(if (curatorView) "Curator-held posts" else "Posts"),
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.SemiBold,
                         modifier = Modifier.weight(1f),
                     )
                     if (!curatorView && ownsBranch && onAddModerator != null) {
-                        TextButton(onClick = { showModeratorDialog = true }) { Text("Moderators", maxLines = 1, softWrap = false) }
+                        TextButton(onClick = { showModeratorDialog = true }) { Text(tr("Moderators"), maxLines = 1, softWrap = false) }
                     }
                     if (!curatorView && canPost && onCreatePost != null) {
                         Button(
                             onClick = { showCreatePost = true },
                             enabled = !submissionUi.uploading,
                         ) {
-                            Text("Create a post", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
+                            Text(tr("Create a post"), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
                         }
                     }
                 }
@@ -688,8 +756,7 @@ fun GroupDetailScreen(
 
             if (curatorView) {
                 item {
-                    Text(
-                        "This view shows post submissions still retained by this device's curator/custody layer, including items that a moderation branch has not exposed.",
+                    Text(tr("This view shows post submissions still retained by this device's curator/custody layer, including items that a moderation branch has not exposed."),
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -701,7 +768,7 @@ fun GroupDetailScreen(
                             CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
                         }
                     }
-                    curatorPosts.isEmpty() -> item { HintText("No retained post submissions are available on this device.") }
+                    curatorPosts.isEmpty() -> item { HintText(tr("No retained post submissions are available on this device.")) }
                     else -> items(curatorPosts, key = { "curator:${it.eventId}" }) { item ->
                         CuratorPostCard(item)
                     }
@@ -711,7 +778,7 @@ fun GroupDetailScreen(
                     item(key = "local-pending-post") { PendingLocalPostCard(pending) }
                 }
                 if (posts.isEmpty() && submissionUi.optimisticPost == null) {
-                    item { HintText("No posts yet.") }
+                    item { HintText(tr("No posts yet.")) }
                 } else {
                     items(posts, key = { it.conversation.objectId }) { post ->
                         GroupPostCard(
@@ -734,7 +801,7 @@ fun GroupDetailScreen(
                                             modifyTitle = message.title ?: post.title
                                             modifyBody = message.body
                                         } else {
-                                            android.widget.Toast.makeText(context, "Couldn't load the source post.", android.widget.Toast.LENGTH_SHORT).show()
+                                            android.widget.Toast.makeText(context, couldntLoadSourcePostText, android.widget.Toast.LENGTH_SHORT).show()
                                         }
                                     }
                                 }
@@ -758,15 +825,18 @@ fun GroupDetailScreen(
     if (showClaimConfirm) {
         AlertDialog(
             onDismissRequest = { if (!claimingModeration) showClaimConfirm = false },
-            title = { Text("Claim moderation of this group?") },
+            title = { Text(tr("Claim moderation of this group?")) },
             text = {
-                Text(
-                    "This creates your own independent moderation branch. It does not replace, revoke, or take control of the Original branch. People can choose which moderation branch they want to view."
+                Text(tr("This creates your own independent moderation branch. It does not replace, revoke, or take control of the Original branch. People can choose which moderation branch they want to view.")
                 )
             },
             confirmButton = {
                 Button(
                     enabled = !claimingModeration,
+                    colors = ButtonDefaults.buttonColors(
+                        disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                        disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                    ),
                     onClick = {
                         val claim = onClaimModeration ?: return@Button
                         claimingModeration = true
@@ -777,13 +847,25 @@ fun GroupDetailScreen(
                             claimNotice = message
                         }
                     },
-                ) { Text(if (claimingModeration) "Creating…" else "Create Claim") }
+                ) {
+                    if (claimingModeration) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(tr("Creating…"))
+                    } else {
+                        Text(tr("Create Claim"))
+                    }
+                }
             },
             dismissButton = {
                 TextButton(
                     enabled = !claimingModeration,
                     onClick = { showClaimConfirm = false },
-                ) { Text("Cancel") }
+                ) { Text(tr("Cancel")) }
             },
         )
     }
@@ -791,21 +873,21 @@ fun GroupDetailScreen(
     if (showCreatePost) {
         AlertDialog(
             onDismissRequest = { showCreatePost = false },
-            title = { Text("Create a post") },
+            title = { Text(tr("Create a post")) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(
                         value = postTitle,
                         onValueChange = { postTitle = it.take(160) },
                         modifier = Modifier.fillMaxWidth(),
-                        label = { Text("Title") },
+                        label = { Text(tr("Title")) },
                         singleLine = true,
                     )
                     OutlinedTextField(
                         value = postBody,
                         onValueChange = { postBody = it.take(MAX_COMMENT_CHARS) },
                         modifier = Modifier.fillMaxWidth(),
-                        label = { Text("Post") },
+                        label = { Text(tr("Post")) },
                         minLines = 4,
                         maxLines = 10,
                     )
@@ -818,7 +900,7 @@ fun GroupDetailScreen(
                             ) { gateModifier ->
                                 Image(
                                     bitmap = bitmap,
-                                    contentDescription = "Selected post image",
+                                    contentDescription = tr("Selected post image"),
                                     modifier = gateModifier.fillMaxWidth().heightIn(max = 180.dp),
                                     contentScale = ContentScale.Fit,
                                 )
@@ -826,10 +908,10 @@ fun GroupDetailScreen(
                         }
                     }
                     Text(
-                        if (postImage == null)
+                        tr(if (postImage == null)
                             "Add an optional picture. A thumbnail is stored in the post preview; the full image stays remote until someone taps it."
                         else
-                            "This post will include an image. The thumbnail is embedded; the full image loads only when opened.",
+                            "This post will include an image. The thumbnail is embedded; the full image loads only when opened."),
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -845,12 +927,12 @@ fun GroupDetailScreen(
                             if (importingPostImage) {
                                 CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
                             } else {
-                                Text(if (postImage == null) "Add picture" else "Change picture")
+                                Text(tr(if (postImage == null) "Add picture" else "Change picture"))
                             }
                         }
                         if (postImage != null) {
                             Spacer(Modifier.width(8.dp))
-                            TextButton(onClick = { postImage = null }) { Text("Remove") }
+                            TextButton(onClick = { postImage = null }) { Text(tr("Remove")) }
                         }
                     }
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -861,16 +943,16 @@ fun GroupDetailScreen(
                             if (importingPostAudio) {
                                 CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
                             } else {
-                                Text(if (postAudio == null) "Add audio" else "Change audio")
+                                Text(tr(if (postAudio == null) "Add audio" else "Change audio"))
                             }
                         }
                         postAudio?.let { audio ->
                             Spacer(Modifier.width(8.dp))
                             Text(
-                                if (audio.durationMs > 0) "${audio.durationMs / 1000}s" else "Audio",
+                                if (audio.durationMs > 0) "${audio.durationMs / 1000}s" else tr("Audio"),
                                 style = MaterialTheme.typography.labelSmall,
                             )
-                            TextButton(onClick = { postAudio = null }) { Text("Remove") }
+                            TextButton(onClick = { postAudio = null }) { Text(tr("Remove")) }
                         }
                     }
                 }
@@ -928,10 +1010,10 @@ fun GroupDetailScreen(
                     },
                     enabled = postTitle.isNotBlank() && postBody.isNotBlank() &&
                         !importingPostImage && !importingPostAudio,
-                ) { Text("Post") }
+                ) { Text(tr("Post")) }
             },
             dismissButton = {
-                TextButton(onClick = { showCreatePost = false }) { Text("Cancel") }
+                TextButton(onClick = { showCreatePost = false }) { Text(tr("Cancel")) }
             },
         )
     }
@@ -939,10 +1021,10 @@ fun GroupDetailScreen(
     banTarget?.let { author ->
         AlertDialog(
             onDismissRequest = { if (!moderationBusy) banTarget = null },
-            title = { Text("Ban user from this branch?") },
+            title = { Text(tr("Ban user from this branch?")) },
             text = {
                 Text(
-                    "${author.authorName.ifBlank { "This user" }} will have new submissions rejected by this moderation branch. Other branches remain independent."
+                    "${author.authorName.ifBlank { tr("This user") }} ${tr("will have new submissions rejected by this moderation branch. Other branches remain independent.")}"
                 )
             },
             confirmButton = {
@@ -956,10 +1038,10 @@ fun GroupDetailScreen(
                             android.widget.Toast.makeText(context, message, android.widget.Toast.LENGTH_SHORT).show()
                         }
                     },
-                ) { Text(if (moderationBusy) "Banning…" else "Ban user", maxLines = 1, softWrap = false) }
+                ) { Text(tr(if (moderationBusy) "Banning…" else "Ban user"), maxLines = 1, softWrap = false) }
             },
             dismissButton = {
-                TextButton(enabled = !moderationBusy, onClick = { banTarget = null }) { Text("Cancel") }
+                TextButton(enabled = !moderationBusy, onClick = { banTarget = null }) { Text(tr("Cancel")) }
             },
         )
     }
@@ -968,20 +1050,19 @@ fun GroupDetailScreen(
         val rootPreview = target.rootMessage
         AlertDialog(
             onDismissRequest = { if (!moderationBusy) deleteTarget = null },
-            title = { Text("Remove this post?") },
+            title = { Text(tr("Remove this post?")) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("The source post is not destroyed. It is removed from this moderation branch.")
+                    Text(tr("The source post is not destroyed. It is removed from this moderation branch."))
                     OutlinedTextField(
                         value = deleteReason,
                         onValueChange = { deleteReason = it.take(600) },
                         modifier = Modifier.fillMaxWidth(),
-                        label = { Text("Public reason (optional)") },
+                        label = { Text(tr("Public reason (optional)")) },
                         minLines = 2,
                         maxLines = 5,
                     )
-                    Text(
-                        "The reason is shown with the removal notice so viewers can see why this branch removed it.",
+                    Text(tr("The reason is shown with the removal notice so viewers can see why this branch removed it."),
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -1002,10 +1083,10 @@ fun GroupDetailScreen(
                             android.widget.Toast.makeText(context, message, android.widget.Toast.LENGTH_SHORT).show()
                         }
                     },
-                ) { Text(if (moderationBusy) "Removing…" else "Remove post", maxLines = 1, softWrap = false) }
+                ) { Text(tr(if (moderationBusy) "Removing…" else "Remove post"), maxLines = 1, softWrap = false) }
             },
             dismissButton = {
-                TextButton(enabled = !moderationBusy, onClick = { deleteTarget = null }) { Text("Cancel") }
+                TextButton(enabled = !moderationBusy, onClick = { deleteTarget = null }) { Text(tr("Cancel")) }
             },
         )
     }
@@ -1014,11 +1095,10 @@ fun GroupDetailScreen(
         val rootPreview = target.rootMessage
         AlertDialog(
             onDismissRequest = { if (!moderationBusy) modifyTarget = null },
-            title = { Text("Modify for this curated version") },
+            title = { Text(tr("Modify for this curated version")) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        "This creates a branch-local curated copy. The author's original source object is not modified.",
+                    Text(tr("This creates a branch-local curated copy. The author's original source object is not modified."),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -1026,14 +1106,14 @@ fun GroupDetailScreen(
                         value = modifyTitle,
                         onValueChange = { modifyTitle = it.take(160) },
                         modifier = Modifier.fillMaxWidth(),
-                        label = { Text("Title") },
+                        label = { Text(tr("Title")) },
                         singleLine = true,
                     )
                     OutlinedTextField(
                         value = modifyBody,
                         onValueChange = { modifyBody = it.take(MAX_COMMENT_CHARS) },
                         modifier = Modifier.fillMaxWidth(),
-                        label = { Text("Post") },
+                        label = { Text(tr("Post")) },
                         minLines = 4,
                         maxLines = 10,
                     )
@@ -1060,10 +1140,10 @@ fun GroupDetailScreen(
                             android.widget.Toast.makeText(context, message, android.widget.Toast.LENGTH_SHORT).show()
                         }
                     },
-                ) { Text(if (moderationBusy) "Saving…" else "Save curated copy", maxLines = 1, softWrap = false) }
+                ) { Text(tr(if (moderationBusy) "Saving…" else "Save curated copy"), maxLines = 1, softWrap = false) }
             },
             dismissButton = {
-                TextButton(enabled = !moderationBusy, onClick = { modifyTarget = null }) { Text("Cancel") }
+                TextButton(enabled = !moderationBusy, onClick = { modifyTarget = null }) { Text(tr("Cancel")) }
             },
         )
     }
@@ -1071,13 +1151,13 @@ fun GroupDetailScreen(
     if (showModeratorDialog) {
         AlertDialog(
             onDismissRequest = { showModeratorDialog = false },
-            title = { Text("Add branch moderator") },
+            title = { Text(tr("Add branch moderator")) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     OutlinedTextField(
                         value = moderatorKey,
                         onValueChange = { moderatorKey = it.trim().take(512) },
-                        label = { Text("Moderator main DHT") },
+                        label = { Text(tr("Moderator main DHT")) },
                         singleLine = true,
                     )
                     PermissionCheck("Moderate posts/comments", modPosts) { modPosts = it }
@@ -1107,9 +1187,9 @@ fun GroupDetailScreen(
                         showModeratorDialog = false
                     },
                     enabled = moderatorKey.isNotBlank(),
-                ) { Text("Add") }
+                ) { Text(tr("Add")) }
             },
-            dismissButton = { TextButton(onClick = { showModeratorDialog = false }) { Text("Cancel") } },
+            dismissButton = { TextButton(onClick = { showModeratorDialog = false }) { Text(tr("Cancel")) } },
         )
     }
 
@@ -1119,7 +1199,7 @@ fun GroupDetailScreen(
         }
         AlertDialog(
             onDismissRequest = { showFeaturedDialog = false },
-            title = { Text("Featured area") },
+            title = { Text(tr("Featured area")) },
             text = {
                 Column(
                     Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()),
@@ -1130,19 +1210,19 @@ fun GroupDetailScreen(
                             onSetFeatured?.invoke(FeaturedSlot())
                             showFeaturedDialog = false
                         }
-                    ) { Text("Clear featured area") }
+                    ) { Text(tr("Clear featured area")) }
 
                     OutlinedTextField(
                         value = customFeaturedTitle,
                         onValueChange = { customFeaturedTitle = it.take(120) },
                         modifier = Modifier.fillMaxWidth(),
-                        label = { Text("Custom title") },
+                        label = { Text(tr("Custom title")) },
                     )
                     OutlinedTextField(
                         value = customFeaturedBody,
                         onValueChange = { customFeaturedBody = it.take(1200) },
                         modifier = Modifier.fillMaxWidth(),
-                        label = { Text("Custom message") },
+                        label = { Text(tr("Custom message")) },
                         minLines = 2,
                     )
                     Button(
@@ -1157,11 +1237,11 @@ fun GroupDetailScreen(
                             showFeaturedDialog = false
                         },
                         enabled = customFeaturedTitle.isNotBlank() || customFeaturedBody.isNotBlank(),
-                    ) { Text("Use custom message") }
+                    ) { Text(tr("Use custom message")) }
 
                     if (candidates.isNotEmpty()) {
                         HorizontalDivider()
-                        Text("Or feature a post/comment", fontWeight = FontWeight.SemiBold)
+                        Text(tr("Or feature a post/comment"), fontWeight = FontWeight.SemiBold)
                         candidates.take(24).forEach { message ->
                             TextButton(
                                 onClick = {
@@ -1169,7 +1249,7 @@ fun GroupDetailScreen(
                                         FeaturedSlot(
                                             kind = FeaturedKind.Post,
                                             ref = message.fullMessage,
-                                            title = message.title ?: "Featured comment",
+                                            title = message.title ?: featuredCommentLabel,
                                             body = "${message.authorName}: ${message.bodyPreview}",
                                         )
                                     )
@@ -1189,7 +1269,7 @@ fun GroupDetailScreen(
                     }
                 }
             },
-            confirmButton = { TextButton(onClick = { showFeaturedDialog = false }) { Text("Close") } },
+            confirmButton = { TextButton(onClick = { showFeaturedDialog = false }) { Text(tr("Close")) } },
         )
     }
 }
@@ -1210,6 +1290,9 @@ fun GroupPostScreen(
     onOpenLink: (DetectedLink) -> Unit,
 ) {
     val context = LocalContext.current
+    val weavePostClipboardLabel = tr("Weave post")
+    val featuredPostLabel = tr("Featured post")
+    val featuredCommentLabel = tr("Featured comment")
     val revision = store.revision
     val group = remember(revision, groupId) { store.byId(groupId) }
     val selected = remember(revision, groupId) { store.selectedBranch(groupId) }
@@ -1248,7 +1331,7 @@ fun GroupPostScreen(
                 TextButton(onClick = onBack) { Text("\u2190") }
                 Column(Modifier.weight(1f)) {
                     Text(
-                        root?.message?.title ?: "Post",
+                        root?.message?.title ?: tr("Post"),
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                         maxLines = 1,
@@ -1266,7 +1349,7 @@ fun GroupPostScreen(
                 if (postLink != null) {
                     IconButton(onClick = {
                         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                        clipboard.setPrimaryClip(ClipData.newPlainText("Weave post", postLink))
+                        clipboard.setPrimaryClip(ClipData.newPlainText(weavePostClipboardLabel, postLink))
                     }) { Text("🔗") }
                 }
                 if (canFeature && root != null) {
@@ -1276,19 +1359,19 @@ fun GroupPostScreen(
                                 FeaturedSlot(
                                     kind = FeaturedKind.Post,
                                     ref = root.ref,
-                                    title = root.message.title ?: "Featured post",
+                                    title = root.message.title ?: featuredPostLabel,
                                     body = "${root.message.authorName}: ${root.message.body.take(320)}",
                                 )
                             )
                         }
-                    ) { Text("Feature") }
+                    ) { Text(tr("Feature")) }
                 }
             }
         }
 
         LazyColumn(Modifier.weight(1f)) {
             if (root == null) {
-                item { HintText("Loading post…") }
+                item { HintText(tr("Loading post…")) }
             } else {
                 item {
                     ElevatedCard(Modifier.fillMaxWidth().padding(16.dp)) {
@@ -1307,8 +1390,7 @@ fun GroupPostScreen(
                                 )
                             }
                             if (!root.message.curatedBy.isNullOrBlank()) {
-                                Text(
-                                    "Modified for this curated version · original source unchanged",
+                                Text(tr("Modified for this curated version · original source unchanged"),
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.primary,
                                     modifier = Modifier.padding(top = 6.dp),
@@ -1340,8 +1422,7 @@ fun GroupPostScreen(
                 }
 
                 item {
-                    Text(
-                        "Comments",
+                    Text(tr("Comments"),
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.SemiBold,
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
@@ -1349,7 +1430,7 @@ fun GroupPostScreen(
                 }
 
                 if (comments.isEmpty()) {
-                    item { HintText("No comments yet.") }
+                    item { HintText(tr("No comments yet.")) }
                 } else {
                     items(comments, key = { it.message.messageId }) { view ->
                         GroupFullCommentRow(
@@ -1362,7 +1443,7 @@ fun GroupPostScreen(
                                     FeaturedSlot(
                                         kind = FeaturedKind.Post,
                                         ref = view.ref,
-                                        title = "Featured comment",
+                                        title = featuredCommentLabel,
                                         body = "${view.message.authorName}: ${view.message.body.take(320)}",
                                     )
                                 )
@@ -1383,7 +1464,7 @@ fun GroupPostScreen(
                                 value = commentText,
                                 onValueChange = { commentText = it.take(MAX_COMMENT_CHARS) },
                                 modifier = Modifier.weight(1f),
-                                label = { Text("Leave a comment") },
+                                label = { Text(tr("Leave a comment")) },
                                 minLines = 1,
                                 maxLines = 5,
                             )
@@ -1397,7 +1478,7 @@ fun GroupPostScreen(
                                     }
                                 },
                                 enabled = commentText.isNotBlank(),
-                            ) { Text("Post") }
+                            ) { Text(tr("Post")) }
                         }
                     }
                 }
@@ -1435,10 +1516,10 @@ private fun GroupFullCommentRow(
             )
         }
         if (canPin) {
-            TextButton(onClick = onPin) { Text(if (view.pinned) "Unpin" else "Pin") }
+            TextButton(onClick = onPin) { Text(tr(if (view.pinned) "Unpin" else "Pin")) }
         }
         if (canFeature) {
-            TextButton(onClick = onFeature) { Text("Feature") }
+            TextButton(onClick = onFeature) { Text(tr("Feature")) }
         }
     }
 }
@@ -1472,8 +1553,7 @@ private fun GroupPostCard(
                         modifier = Modifier.padding(top = 4.dp),
                     )
                     if (root.hasAudio) {
-                        Text(
-                            " · 🎵 Audio",
+                        Text(tr(" · 🎵 Audio"),
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.primary,
                             modifier = Modifier.padding(top = 4.dp),
@@ -1481,8 +1561,7 @@ private fun GroupPostCard(
                     }
                 }
                 if (!root.curatedBy.isNullOrBlank()) {
-                    Text(
-                        "Modified for this curated version · source post unchanged",
+                    Text(tr("Modified for this curated version · source post unchanged"),
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.primary,
                         modifier = Modifier.padding(top = 4.dp),
@@ -1497,7 +1576,7 @@ private fun GroupPostCard(
                     modifier = Modifier.padding(top = 6.dp),
                 )
                 Text(
-                    "${post.replyCount} comment${if (post.replyCount == 1) "" else "s"}",
+                    "${post.replyCount} ${tr(if (post.replyCount == 1) "comment" else "comments")}",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.padding(top = 8.dp),
@@ -1510,15 +1589,15 @@ private fun GroupPostCard(
                     }
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                         DropdownMenuItem(
-                            text = { Text("Ban user") },
+                            text = { Text(tr("Ban user")) },
                             onClick = { menu = false; onBan() },
                         )
                         DropdownMenuItem(
-                            text = { Text("Delete this post") },
+                            text = { Text(tr("Delete this post")) },
                             onClick = { menu = false; onDelete() },
                         )
                         DropdownMenuItem(
-                            text = { Text("Modify this post") },
+                            text = { Text(tr("Modify this post")) },
                             onClick = { menu = false; onModify() },
                         )
                     }
@@ -1546,7 +1625,7 @@ private fun PendingLocalPostCard(post: LocalPendingPostUi) {
             )
             Text(post.body, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 6.dp))
             Text(
-                post.status,
+                tr(post.status),
                 style = MaterialTheme.typography.labelSmall,
                 color = if (post.failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
                 fontWeight = FontWeight.SemiBold,
@@ -1562,7 +1641,7 @@ private fun CuratorPostCard(post: GroupCuratorPost) {
         Column(Modifier.padding(14.dp)) {
             val message = post.message
             Text(
-                message?.title?.takeIf { it.isNotBlank() } ?: "Retained post",
+                message?.title?.takeIf { it.isNotBlank() } ?: tr("Retained post"),
                 style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.Bold,
             )
@@ -1581,15 +1660,14 @@ private fun CuratorPostCard(post: GroupCuratorPost) {
                     modifier = Modifier.padding(top = 6.dp),
                 )
             } else {
-                Text(
-                    "The retained event is known, but its payload is not currently available or failed hash verification.",
+                Text(tr("The retained event is known, but its payload is not currently available or failed hash verification."),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 6.dp),
                 )
             }
             Text(
-                post.status,
+                tr(post.status),
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.primary,
                 fontWeight = FontWeight.SemiBold,
@@ -1603,16 +1681,16 @@ private fun CuratorPostCard(post: GroupCuratorPost) {
 private fun RemovedPostCard(post: GroupRemovedPostNotice) {
     OutlinedCard(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 5.dp)) {
         Column(Modifier.padding(12.dp)) {
-            Text(post.title.ifBlank { "Removed post" }, fontWeight = FontWeight.SemiBold)
+            Text(post.title.ifBlank { tr("Removed post") }, fontWeight = FontWeight.SemiBold)
             if (post.authorName.isNotBlank()) {
                 Text(
-                    "Originally posted by ${post.authorName}",
+                    "${tr("Originally posted by")} ${post.authorName}",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
             Text(
-                if (post.reason.isBlank()) "Removed by this moderation branch." else "Removed: ${post.reason}",
+                if (post.reason.isBlank()) tr("Removed by this moderation branch.") else "${tr("Removed")}: ${post.reason}",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 4.dp),
@@ -1628,6 +1706,7 @@ private fun PostAttachmentViewer(
     controller: SocialNetworkController,
 ) {
     val context = LocalContext.current
+    val weaveImageClipboardLabel = tr("Weave image")
     val attachment = message.fullMedia.firstOrNull { it.type == WeaveObjectType.Image } ?: return
     var requested by remember(message.messageId) { mutableStateOf(false) }
     var loading by remember(message.messageId) { mutableStateOf(false) }
@@ -1679,7 +1758,7 @@ private fun PostAttachmentViewer(
                         ) { gateModifier ->
                             Image(
                                 bitmap = thumbBitmap.asImageBitmap(),
-                                contentDescription = "Post image thumbnail",
+                                contentDescription = tr("Post image thumbnail"),
                                 modifier = gateModifier.fillMaxWidth().heightIn(max = 220.dp),
                                 contentScale = ContentScale.Fit,
                             )
@@ -1689,11 +1768,11 @@ private fun PostAttachmentViewer(
                         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 8.dp)) {
                             CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
                             Spacer(Modifier.width(8.dp))
-                            Text("Loading full image…", style = MaterialTheme.typography.labelSmall)
+                            Text(tr("Loading full image…"), style = MaterialTheme.typography.labelSmall)
                         }
                     } else {
                         Text(
-                            if (thumbBitmap == null) "Tap to load image" else "Tap thumbnail to load full image",
+                            tr(if (thumbBitmap == null) "Tap to load image" else "Tap thumbnail to load full image"),
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.primary,
                             modifier = Modifier.padding(top = 8.dp),
@@ -1702,8 +1781,8 @@ private fun PostAttachmentViewer(
                     encodeMediaLink(attachment)?.let { link ->
                         TextButton(onClick = {
                             val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                            clipboard.setPrimaryClip(ClipData.newPlainText("Weave image", link))
-                        }) { Text("Copy image link") }
+                            clipboard.setPrimaryClip(ClipData.newPlainText(weaveImageClipboardLabel, link))
+                        }) { Text(tr("Copy image link")) }
                     }
                 }
             }
@@ -1716,7 +1795,7 @@ private fun PostAttachmentViewer(
                 ) { gateModifier ->
                     Image(
                         bitmap = fullBitmap,
-                        contentDescription = "Post image",
+                        contentDescription = tr("Post image"),
                         modifier = gateModifier.fillMaxWidth(),
                         contentScale = ContentScale.Fit,
                     )
@@ -1724,10 +1803,10 @@ private fun PostAttachmentViewer(
                 loading -> Row(verticalAlignment = Alignment.CenterVertically) {
                     CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
                     Spacer(Modifier.width(8.dp))
-                    Text("Loading full image…", style = MaterialTheme.typography.labelSmall)
+                    Text(tr("Loading full image…"), style = MaterialTheme.typography.labelSmall)
                 }
                 else -> Text(
-                    error ?: "Couldn't load the full image.",
+                    error?.let { tr(it) } ?: tr("Couldn't load the full image."),
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.error,
                 )
@@ -1766,10 +1845,10 @@ private fun GroupCommentRow(
             )
         }
         if (canPin) {
-            TextButton(onClick = onPin) { Text(if (message.pinned) "Unpin" else "Pin") }
+            TextButton(onClick = onPin) { Text(tr(if (message.pinned) "Unpin" else "Pin")) }
         }
         if (canFeature) {
-            TextButton(onClick = onFeature) { Text("Feature") }
+            TextButton(onClick = onFeature) { Text(tr("Feature")) }
         }
     }
 }
@@ -1828,7 +1907,7 @@ fun GroupEditorScreen(
             ) {
                 TextButton(onClick = onBack) { Text("\u2190") }
                 Text(
-                    if (original == null) "Create group" else "Manage group",
+                    tr(if (original == null) "Create group" else "Manage group"),
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.weight(1f),
@@ -1840,7 +1919,7 @@ fun GroupEditorScreen(
             Modifier.fillMaxSize().verticalScroll(scroll).padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            OutlinedTextField(name, { name = it.take(120) }, Modifier.fillMaxWidth(), label = { Text("Name") })
+            OutlinedTextField(name, { name = it.take(120) }, Modifier.fillMaxWidth(), label = { Text(tr("Name")) })
             Row(verticalAlignment = Alignment.CenterVertically) {
                 GroupThumbnail(
                     encoded = thumbnailBase64,
@@ -1859,10 +1938,10 @@ fun GroupEditorScreen(
                         if (thumbnailImporting) {
                             CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
                             Spacer(Modifier.width(8.dp))
-                            Text("Preparing…", maxLines = 1, softWrap = false)
+                            Text(tr("Preparing…"), maxLines = 1, softWrap = false)
                         } else {
                             Text(
-                                if (thumbnailBase64 == null) "Add group picture" else "Change group picture",
+                                tr(if (thumbnailBase64 == null) "Add group picture" else "Change group picture"),
                                 maxLines = 1,
                                 softWrap = false,
                                 overflow = TextOverflow.Ellipsis,
@@ -1870,38 +1949,37 @@ fun GroupEditorScreen(
                         }
                     }
                     if (thumbnailBase64 != null) {
-                        TextButton(onClick = { thumbnailBase64 = null }) { Text("Remove") }
+                        TextButton(onClick = { thumbnailBase64 = null }) { Text(tr("Remove")) }
                     }
                 }
             }
-            Text(
-                "A small embedded thumbnail helps distinguish groups without loading a full-size image.",
+            Text(tr("A small embedded thumbnail helps distinguish groups without loading a full-size image."),
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             OutlinedTextField(
                 description, { description = it.take(2000) }, Modifier.fillMaxWidth(),
-                label = { Text("Description") }, minLines = 3
+                label = { Text(tr("Description")) }, minLines = 3
             )
-            OutlinedTextField(tags, { tags = it.take(500) }, Modifier.fillMaxWidth(), label = { Text("Topics / tags") })
+            OutlinedTextField(tags, { tags = it.take(500) }, Modifier.fillMaxWidth(), label = { Text(tr("Topics / tags")) })
 
-            Text("Simple controls", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+            Text(tr("Simple controls"), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
             EnumPicker("Joining", join, GroupJoinPolicy.entries) { join = it }
             EnumPicker("Posting", posting, GroupPostingPolicy.entries) { posting = it }
             EnumPicker("Moderation", moderation, GroupModerationPreset.entries) { moderation = it }
             EnumPicker("Visibility", visibility, GroupVisibility.entries) { visibility = it }
 
             HorizontalDivider()
-            Text("Featured area", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+            Text(tr("Featured area"), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
             EnumPicker("Type", featuredKind, FeaturedKind.entries) { featuredKind = it }
             if (featuredKind != FeaturedKind.None) {
                 OutlinedTextField(
                     featuredTitle, { featuredTitle = it.take(120) }, Modifier.fillMaxWidth(),
-                    label = { Text("Featured title") }
+                    label = { Text(tr("Featured title")) }
                 )
                 OutlinedTextField(
                     featuredBody, { featuredBody = it.take(1200) }, Modifier.fillMaxWidth(),
-                    label = { Text("Featured text / note") }, minLines = 2
+                    label = { Text(tr("Featured text / note")) }, minLines = 2
                 )
                 Text(
                     if (featuredKind == FeaturedKind.Post || featuredKind == FeaturedKind.Widget)
@@ -1914,7 +1992,7 @@ fun GroupEditorScreen(
             }
 
             TextButton(onClick = { showAdvanced = !showAdvanced }) {
-                Text(if (showAdvanced) "Hide advanced" else "Advanced")
+                Text(tr(if (showAdvanced) "Hide advanced" else "Advanced"))
             }
             if (showAdvanced) {
                 ToggleRow("Quarantine new members", quarantineNew) { quarantineNew = it }
@@ -1966,7 +2044,7 @@ fun GroupEditorScreen(
                 enabled = name.isNotBlank(),
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text(if (original == null) "Create group" else "Save changes")
+                Text(tr(if (original == null) "Create group" else "Save changes"))
             }
 
             Spacer(Modifier.height(24.dp))
@@ -1987,7 +2065,7 @@ fun GroupModerationScreen(
         Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 2.dp) {
             Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 TextButton(onClick = onBack) { Text("\u2190") }
-                Text("Group moderation", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                Text(tr("Group moderation"), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             }
         }
         if (tasks.isEmpty()) {
@@ -2000,11 +2078,11 @@ fun GroupModerationScreen(
                         if (task.reason.isNotBlank()) Text(task.reason, modifier = Modifier.padding(top = 4.dp))
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                             TextButton(onClick = { onResolve(task.taskId, false) }) {
-                                Text("Reject / Drop")
+                                Text(tr("Reject / Drop"))
                             }
                             Spacer(Modifier.width(8.dp))
                             Button(onClick = { onResolve(task.taskId, true) }) {
-                                Text("Approve / Keep")
+                                Text(tr("Approve / Keep"))
                             }
                         }
                     }
@@ -2019,9 +2097,9 @@ fun GroupModerationScreen(
 private fun GroupModeHeader(title: String, subtitle: String) {
     Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 2.dp) {
         Column(Modifier.fillMaxWidth().padding(16.dp)) {
-            Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Text(tr(title), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             Text(
-                subtitle,
+                tr(subtitle),
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 2.dp),
@@ -2042,7 +2120,7 @@ private fun GroupPulseCard(group: GroupRecord, pulse: GroupPulse, onClick: () ->
             Text(group.name, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
             if (pulse.conversations.isNotEmpty()) {
                 Text(
-                    "${pulse.conversations.sumOf { it.recentUniqueAuthors }} active",
+                    "${pulse.conversations.sumOf { it.recentUniqueAuthors }} ${tr("active")}",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.primary,
                 )
@@ -2060,7 +2138,7 @@ private fun GroupPulseCard(group: GroupRecord, pulse: GroupPulse, onClick: () ->
                         MessagePreviewLine(root)
                     }
                     Text(
-                        "${conversation.replyCount} comment${if (conversation.replyCount == 1) "" else "s"}",
+                        "${conversation.replyCount} ${tr(if (conversation.replyCount == 1) "comment" else "comments")}",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(top = 5.dp),
@@ -2070,7 +2148,7 @@ private fun GroupPulseCard(group: GroupRecord, pulse: GroupPulse, onClick: () ->
         }
         if (pulse.conversations.isEmpty()) {
             Text(
-                group.description.ifBlank { "No cached conversation activity yet." },
+                group.description.ifBlank { tr("No cached conversation activity yet.") },
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
                 style = MaterialTheme.typography.bodySmall,
@@ -2091,7 +2169,7 @@ private fun ConversationPulseCard(conversation: GroupConversationPreview) {
             }
             conversation.rootMessage?.let { MessagePreviewLine(it) }
             Text(
-                "${conversation.replyCount} comments · ${conversation.recentUniqueAuthors} participants",
+                "${conversation.replyCount} ${tr("comments")} · ${conversation.recentUniqueAuthors} ${tr("participants")}",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 6.dp),
@@ -2146,7 +2224,7 @@ private fun GroupThumbnail(
             ) { gateModifier ->
                 Image(
                     bitmap = bitmap.asImageBitmap(),
-                    contentDescription = "$name group thumbnail",
+                    contentDescription = "$name ${tr("group thumbnail")}",
                     modifier = gateModifier.fillMaxSize(),
                     contentScale = ContentScale.Crop,
                 )
@@ -2182,7 +2260,7 @@ private fun TinyThumbnail(encoded: String?, contentId: String) {
         ) { gateModifier ->
             Image(
                 bitmap = bitmap.asImageBitmap(),
-                contentDescription = "Message thumbnail",
+                contentDescription = tr("Message thumbnail"),
                 modifier = gateModifier.fillMaxSize(),
             )
         }
@@ -2199,22 +2277,21 @@ private fun FeaturedCard(
         Column(Modifier.padding(14.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    if (slot.kind == FeaturedKind.None) "Featured" else when (slot.kind) {
-                        FeaturedKind.Post -> "\uD83D\uDCCC Featured comment"
-                        FeaturedKind.Widget -> "Featured widget"
-                        FeaturedKind.Message -> "Featured"
-                        FeaturedKind.None -> "Featured"
+                    if (slot.kind == FeaturedKind.None) tr("Featured") else when (slot.kind) {
+                        FeaturedKind.Post -> "\uD83D\uDCCC ${tr("Featured comment")}"
+                        FeaturedKind.Widget -> tr("Featured widget")
+                        FeaturedKind.Message -> tr("Featured")
+                        FeaturedKind.None -> tr("Featured")
                     },
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.primary,
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.weight(1f),
                 )
-                if (canEdit) TextButton(onClick = onEdit) { Text("Edit") }
+                if (canEdit) TextButton(onClick = onEdit) { Text(tr("Edit")) }
             }
             if (slot.kind == FeaturedKind.None) {
-                Text(
-                    "Nothing featured yet.",
+                Text(tr("Nothing featured yet."),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -2231,7 +2308,14 @@ private fun FeaturedCard(
 }
 
 @Composable
-private fun GroupRow(group: GroupRecord, onClick: () -> Unit) {
+private fun GroupRow(
+    group: GroupRecord,
+    onClick: () -> Unit,
+    onNeedThumbnail: (() -> Unit)? = null,
+) {
+    LaunchedEffect(group.groupId, group.thumbnailBase64) {
+        if (group.thumbnailBase64.isNullOrBlank()) onNeedThumbnail?.invoke()
+    }
     Row(
         Modifier.fillMaxWidth().clickable(onClick = onClick).padding(16.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -2264,9 +2348,9 @@ private fun GroupManagementRow(group: GroupRecord, onOpen: () -> Unit, onManage:
             Text(group.role.pretty(), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         if (onManage != null) {
-            TextButton(onClick = onManage) { Text("Manage") }
+            TextButton(onClick = onManage) { Text(tr("Manage")) }
         } else {
-            TextButton(onClick = onOpen) { Text("Open") }
+            TextButton(onClick = onOpen) { Text(tr("Open")) }
         }
     }
 }
@@ -2274,7 +2358,7 @@ private fun GroupManagementRow(group: GroupRecord, onOpen: () -> Unit, onManage:
 @Composable
 private fun SectionLabel(text: String) {
     Text(
-        text,
+        tr(text),
         style = MaterialTheme.typography.titleSmall,
         fontWeight = FontWeight.SemiBold,
         modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
@@ -2284,7 +2368,7 @@ private fun SectionLabel(text: String) {
 @Composable
 private fun HintText(text: String) {
     Text(
-        text,
+        tr(text),
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
@@ -2298,9 +2382,9 @@ private fun EmptyGroupState(title: String, body: String) {
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text(title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+        Text(tr(title), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
         Text(
-            body,
+            tr(body),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(top = 6.dp),
@@ -2314,11 +2398,11 @@ private fun <T : Enum<T>> EnumPicker(label: String, value: T, values: List<T>, o
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Text(label, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
         Box {
-            OutlinedButton(onClick = { expanded = true }) { Text(value.prettyName()) }
+            OutlinedButton(onClick = { expanded = true }) { Text(tr(value.prettyName())) }
             DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
                 values.forEach { option ->
                     DropdownMenuItem(
-                        text = { Text(option.prettyName()) },
+                        text = { Text(tr(option.prettyName())) },
                         onClick = { onSelect(option); expanded = false },
                     )
                 }

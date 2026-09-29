@@ -21,6 +21,10 @@ import kotlinx.coroutines.withContext
 import android.content.Intent
 import android.net.Uri
 import android.content.res.Configuration
+import android.os.SystemClock
+import com.example.veilknit_deamon.DaemonForegroundService
+import com.example.veilknit_deamon.DaemonStateStore
+import com.example.veilknit_deamon.VeilKnitApp
 import java.util.Locale
 
 /**
@@ -49,7 +53,10 @@ fun WeaveApp() {
     var widgetsEnabled by remember { mutableStateOf(true) }
     var setupError by remember { mutableStateOf<String?>(null) }
 
-    LaunchedEffect(Unit) { controller.start() }
+    val daemonState by DaemonStateStore.state.collectAsState()
+    LaunchedEffect(daemonState.ready) {
+        if (daemonState.ready) controller.start() else controller.stop()
+    }
     DisposableEffect(Unit) { onDispose { controller.stop() } }
 
     val ui by controller.ui.collectAsState()
@@ -77,7 +84,7 @@ fun WeaveApp() {
     val profilePresenceKnown = state.savedProfilePresent != null
     val safeToDecideFirstRun = state.savedProfilePresent == true ||
         (state.savedProfilePresent == false && onboarding.ready)
-    val failure = ui.status.takeIf { it.startsWith("Error", ignoreCase = true) || it.contains("Could not bind") }
+    val failure = ui.status.takeIf { it.startsWith("Error", ignoreCase = true) }
     val localizedResources = remember(language.current, context) {
         val configuration = Configuration(context.resources.configuration)
         configuration.setLocale(Locale.forLanguageTag(language.current.code))
@@ -92,6 +99,15 @@ fun WeaveApp() {
     MaterialTheme(colorScheme = DesignerColorScheme) {
         Surface(color = MaterialTheme.colorScheme.background) {
             when {
+                !daemonState.serviceRunning && !daemonState.nativeRunning -> VeilKnitApp()
+
+                !daemonState.ready -> ConnectionGate(
+                    status = daemonState.status,
+                    error = daemonState.lastError,
+                    onRetry = { DaemonForegroundService.stop(context) },
+                    embeddedDaemonStartup = true,
+                )
+
                 !hasKnownIdentity || (!ui.connected && !setupDone) -> ConnectionGate(
                     status = ui.status,
                     error = failure,
@@ -178,6 +194,11 @@ private fun WeaveShell(
         initialTab = Tab.Me,
         initialMode = groupStore.preferredMode,
     )
+    val veilKnitGesture = remember { VeilKnitSettingsGesture() }
+    fun openSettingsOrVeilKnit() {
+        if (veilKnitGesture.recordSettingsEntry()) nav.push(Destination.VeilKnit)
+        else nav.push(Destination.Settings)
+    }
     val ui by controller.ui.collectAsState()
     val context = LocalContext.current
     var pendingExternalUrl by remember { mutableStateOf<String?>(null) }
@@ -232,6 +253,8 @@ private fun WeaveShell(
             Destination.Activity -> "Activity"
             Destination.Editor -> "Editor"
             Destination.Settings -> "Settings"
+            Destination.VeilKnit -> "VeilKnit"
+            Destination.VeilKnitBackup -> "VeilKnitBackup"
             Destination.GroupModeration -> "GroupModeration"
             is Destination.Profile -> "Profile"
             is Destination.QuickEdit -> "QuickEdit"
@@ -253,12 +276,21 @@ private fun WeaveShell(
 
     BackHandler(enabled = true) { nav.pop() }
 
+    if (destination is Destination.VeilKnit || destination is Destination.VeilKnitBackup) {
+        VeilKnitApp(
+            onBack = { nav.pop() },
+            startOnBackup = destination is Destination.VeilKnitBackup,
+        )
+        return
+    }
+
     // Both editors are full-bleed: no bottom bar competing with their own controls. Keep them
     // composed through a transient daemon reconnect so their local navigation/editor state survives.
     if (destination is Destination.Editor) {
         Box(Modifier.fillMaxSize()) {
             EditorScreen(
                 state = state,
+                media = media,
                 onOpenBasic = { nav.replaceTop(Destination.QuickEdit(state.pageIndex)) },
                 onBack = { nav.pop() },
             )
@@ -293,7 +325,23 @@ private fun WeaveShell(
         return
     }
 
-    Column(Modifier.fillMaxSize().safeDrawingPadding()) {
+    val groupThemeActive = when (destination) {
+        is Destination.Group,
+        is Destination.GroupPost,
+        is Destination.GroupEditor,
+        Destination.GroupModeration -> true
+        is Destination.Profile,
+        Destination.Activity -> false
+        else -> nav.mode == BrowseMode.Groups
+    }
+    val sectionColorScheme = if (groupThemeActive) GroupColorScheme else DesignerColorScheme
+
+    MaterialTheme(colorScheme = sectionColorScheme) {
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = MaterialTheme.colorScheme.background,
+        ) {
+            Column(Modifier.fillMaxSize().safeDrawingPadding()) {
         if (!connectionAvailable) {
             TransientConnectionBanner(connectionStatus, onRetryConnection)
         } else {
@@ -321,6 +369,21 @@ private fun WeaveShell(
                         onResolveLink = { link ->
                             controller.resolveGroupLink(link)
                         },
+                        onPrefetchGroup = { group ->
+                            val branch = groupStore.selectedBranch(group.groupId)
+                                ?: group.rootRecordKey.takeIf { it.isNotBlank() }?.let { root ->
+                                    GroupBranchPointer(
+                                        groupId = group.groupId,
+                                        branchId = GroupBranchNetwork.originalBranchId(group.groupId),
+                                        branchRoot = root,
+                                        ownerMainDht = group.ownerId,
+                                        kind = GroupBranchKind.Original,
+                                        creatorRoot = root,
+                                        updatedAt = group.updatedAt,
+                                    )
+                                }
+                            if (branch != null) controller.refreshGroupBranch(branch)
+                        },
                     )
                 } else {
                     SearchScreen(
@@ -337,7 +400,7 @@ private fun WeaveShell(
                         onCreate = { nav.push(Destination.GroupEditor(null)) },
                         onManage = { nav.push(Destination.GroupEditor(it)) },
                         onModeration = { nav.push(Destination.GroupModeration) },
-                        onSettings = { nav.push(Destination.Settings) },
+                        onSettings = { openSettingsOrVeilKnit() },
                     )
                 } else {
                     MeScreen(
@@ -351,7 +414,7 @@ private fun WeaveShell(
                             if (state.preferAdvancedEditor) nav.push(Destination.Editor)
                             else nav.push(Destination.QuickEdit(page))
                         },
-                        onSettings = { nav.push(Destination.Settings) },
+                        onSettings = { openSettingsOrVeilKnit() },
                         onOpenLink = ::openDetectedLink,
                     )
                 }
@@ -514,6 +577,9 @@ private fun WeaveShell(
                     onResolve = { taskId, approve -> controller.resolveGroupModerationTask(taskId, approve) },
                 )
 
+                Destination.VeilKnit,
+                Destination.VeilKnitBackup -> Unit // handled as full-bleed destinations above
+
                 Destination.Settings -> SettingsScreen(
                     controller = controller,
                     ownKey = ui.mainDht,
@@ -526,6 +592,7 @@ private fun WeaveShell(
                     onClaimGroupLink = { link, onResult ->
                         controller.claimGroupLink(link, onResult)
                     },
+                    onSetupAccountBackup = { nav.push(Destination.VeilKnitBackup) },
                     onBack = { nav.pop() },
                 )
 
@@ -555,15 +622,16 @@ private fun WeaveShell(
             groupModerationCount = groupModerationCount,
             onModeChanged = { groupStore.preferredMode = it },
         )
-    }
+            }
+        }
 
-    pendingExternalUrl?.let { url ->
+        pendingExternalUrl?.let { url ->
         AlertDialog(
             onDismissRequest = { pendingExternalUrl = null },
-            title = { Text("Open external link?") },
+            title = { Text(tr("Open external link?")) },
             text = {
                 Column {
-                    Text("This link leaves Weave and opens another app or browser.")
+                    Text(tr("This link leaves Weave and opens another app or browser."))
                     Text(
                         url,
                         style = MaterialTheme.typography.labelSmall,
@@ -583,12 +651,13 @@ private fun WeaveShell(
                     }.onFailure {
                         toast(context, "No app could open that link.")
                     }
-                }) { Text("Open browser") }
+                }) { Text(tr("Open browser")) }
             },
             dismissButton = {
-                TextButton(onClick = { pendingExternalUrl = null }) { Text("Cancel") }
+                TextButton(onClick = { pendingExternalUrl = null }) { Text(tr("Cancel")) }
             },
         )
+            }
     }
 }
 
@@ -614,6 +683,19 @@ private fun StorageWarningBanner(
             }
             TextButton(onClick = onDismiss) { Text(tr("Dismiss")) }
         }
+    }
+}
+
+private class VeilKnitSettingsGesture {
+    private val entries = ArrayDeque<Long>()
+
+    fun recordSettingsEntry(): Boolean {
+        val now = SystemClock.elapsedRealtime()
+        while (entries.isNotEmpty() && now - entries.first() > 5_000L) entries.removeFirst()
+        entries.addLast(now)
+        if (entries.size < 5) return false
+        entries.clear()
+        return true
     }
 }
 

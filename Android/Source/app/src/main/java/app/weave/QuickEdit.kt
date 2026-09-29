@@ -909,7 +909,7 @@ fun QuickEditScreen(
                     OutlinedButton(
                         onClick = { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }
                     ) { Text(tr("+ Image")) }
-                    OutlinedButton(onClick = { audioPicker.launch("audio/*") }) { Text("+ Audio") }
+                    OutlinedButton(onClick = { audioPicker.launch("audio/*") }) { Text(tr("+ Audio")) }
                     OutlinedButton(onClick = { camera.launch(null) }) { Text(tr("+ Camera")) }
                     OutlinedButton(onClick = { dhtImportError = null; showDhtImport = true }) { Text(tr("+ DHT image")) }
                     if (media.library().isNotEmpty()) {
@@ -1116,7 +1116,7 @@ private fun BlockEditor(
 
                 is QuickBlock.Audio -> Column {
                     Text(
-                        "Sanitized AAC/M4A${if (block.durationMs > 0) " · ${block.durationMs / 1000}s" else ""}",
+                        "${tr("Sanitized AAC/M4A")}${if (block.durationMs > 0) " · ${block.durationMs / 1000}s" else ""}",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -1124,7 +1124,7 @@ private fun BlockEditor(
                         value = block.title,
                         onValueChange = { onChange(block.copy(title = it.take(120))) },
                         modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                        label = { Text("Audio title") },
+                        label = { Text(tr("Audio title")) },
                         singleLine = true,
                     )
                 }

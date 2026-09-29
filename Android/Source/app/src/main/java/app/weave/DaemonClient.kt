@@ -1,38 +1,34 @@
 package app.weave
 
-import android.content.ComponentName
 import android.content.Context
-import android.content.Intent
-import android.content.ServiceConnection
-import android.content.pm.PackageManager
-import android.os.IBinder
+import com.example.veilknit_deamon.DaemonApiRuntime
+import com.example.veilknit_deamon.DaemonStateStore
+import com.example.veilknit_deamon.NativeDaemonBridge
 import android.os.SystemClock
 import android.util.Base64
-import com.example.veilknit_deamon.ipc.IVeilKnitApi
-import com.example.veilknit_deamon.ipc.IVeilKnitStreamCallback
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.SecureRandom
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
 class DaemonClient(private val context: Context) {
     companion object {
         const val PROTOCOL_VERSION = 3
         const val APP_ID = "weave.v1"
         const val APP_NAME = "Weave"
-        private const val DAEMON_PACKAGE = "com.example.veilknit_deamon"
-        private const val DAEMON_ACTION = "com.example.veilknit_deamon.BIND_LOCAL_API"
-        private const val DAEMON_PERMISSION = "com.example.veilknit_deamon.permission.BIND_VEILKNIT_API"
         private val CAPABILITIES = listOf(
             "SendMessages", "ReceiveMessages", "ManageOwnStorage", "ReadOwnStorage",
             "ReadPublicProfiles", "SubscribeNetworkStatus", "SignAppData"
@@ -46,24 +42,22 @@ class DaemonClient(private val context: Context) {
         val daemonInstanceId: String,
     )
 
-    private var api: IVeilKnitApi? = null
-    private var serviceConnection: ServiceConnection? = null
     private val requestId = AtomicLong(1L)
+    private val subscriptionScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val subscriptionJobs = ConcurrentHashMap<Long, Job>()
     private var sessionToken: String? = null
     private val credentialStore = SecureCredentialStore(context)
     private var connectedIdentity: DaemonIdentity? = null
 
     /**
-     * Bind, discover which VeilKnit account/profile is actually active, then use only that
-     * profile's credential. A daemon restart invalidates session tokens; an account/profile
-     * change also selects a different credential slot.
+     * Discover which embedded VeilKnit account/profile is active, then use only that profile's
+     * credential. A daemon restart invalidates session tokens; an account/profile change also
+     * selects a different credential slot.
      */
     suspend fun connect(onStatus: (String) -> Unit) {
         sessionToken = null
         connectedIdentity = null
-        WeaveDiagnostics.event(context, "DAEMON_CONNECT", "stage=bind_begin")
-        api = bindApi()
-        WeaveDiagnostics.event(context, "DAEMON_CONNECT", "stage=bound")
+        WeaveDiagnostics.event(context, "DAEMON_CONNECT", "stage=embedded_bridge_begin")
         val identity = awaitReadyDaemonIdentity(onStatus)
         WeaveDiagnostics.event(
             context,
@@ -80,7 +74,7 @@ class DaemonClient(private val context: Context) {
             if (!first.message.orEmpty().contains("authentication_failed") &&
                 !first.message.orEmpty().contains("Credential generation changed")) throw first
             clearCredential(identity.profileId)
-            onStatus("Weave authorization changed for this VeilKnit account; approval is required again.")
+            onStatus("Refreshing Weave authorization for this VeilKnit account…")
             ensureCredential(identity.profileId, onStatus)
             authenticate(identity.profileId)
         }
@@ -92,9 +86,8 @@ class DaemonClient(private val context: Context) {
     fun activeDaemonIdentity(): DaemonIdentity? = connectedIdentity
 
     /**
-     * The Binder service can survive while the native daemon is stopped/restarted. Polling
-     * this tiny state object lets Weave notice that its authenticated session belongs to a
-     * dead daemon instance or to a different signed-in network profile.
+     * Polling this tiny shared state object lets Weave notice that its authenticated session
+     * belongs to a stopped/restarted core or to a different signed-in network profile.
      */
     fun daemonIdentityChanged(): Boolean {
         val expected = connectedIdentity ?: return true
@@ -115,103 +108,28 @@ class DaemonClient(private val context: Context) {
         PrivateVault.get(context).detach(reason)
         sessionToken = null
         connectedIdentity = null
-        serviceConnection?.let { runCatching { context.unbindService(it) } }
-        serviceConnection = null
-        api = null
-    }
-
-    private suspend fun bindApi(): IVeilKnitApi = suspendCancellableCoroutine { continuation ->
-        val intent = Intent(DAEMON_ACTION).setPackage(DAEMON_PACKAGE)
-        val connection = object : ServiceConnection {
-            override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-                if (continuation.isActive) continuation.resume(IVeilKnitApi.Stub.asInterface(service))
-            }
-            override fun onServiceDisconnected(name: ComponentName?) {
-                WeaveDiagnostics.event(context, "BINDER_DISCONNECTED", "component=${name?.flattenToShortString() ?: "(unknown)"}")
-                api = null
-            }
-            override fun onNullBinding(name: ComponentName?) {
-                if (continuation.isActive) continuation.resumeWithException(IllegalStateException("VeilKnit API service returned a null binding"))
-            }
-        }
-        serviceConnection = connection
-
-        val bound = try {
-            context.bindService(intent, connection, Context.BIND_AUTO_CREATE)
-        } catch (security: SecurityException) {
-            serviceConnection = null
-            continuation.resumeWithException(
-                IllegalStateException(
-                    "Denied $DAEMON_PERMISSION. The daemon declares this permission at " +
-                        "protectionLevel=signature, so both APKs must be signed with the same key. " +
-                        "Install the daemon first, then reinstall this app.",
-                    security
-                )
-            )
-            return@suspendCancellableCoroutine
-        }
-
-        if (!bound) {
-            // Android still holds a reference even when bindService() reports failure.
-            runCatching { context.unbindService(connection) }
-            serviceConnection = null
-            continuation.resumeWithException(IllegalStateException(diagnoseBindFailure()))
-            return@suspendCancellableCoroutine
-        }
-
-        continuation.invokeOnCancellation {
-            runCatching { context.unbindService(connection) }
-            if (serviceConnection === connection) serviceConnection = null
-        }
-    }
-
-    /**
-     * bindService() returns false without an exception for several unrelated reasons.
-     * Work out which one actually applies so the log says something useful.
-     */
-    private fun diagnoseBindFailure(): String {
-        val daemonInstalled = runCatching {
-            context.packageManager.getPackageInfo(DAEMON_PACKAGE, 0)
-        }.isSuccess
-        if (!daemonInstalled) {
-            return "VeilKnit daemon package $DAEMON_PACKAGE is not installed, or is not visible to " +
-                "this app. Install the daemon, and make sure AndroidManifest.xml declares a " +
-                "<queries> entry for it (required on targetSdk 30+)."
-        }
-        val resolved = context.packageManager.queryIntentServices(
-            Intent(DAEMON_ACTION).setPackage(DAEMON_PACKAGE), 0
-        )
-        if (resolved.isEmpty()) {
-            return "The daemon is installed but exposes no service for $DAEMON_ACTION. " +
-                "Check that the installed daemon build is recent enough to ship VeilKnitApiService."
-        }
-        if (context.checkSelfPermission(DAEMON_PERMISSION) != PackageManager.PERMISSION_GRANTED) {
-            return "$DAEMON_PERMISSION was not granted. Declare it with <uses-permission> in " +
-                "AndroidManifest.xml, sign both APKs with the same key, and install the daemon " +
-                "before this app."
-        }
-        return "Could not bind the VeilKnit daemon API for an unknown reason. Is the daemon " +
-            "foreground service running?"
+        subscriptionJobs.keys.toList().forEach(::unsubscribe)
     }
 
     private fun daemonState(): JSONObject {
-        val started = SystemClock.elapsedRealtime()
-        var responseBytes = 0
-        try {
-            val text = api?.getDaemonStateJson() ?: error("VeilKnit API is not bound")
-            responseBytes = text.toByteArray(Charsets.UTF_8).size
-            WeaveDiagnostics.rpc(
-                context, "getDaemonStateJson", 0, responseBytes,
-                SystemClock.elapsedRealtime() - started, true
+        val state = DaemonStateStore.state.value
+        return JSONObject()
+            .put("service_running", state.serviceRunning)
+            .put("native_running", state.nativeRunning)
+            .put("ready", state.ready)
+            .put("authenticated", state.authenticated)
+            .put("status", state.status)
+            .put(
+                "profile_id",
+                if (state.ready) {
+                    NativeDaemonBridge.embeddedProfileId().ifBlank {
+                        DaemonApiRuntime.activeProfileId(context.filesDir)
+                    }
+                } else ""
             )
-            return JSONObject(text)
-        } catch (t: Throwable) {
-            WeaveDiagnostics.rpc(
-                context, "getDaemonStateJson", 0, responseBytes,
-                SystemClock.elapsedRealtime() - started, false, t
-            )
-            throw t
-        }
+            .put("daemon_instance_id", DaemonApiRuntime.daemonInstanceId())
+            .put("main_dht_key", state.mainDhtKey)
+            .put("last_error", state.lastError ?: JSONObject.NULL)
     }
 
     private suspend fun awaitReadyDaemonIdentity(onStatus: (String) -> Unit): DaemonIdentity =
@@ -258,7 +176,7 @@ class DaemonClient(private val context: Context) {
         var responseBytes = 0
         var recorded = false
         try {
-            val responseText = api?.transact(requestText) ?: error("Daemon API is not bound")
+            val responseText = NativeDaemonBridge.transact(requestText)
             responseBytes = responseText.toByteArray(Charsets.UTF_8).size
             val response = JSONObject(responseText)
             if (!response.optBoolean("ok", false)) {
@@ -293,14 +211,50 @@ class DaemonClient(private val context: Context) {
     private suspend fun ensureCredential(profileId: String, onStatus: (String) -> Unit) = withContext(Dispatchers.IO) {
         if (credentialStore.read(profileId) != null) return@withContext
         val token = ByteArray(32).also { SecureRandom().nextBytes(it) }.toHex()
-        val result = rawRequest("request_app_registration", authenticated = false) {
-            put("app_id", APP_ID)
-            put("display_name", APP_NAME)
-            put("requested_capabilities", JSONArray(CAPABILITIES))
-            put("request_token_hex", token)
+        val result = try {
+            rawRequest("request_app_registration", authenticated = false) {
+                put("app_id", APP_ID)
+                put("display_name", APP_NAME)
+                put("requested_capabilities", JSONArray(CAPABILITIES))
+                put("request_token_hex", token)
+            }
+        } catch (registrationError: IllegalStateException) {
+            if (!registrationError.message.orEmpty().contains("app_already_registered")) {
+                throw registrationError
+            }
+
+            // The daemon account still remembers weave.v1 but this APK no longer has the
+            // matching secret (for example after reinstalling Weave or restoring an older
+            // VeilKnit account). Because bundled Weave and the embedded daemon are the same
+            // signed process, recover by rotating only this app's credential through a JNI-only
+            // hook. External socket clients cannot invoke this path.
+            onStatus("Recovering Weave authorization for this VeilKnit account…")
+            val recovered = JSONObject(NativeDaemonBridge.recoverEmbeddedAppCredential(APP_ID))
+            check(recovered.optBoolean("ok", false)) {
+                "Could not recover embedded Weave authorization: ${recovered.optString("error", "unknown error")}"
+            }
+            credentialStore.write(
+                profileId,
+                SecureCredentialStore.Credential(
+                    secretHex = recovered.getString("secret_hex"),
+                    generation = recovered.getLong("credential_generation"),
+                )
+            )
+            WeaveDiagnostics.event(
+                context,
+                "DAEMON_CONNECT",
+                "stage=embedded_credential_recovered profile=${short(profileId)} generation=${recovered.getLong("credential_generation")}"
+            )
+            return@withContext
         }
         val requestId = result.getLong("request_id")
-        onStatus("Approve the newest $APP_NAME request in the daemon Applications tab (request #$requestId).")
+        // Weave and the embedded VeilKnit core are one signed APK/trust boundary. Preserve the
+        // normal registration/credential machinery, but approve this bundled app automatically.
+        // Standalone/external applications still use the daemon's explicit approval flow.
+        check(NativeDaemonBridge.sendCommand("app-approve $requestId")) {
+            "Embedded VeilKnit did not accept Weave's authorization command"
+        }
+        onStatus("Authorizing Weave with the embedded VeilKnit core…")
         while (true) {
             delay(1200)
             val status = rawRequest("get_app_registration_status", authenticated = false) {
@@ -644,13 +598,23 @@ class DaemonClient(private val context: Context) {
     fun sendServiceReply(requestIdHex: String, replyRouteBlobBase64: String, payload: ByteArray): JSONObject = rawRequest("send_service_reply") {
         put("request_id_hex", requestIdHex); put("reply_route_blob_base64", replyRouteBlobBase64); put("payload_base64", Base64.encodeToString(payload, Base64.NO_WRAP))
     }
-    fun subscribeServiceRequests(serviceIdsHex: List<String>, onRequest: (JSONObject) -> Unit, onClosed: (String) -> Unit): Long {
-        val request = JSONObject().put("protocol_version", PROTOCOL_VERSION).put("request_id", requestId.getAndIncrement()).put("action", "subscribe_service_requests")
-            .put("session_token", sessionToken ?: error("Not authenticated")).put("service_ids_hex", JSONArray(serviceIdsHex.take(64)))
-        return api?.subscribe(request.toString(), object : IVeilKnitStreamCallback.Stub() {
-            override fun onLine(line: String?) { if (!line.isNullOrBlank()) runCatching { val obj=JSONObject(line); if(obj.optString("stream")=="service_requests") onRequest(obj.getJSONObject("event")) } }
-            override fun onClosed(reason: String?) { onClosed(reason ?: "Daemon service-request stream closed") }
-        }) ?: error("Daemon API is not bound")
+    fun subscribeServiceRequests(
+        serviceIdsHex: List<String>,
+        onRequest: (JSONObject) -> Unit,
+        onClosed: (String) -> Unit,
+    ): Long {
+        val request = JSONObject()
+            .put("protocol_version", PROTOCOL_VERSION)
+            .put("request_id", requestId.getAndIncrement())
+            .put("action", "subscribe_service_requests")
+            .put("session_token", sessionToken ?: error("Not authenticated"))
+            .put("service_ids_hex", JSONArray(serviceIdsHex.take(64)))
+        return startEmbeddedSubscription(
+            request = request,
+            expectedStream = "service_requests",
+            onEvent = onRequest,
+            onClosed = onClosed,
+        )
     }
 
     fun subscribeMessages(onMessage: (JSONObject) -> Unit, onClosed: (String) -> Unit): Long {
@@ -659,19 +623,70 @@ class DaemonClient(private val context: Context) {
             .put("request_id", requestId.getAndIncrement())
             .put("action", "subscribe_messages")
             .put("session_token", sessionToken ?: error("Not authenticated"))
-        return api?.subscribe(request.toString(), object : IVeilKnitStreamCallback.Stub() {
-            override fun onLine(line: String?) {
-                if (line.isNullOrBlank()) return
-                runCatching {
-                    val obj = JSONObject(line)
-                    if (obj.optString("stream") == "application_messages") onMessage(obj.getJSONObject("event"))
-                }
-            }
-            override fun onClosed(reason: String?) { onClosed(reason ?: "Daemon message stream closed") }
-        }) ?: error("Daemon API is not bound")
+        return startEmbeddedSubscription(
+            request = request,
+            expectedStream = "application_messages",
+            onEvent = onMessage,
+            onClosed = onClosed,
+        )
     }
 
-    fun unsubscribe(id: Long) { runCatching { api?.unsubscribe(id) } }
+    private fun startEmbeddedSubscription(
+        request: JSONObject,
+        expectedStream: String,
+        onEvent: (JSONObject) -> Unit,
+        onClosed: (String) -> Unit,
+    ): Long {
+        val id = NativeDaemonBridge.subscribe(request.toString())
+        check(id > 0L) { "Embedded VeilKnit subscription bridge is not ready" }
+        subscriptionJobs[id] = subscriptionScope.launch {
+            var closureReason = "Embedded VeilKnit stream closed"
+            try {
+                while (isActive) {
+                    val lines = NativeDaemonBridge.drainSubscription(id)
+                    for (line in lines) {
+                        val obj = runCatching { JSONObject(line) }.getOrNull() ?: continue
+                        if (!obj.optBoolean("ok", true)) {
+                            val error = obj.optJSONObject("error")
+                            closureReason = "${error?.optString("code", "stream_error")}: ${error?.optString("message", "embedded stream error")}"
+                            return@launch
+                        }
+                        if (obj.optString("stream") == expectedStream) {
+                            obj.optJSONObject("event")?.let { event -> runCatching { onEvent(event) } }
+                        }
+                    }
+                    if (!NativeDaemonBridge.subscriptionActive(id)) {
+                        // Drain one final time so a last queued event is not lost when the producer
+                        // closes between polls.
+                        NativeDaemonBridge.drainSubscription(id).forEach { line ->
+                            runCatching { JSONObject(line) }.getOrNull()?.let { obj ->
+                                if (obj.optString("stream") == expectedStream) {
+                                    obj.optJSONObject("event")?.let { event -> runCatching { onEvent(event) } }
+                                }
+                            }
+                        }
+                        break
+                    }
+                    delay(50)
+                }
+            } finally {
+                NativeDaemonBridge.unsubscribe(id)
+                subscriptionJobs.remove(id)
+                if (isActive) runCatching { onClosed(closureReason) }
+            }
+        }
+        return id
+    }
+
+    fun subscriptionActive(id: Long?): Boolean {
+        if (id == null || id <= 0L) return false
+        return subscriptionJobs[id]?.isActive == true && NativeDaemonBridge.subscriptionActive(id)
+    }
+
+    fun unsubscribe(id: Long) {
+        subscriptionJobs.remove(id)?.cancel()
+        NativeDaemonBridge.unsubscribe(id)
+    }
 
     private fun computeProof(
         secret: ByteArray, appId: String, challengeId: Long, nonce: ByteArray,

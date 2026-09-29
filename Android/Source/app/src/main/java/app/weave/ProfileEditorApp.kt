@@ -9,6 +9,9 @@ import android.text.StaticLayout
 import android.text.TextPaint
 import android.widget.Toast
 import androidx.annotation.StringRes
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -50,6 +53,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.stringResource
@@ -65,6 +69,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -89,11 +94,12 @@ enum class EditorTool(val symbol: String, @StringRes val descriptionRes: Int, @S
     Button("▰", R.string.tool_button, R.string.tool_button_short),
     Stamp("★", R.string.tool_stamp, R.string.tool_stamp_short),
     Image("▧", R.string.tool_image, R.string.tool_image_short),
+    Audio("♫", R.string.tool_audio, R.string.tool_audio_short),
     Widget("⌘", R.string.tool_widget, R.string.tool_widget_short),
     Page("＋", R.string.tool_page, R.string.tool_page_short)
 }
 
-enum class PanelSection { Depth, MoveSize, Appearance, Content, FileActions }
+enum class PanelSection { Depth, Add, MoveSize, Appearance, Content, FileActions }
 
 data class HierarchyEntry(
     val label: String,
@@ -130,23 +136,17 @@ private fun localizedDefaultProfile(context: Context): ProfileDocument {
     root.children.filter { it.type == ElementType.Stamp }.forEachIndexed { i, e ->
         e.name = context.getString(if (i == 0) R.string.default_star_name else R.string.default_star2_name)
     }
-    root.children.firstOrNull { it.type == ElementType.Block }?.let { header ->
-        header.name = context.getString(R.string.default_header_box)
-        header.children.firstOrNull { it.type == ElementType.Text }?.let { title ->
-            title.name = context.getString(R.string.default_profile_title_name)
-            title.text = context.getString(R.string.default_profile_title)
-        }
+    root.children.filter { it.type == ElementType.Text }.getOrNull(0)?.let { title ->
+        title.name = context.getString(R.string.default_profile_title_name)
+        title.text = context.getString(R.string.default_profile_title)
     }
-    root.children.filter { it.type == ElementType.Block }.getOrNull(1)?.let { box ->
-        box.name = context.getString(R.string.default_welcome_box)
-        box.children.firstOrNull { it.type == ElementType.Text }?.let { body ->
-            body.name = context.getString(R.string.default_welcome_text_name)
-            body.text = context.getString(R.string.default_welcome_text)
-        }
-        box.children.firstOrNull { it.type == ElementType.Widget }?.let { widget ->
-            widget.name = context.getString(R.string.default_widget_placeholder_name)
-            widget.widgetLabel = context.getString(R.string.future_widget)
-        }
+    root.children.filter { it.type == ElementType.Text }.getOrNull(1)?.let { body ->
+        body.name = context.getString(R.string.default_welcome_text_name)
+        body.text = context.getString(R.string.default_welcome_text)
+    }
+    root.children.firstOrNull { it.type == ElementType.Widget }?.let { widget ->
+        widget.name = context.getString(R.string.default_widget_placeholder_name)
+        widget.widgetLabel = context.getString(R.string.future_widget)
     }
     return d
 }
@@ -188,9 +188,12 @@ fun loadActiveProfile(context: Context): ProfileDocument =
 
 private const val PROFILE_MAX_LOCAL_BYTES = 8 * 1024 * 1024
 private const val PROFILE_EDITOR_MODE_KEY = "profile/editor-mode-v1.txt"
+private const val PROFILE_EDITOR_UI_PREFS = "profile-editor-ui-v1"
+private const val PROFILE_EDITOR_PANEL_COLLAPSED_KEY = "panel-collapsed"
 
 class EditorState(private val context: Context) : PrivateVault.Participant {
     private val vault = PrivateVault.get(context)
+    private val editorUiPrefs = context.getSharedPreferences(PROFILE_EDITOR_UI_PREFS, Context.MODE_PRIVATE)
     /**
      * The working document is restored from disk on construction. Without this the app came
      * up on the built-in default every launch, so anything made in a previous session was
@@ -199,11 +202,12 @@ class EditorState(private val context: Context) : PrivateVault.Participant {
     var doc by mutableStateOf(loadActiveProfile(context))
     var pageIndex by mutableIntStateOf(0)
     var selectedId by mutableStateOf(doc.pages.first().root.id)
-    var panelCollapsed by mutableStateOf(false)
+    var panelCollapsed by mutableStateOf(editorUiPrefs.getBoolean(PROFILE_EDITOR_PANEL_COLLAPSED_KEY, true))
+        private set
     var hierarchyCollapsed by mutableStateOf(true)
     var tool by mutableStateOf(EditorTool.Move)
-    var mode by mutableStateOf(EditMode.Boxes)
-    var focusedBoxId by mutableStateOf<String?>(firstBoxId())
+    var mode by mutableStateOf(EditMode.Foreground)
+    var focusedBoxId by mutableStateOf<String?>(null)
     var selectedGradientStop by mutableIntStateOf(0)
     var currentFileName by mutableStateOf<String?>(null)
     var showSaveAs by mutableStateOf(false)
@@ -218,6 +222,7 @@ class EditorState(private val context: Context) : PrivateVault.Participant {
     var depthRevision by mutableIntStateOf(0); private set
     private val expanded = mutableStateMapOf(
         PanelSection.Depth to false,
+        PanelSection.Add to false,
         PanelSection.MoveSize to false,
         PanelSection.Appearance to false,
         PanelSection.Content to false,
@@ -228,6 +233,7 @@ class EditorState(private val context: Context) : PrivateVault.Participant {
     private var savedSnapshot = doc.deepCopy()
     private var continuousEditing = false
     private var depthEditing = false
+    private var hierarchyEditing = false
     private var dragElement: Element? = null
     private var dragParentRect = NRect(0f, 0f, 1f, 1f)
     private val legacyProfileDir: File = File(context.filesDir, "profiles")
@@ -297,8 +303,8 @@ class EditorState(private val context: Context) : PrivateVault.Participant {
             undo.clear(); redo.clear()
             pageIndex = 0
             selectedId = doc.pages.first().root.id
-            focusedBoxId = firstBoxId()
-            mode = EditMode.Boxes
+            focusedBoxId = null
+            mode = EditMode.Foreground
             persistError = null
             profileLoadedForCurrentAccount = true
             savedProfilePresent = !loaded.missing
@@ -436,8 +442,8 @@ class EditorState(private val context: Context) : PrivateVault.Participant {
         doc = next
         pageIndex = 0
         selectedId = doc.pages.first().root.id
-        focusedBoxId = firstBoxId()
-        mode = EditMode.Boxes
+        focusedBoxId = null
+        mode = EditMode.Foreground
         invalidate()
         persistActive()
     }
@@ -550,29 +556,142 @@ class EditorState(private val context: Context) : PrivateVault.Participant {
     fun canUndo(): Boolean = undo.isNotEmpty()
     fun undo() { if (undo.isEmpty()) return; redo.addLast(doc.deepCopy()); doc = undo.removeLast(); repairSelection() }
     fun redo() { if (redo.isEmpty()) return; undo.addLast(doc.deepCopy()); doc = redo.removeLast(); repairSelection() }
-    fun revert() { pushUndo(); doc = savedSnapshot.deepCopy(); pageIndex = 0; selectedId = doc.pages[0].root.id; mode = EditMode.Boxes; focusedBoxId = firstBoxId(); invalidate() }
-    private fun repairSelection() { inlineTextEditId = null; inlineTextDraft = ""; pageIndex = pageIndex.coerceIn(doc.pages.indices); focusedBoxId = firstBoxId(); selectedId = doc.pages[pageIndex].root.id; mode = EditMode.Boxes; invalidate() }
+    fun revert() { pushUndo(); doc = savedSnapshot.deepCopy(); pageIndex = 0; selectedId = doc.pages[0].root.id; mode = EditMode.Foreground; focusedBoxId = null; invalidate() }
+    private fun repairSelection() { inlineTextEditId = null; inlineTextDraft = ""; pageIndex = pageIndex.coerceIn(doc.pages.indices); focusedBoxId = null; selectedId = doc.pages[pageIndex].root.id; mode = EditMode.Foreground; invalidate() }
 
     fun changeEditMode(next: EditMode) {
         finishInlineTextEdit()
+        val root = doc.pages[pageIndex].root
         when (next) {
-            EditMode.Background -> { mode = next; selectedId = doc.pages[pageIndex].root.id; depthArmedId = null }
-            EditMode.Boxes -> { mode = next; selectedId = focusedBoxId ?: firstBoxId() ?: doc.pages[pageIndex].root.id; depthArmedId = null }
-            EditMode.Foreground -> {
-                val candidate = when { isRootBox(selected()) -> selectedId; findElement(focusedBoxId)?.type == ElementType.Block -> focusedBoxId; else -> firstBoxId() }
-                if (candidate == null) { mode = EditMode.Boxes; return }
-                enterBox(candidate)
+            EditMode.Background -> {
+                mode = EditMode.Background
+                if (selected()?.type != ElementType.Stamp) selectedId = root.id
+            }
+            EditMode.Foreground, EditMode.Boxes -> {
+                // Boxes is retained only as a legacy enum value for old code/documents.
+                // The redesigned editor has one freeform foreground workspace.
+                mode = EditMode.Foreground
+                if (selected()?.type == ElementType.Stamp) selectedId = root.id
+                focusedBoxId = null
             }
         }
+        depthArmedId = null
         invalidate()
     }
+
+    /** Legacy compatibility helper: selecting an old box no longer zooms into a separate mode. */
     fun enterBox(id: String) {
         finishInlineTextEdit()
         val e = findElement(id) ?: return
-        if (!isRootBox(e)) return
-        focusedBoxId = id; selectedId = id; mode = EditMode.Foreground; depthArmedId = null; invalidate()
+        selectedId = e.id
+        focusedBoxId = null
+        mode = EditMode.Foreground
+        depthArmedId = null
+        invalidate()
     }
-    fun exitBox() { finishInlineTextEdit(); mode = EditMode.Boxes; selectedId = focusedBoxId ?: firstBoxId() ?: doc.pages[pageIndex].root.id; depthArmedId = null; invalidate() }
+
+    fun exitBox() {
+        finishInlineTextEdit()
+        focusedBoxId = null
+        mode = EditMode.Foreground
+        selectedId = doc.pages[pageIndex].root.id
+        depthArmedId = null
+        invalidate()
+    }
+
+    fun updatePanelCollapsed(collapsed: Boolean) {
+        if (panelCollapsed == collapsed) return
+        panelCollapsed = collapsed
+        editorUiPrefs.edit().putBoolean(PROFILE_EDITOR_PANEL_COLLAPSED_KEY, collapsed).apply()
+    }
+
+    private fun beginHierarchyReorder() {
+        if (!hierarchyEditing) {
+            pushUndo()
+            hierarchyEditing = true
+        }
+    }
+
+    fun finishHierarchyReorder() {
+        hierarchyEditing = false
+        invalidate()
+    }
+
+    fun movePageTo(pageId: String, targetIndex: Int) {
+        val from = doc.pages.indexOfFirst { it.id == pageId }
+        if (from < 0 || doc.pages.isEmpty()) return
+        val to = targetIndex.coerceIn(doc.pages.indices)
+        if (to == from) return
+        beginHierarchyReorder()
+        val currentPageId = doc.pages.getOrNull(pageIndex)?.id
+        val moved = doc.pages.removeAt(from)
+        doc.pages.add(to, moved)
+        pageIndex = currentPageId?.let { id -> doc.pages.indexOfFirst { it.id == id } }
+            ?.takeIf { it >= 0 } ?: pageIndex.coerceIn(doc.pages.indices)
+        uiRevision++
+        renderRevision++
+    }
+
+    fun layerSiblingIds(entry: HierarchyEntry): List<String> {
+        if (entry.pageIndex !in doc.pages.indices) return emptyList()
+        val element = findElement(entry.elementId) ?: return emptyList()
+        val parent = parentOf(element.id) ?: return emptyList()
+        return parent.children.sortedByDescending { it.rect.zIndex }.map { it.id }
+    }
+
+    fun moveLayerTo(entry: HierarchyEntry, targetIndex: Int) {
+        if (entry.pageIndex !in doc.pages.indices) return
+        val page = doc.pages[entry.pageIndex]
+        val element = findElement(entry.elementId) ?: return
+        if (element.id == page.root.id) return
+        val parent = parentOf(element.id) ?: return
+        val topFirst = parent.children.sortedByDescending { it.rect.zIndex }.toMutableList()
+        val from = topFirst.indexOfFirst { it.id == element.id }
+        if (from < 0 || topFirst.isEmpty()) return
+        val to = targetIndex.coerceIn(topFirst.indices)
+        if (to == from) return
+        beginHierarchyReorder()
+        val moved = topFirst.removeAt(from)
+        topFirst.add(to, moved)
+        topFirst.forEachIndexed { index, child -> child.rect.zIndex = topFirst.size - 1 - index }
+        parent.children.clear()
+        parent.children.addAll(topFirst.asReversed())
+        selectedId = element.id
+        pageIndex = entry.pageIndex
+        renderRevision++
+        depthRevision++
+        uiRevision++
+    }
+
+    fun goToPage(index: Int) {
+        if (index !in doc.pages.indices) return
+        finishInlineTextEdit()
+        pageIndex = index
+        selectedId = doc.pages[index].root.id
+        focusedBoxId = null
+        if (mode == EditMode.Boxes) mode = EditMode.Foreground
+        selectedGradientStop = 0
+        depthArmedId = null
+        invalidate()
+    }
+
+    fun createPage(name: String) {
+        if (doc.pages.size >= VspfLimits.MAX_PAGES) return
+        finishInlineTextEdit()
+        pushUndo()
+        val pageName = name.trim().ifBlank { text(R.string.new_page) }.take(40)
+        val p = Page(name = pageName)
+        p.root.name = pageName
+        p.root.background.solidArgb = 0xFFF7F7F7.toInt()
+        doc.pages += p
+        pageIndex = doc.pages.lastIndex
+        selectedId = p.root.id
+        focusedBoxId = null
+        mode = EditMode.Foreground
+        selectedGradientStop = 0
+        depthArmedId = null
+        invalidate()
+    }
 
     fun hierarchy(): List<HierarchyEntry> {
         val out = mutableListOf<HierarchyEntry>()
@@ -590,40 +709,35 @@ class EditorState(private val context: Context) : PrivateVault.Participant {
         val out = mutableListOf<HierarchyEntry>()
         fun walk(e: Element, depth: Int) {
             out += HierarchyEntry(displayName(e), pi, e.id, depth, e.type)
-            e.children.forEach { walk(it, depth + 1) }
+            e.children.sortedByDescending { it.rect.zIndex }.forEach { walk(it, depth + 1) }
         }
-        page.root.children.forEach { walk(it, 0) }
+        page.root.children.sortedByDescending { it.rect.zIndex }.forEach { walk(it, 0) }
         return out
     }
     fun select(entry: HierarchyEntry) {
-        pageIndex = entry.pageIndex; selectedGradientStop = 0
+        pageIndex = entry.pageIndex
+        selectedGradientStop = 0
         val root = doc.pages[pageIndex].root
         val e = findElement(entry.elementId) ?: root
-        if (e.id == root.id) {
-            mode = EditMode.Background; focusedBoxId = firstBoxId(); selectedId = root.id
-        } else {
-            val directParent = parentOf(e.id)
-            if (directParent?.id == root.id && e.type == ElementType.Stamp) {
-                mode = EditMode.Background; selectedId = e.id
-            } else if (directParent?.id == root.id) {
-                mode = EditMode.Boxes; selectedId = e.id; if (e.type == ElementType.Block) focusedBoxId = e.id
-            } else {
-                var top = e
-                var p = parentOf(top.id)
-                while (p != null && p.id != root.id) { top = p; p = parentOf(top.id) }
-                if (top.type == ElementType.Block) { focusedBoxId = top.id; mode = EditMode.Foreground; selectedId = e.id }
-                else { mode = EditMode.Boxes; selectedId = e.id }
-            }
-        }
-        depthArmedId = null; invalidate()
+        selectedId = e.id
+        focusedBoxId = null
+        mode = if (e.type == ElementType.Stamp) EditMode.Background else EditMode.Foreground
+        depthArmedId = null
+        invalidate()
     }
 
     fun depthScope(): MutableList<Element> {
         val root = doc.pages[pageIndex].root
         return when (mode) {
             EditMode.Background -> root.children.filter { it.type == ElementType.Stamp }.toMutableList()
-            EditMode.Boxes -> root.children.filter { it.type != ElementType.Stamp }.toMutableList()
-            EditMode.Foreground -> findElement(focusedBoxId)?.children ?: mutableListOf()
+            EditMode.Foreground, EditMode.Boxes -> {
+                val selectedElement = selected()
+                val scopeParent = selectedElement
+                    ?.takeUnless { it.id == root.id }
+                    ?.let { parentOf(it.id) }
+                    ?: root
+                scopeParent.children.filter { it.type != ElementType.Stamp }.toMutableList()
+            }
         }
     }
     fun depthTopFirst(): List<Element> = depthScope().sortedByDescending { it.rect.zIndex }
@@ -661,15 +775,16 @@ class EditorState(private val context: Context) : PrivateVault.Participant {
             if (doc.pages.size <= 1) { toast(R.string.must_keep_page); return }
             val kind = itemKindLabel(page.root, pageRoot = true)
             pushUndo(); val removed = page.id; doc.pages.removeAt(pageIndex); if (doc.defaultPageId == removed) doc.defaultPageId = doc.pages.first().id
-            pageIndex = pageIndex.coerceAtMost(doc.pages.lastIndex); selectedId = doc.pages[pageIndex].root.id; focusedBoxId = firstBoxId(); invalidate()
+            pageIndex = pageIndex.coerceAtMost(doc.pages.lastIndex); selectedId = doc.pages[pageIndex].root.id; focusedBoxId = null; mode = EditMode.Foreground; invalidate()
             toast(R.string.editor_deleted_item, kind)
             return
         }
         val target = selected() ?: return
         val kind = itemKindLabel(target)
         val parent = parentOf(selectedId) ?: return; pushUndo(); parent.children.removeAll { it.id == selectedId }
-        if (selectedId == focusedBoxId) focusedBoxId = firstBoxId()
-        selectedId = if (mode == EditMode.Foreground) focusedBoxId ?: page.root.id else parent.id; invalidate()
+        focusedBoxId = null
+        selectedId = parent.id
+        invalidate()
         toast(R.string.editor_deleted_item, kind)
     }
     fun duplicateSelected() {
@@ -678,51 +793,150 @@ class EditorState(private val context: Context) : PrivateVault.Participant {
             if (doc.pages.size >= VspfLimits.MAX_PAGES) return
             val kind = itemKindLabel(page.root, pageRoot = true)
             pushUndo(); val copy = page.copy(id = makeId("page"), name = page.name + text(R.string.copy_suffix), root = page.root.deepCopy()); reIdTree(copy.root); copy.root.name = copy.name
-            doc.pages += copy; pageIndex = doc.pages.lastIndex; selectedId = copy.root.id; focusedBoxId = firstBoxId(); invalidate()
+            doc.pages += copy; pageIndex = doc.pages.lastIndex; selectedId = copy.root.id; focusedBoxId = null; mode = EditMode.Foreground; invalidate()
             toast(R.string.editor_cloned_item, kind)
             return
         }
         val e = selected() ?: return; val kind = itemKindLabel(e); val parent = parentOf(selectedId) ?: return; pushUndo(); val c = e.deepCopy(); reIdTree(c); c.name += text(R.string.copy_suffix)
         c.rect.x = (c.rect.x + .03f).coerceAtMost(1f - c.rect.width); c.rect.y = (c.rect.y + .03f).coerceAtMost(1f - c.rect.height); c.rect.zIndex = e.rect.zIndex + 1
-        parent.children += c; selectedId = c.id; if (isRootBox(c)) focusedBoxId = c.id; invalidate()
+        parent.children += c; selectedId = c.id; focusedBoxId = null; invalidate()
         toast(R.string.editor_cloned_item, kind)
     }
     fun adjustLayer(delta: Int) { val e = selected() ?: return; if (isPageRoot(e)) return; pushUndo(); e.rect.zIndex += delta; invalidate() }
 
     fun allowedTools(): List<EditorTool> = when (mode) {
-        EditMode.Background -> listOf(EditorTool.Move, EditorTool.Stamp, EditorTool.Page)
-        EditMode.Boxes -> listOf(EditorTool.Move, EditorTool.Block, EditorTool.Page)
-        EditMode.Foreground -> listOf(EditorTool.Move, EditorTool.Text, EditorTool.Link, EditorTool.Button, EditorTool.Stamp, EditorTool.Image, EditorTool.Widget)
+        EditMode.Background -> listOf(EditorTool.Move, EditorTool.Stamp)
+        EditMode.Foreground, EditMode.Boxes -> listOf(
+            EditorTool.Move,
+            EditorTool.Text,
+            EditorTool.Link,
+            EditorTool.Button,
+            EditorTool.Image,
+            EditorTool.Audio,
+            EditorTool.Widget,
+        )
     }
+
     fun add(tool: EditorTool) {
         if (tool !in allowedTools()) return
         if (tool == EditorTool.Move) { this.tool = tool; return }
-        if (tool == EditorTool.Page) {
-            editDoc { d -> val p = Page(name = text(R.string.new_page)); p.root.name = p.name; p.root.background.solidArgb = 0xFFF7F7F7.toInt(); d.pages += p; pageIndex = d.pages.lastIndex; selectedId = p.root.id; focusedBoxId = null; mode = EditMode.Boxes }
-            this.tool = EditorTool.Move; return
+        if (tool == EditorTool.Widget) {
+            mode = EditMode.Foreground
+            widgetReplaceTargetId = null
+            showWidgetPicker = true
+            this.tool = EditorTool.Move
+            return
         }
-        if (tool == EditorTool.Widget) { widgetReplaceTargetId = null; showWidgetPicker = true; this.tool = EditorTool.Move; return }
-        pushUndo(); val root = doc.pages[pageIndex].root
-        val parent = when (mode) {
-            EditMode.Background -> root
-            EditMode.Boxes -> root
-            EditMode.Foreground -> {
-                val focus = findElement(focusedBoxId) ?: return
-                val s = selected(); if (s?.type == ElementType.Block && s.id != root.id && isDescendantOf(s.id, focus.id)) s else focus
-            }
-        }
+
+        pushUndo()
+        val root = doc.pages[pageIndex].root
+        val parent = root
         val nextZ = (parent.children.maxOfOrNull { it.rect.zIndex } ?: 0) + 1
         val e = when (tool) {
-            EditorTool.Text -> Element(type = ElementType.Text, name = text(R.string.new_text_name), text = text(R.string.new_text_content), rect = RectSpec(.12f, .12f, .55f, .14f, nextZ))
-            EditorTool.Block -> Element(type = ElementType.Block, name = text(R.string.new_box), rect = RectSpec(.12f, .12f, .52f, .30f, nextZ), background = BackgroundSpec(solidArgb = 0xDDFFFFFF.toInt()))
-            EditorTool.Link -> Element(type = ElementType.Link, name = text(R.string.new_link), label = text(R.string.new_page_link), target = doc.pages[pageIndex].id, rect = RectSpec(.12f, .12f, .42f, .10f, nextZ))
-            EditorTool.Button -> Element(type = ElementType.Button, name = text(R.string.new_button), label = text(R.string.new_button), rect = RectSpec(.12f, .12f, .34f, .11f, nextZ), background = BackgroundSpec(solidArgb = 0xFFECF0F8.toInt()), fontSize = 16f, textAlign = TextAlignMode.Center)
-            EditorTool.Stamp -> Element(type = ElementType.Stamp, name = text(R.string.new_stamp), rect = RectSpec(.12f, .12f, .10f, .10f, nextZ), stampDecoration = DecorationRef(builtinName = "Star1", basedOnBuiltin = "Star1"))
-            EditorTool.Image -> Element(type = ElementType.Media, name = text(R.string.new_image), rect = RectSpec(.12f, .12f, .48f, .28f, nextZ), mediaKind = MediaKind.Image, mediaTitle = text(R.string.image_placeholder))
-            EditorTool.Widget -> Element(type = ElementType.Widget, name = text(R.string.new_widget), rect = RectSpec(.12f, .12f, .48f, .24f, nextZ), widgetLabel = text(R.string.future_widget))
-            else -> return
+            EditorTool.Text -> Element(
+                type = ElementType.Text,
+                name = text(R.string.new_text_name),
+                text = text(R.string.new_text_content),
+                rect = RectSpec(.12f, .12f, .55f, .14f, nextZ),
+            )
+            EditorTool.Link -> Element(
+                type = ElementType.Link,
+                name = text(R.string.new_link),
+                label = text(R.string.new_page_link),
+                target = doc.pages[pageIndex].id,
+                rect = RectSpec(.12f, .12f, .42f, .10f, nextZ),
+            )
+            EditorTool.Button -> Element(
+                type = ElementType.Button,
+                name = text(R.string.new_button),
+                label = text(R.string.new_button),
+                rect = RectSpec(.12f, .12f, .34f, .11f, nextZ),
+                background = BackgroundSpec(solidArgb = 0xFFECF0F8.toInt()),
+                fontSize = 16f,
+                textAlign = TextAlignMode.Center,
+            )
+            EditorTool.Stamp -> Element(
+                type = ElementType.Stamp,
+                name = text(R.string.new_stamp),
+                rect = RectSpec(.12f, .12f, .10f, .10f, nextZ),
+                stampDecoration = DecorationRef(builtinName = "Star1", basedOnBuiltin = "Star1"),
+            )
+            EditorTool.Image -> Element(
+                type = ElementType.Media,
+                name = text(R.string.new_image),
+                rect = RectSpec(.12f, .12f, .48f, .28f, nextZ),
+                mediaKind = MediaKind.Image,
+                mediaTitle = text(R.string.image_placeholder),
+            )
+            EditorTool.Audio -> Element(
+                type = ElementType.Media,
+                name = text(R.string.media_audio),
+                rect = RectSpec(.12f, .12f, .48f, .14f, nextZ),
+                mediaKind = MediaKind.Audio,
+                mediaTitle = text(R.string.media_audio),
+                intrinsicWidth = 1,
+                intrinsicHeight = 1,
+            )
+            EditorTool.Block, EditorTool.Page -> return
+            EditorTool.Widget -> return
+            EditorTool.Move -> return
         }
-        parent.children += e; refreshAutoName(e); selectedId = e.id; if (mode == EditMode.Boxes && e.type == ElementType.Block) focusedBoxId = e.id; invalidate(); this.tool = EditorTool.Move
+        parent.children += e
+        refreshAutoName(e)
+        selectedId = e.id
+        focusedBoxId = null
+        invalidate()
+        this.tool = EditorTool.Move
+    }
+
+    fun addImportedImage(stored: LocalMediaStore.Stored) {
+        mode = EditMode.Foreground
+        pushUndo()
+        val root = doc.pages[pageIndex].root
+        val nextZ = (root.children.maxOfOrNull { it.rect.zIndex } ?: 0) + 1
+        val sourceAspect = stored.width.toFloat() / stored.height.coerceAtLeast(1).toFloat()
+        val width = .58f
+        val logicalPageAspect = doc.pages[pageIndex].aspectRatio.coerceAtLeast(.1f)
+        val height = (width * logicalPageAspect / sourceAspect).coerceIn(.08f, .55f)
+        val e = Element(
+            type = ElementType.Media,
+            name = text(R.string.new_image),
+            rect = RectSpec(.12f, .12f, width, height, nextZ),
+            mediaKind = MediaKind.Image,
+            mediaContentHash = stored.contentHash,
+            intrinsicWidth = stored.width.toLong(),
+            intrinsicHeight = stored.height.toLong(),
+            mediaTitle = text(R.string.media_image),
+            mediaDescription = "",
+        )
+        root.children += e
+        refreshAutoName(e)
+        selectedId = e.id
+        focusedBoxId = null
+        invalidate()
+    }
+
+    fun addImportedAudio(stored: LocalMediaStore.AudioStored) {
+        mode = EditMode.Foreground
+        pushUndo()
+        val root = doc.pages[pageIndex].root
+        val nextZ = (root.children.maxOfOrNull { it.rect.zIndex } ?: 0) + 1
+        val e = Element(
+            type = ElementType.Media,
+            name = text(R.string.media_audio),
+            rect = RectSpec(.12f, .12f, .62f, .12f, nextZ),
+            mediaKind = MediaKind.Audio,
+            mediaContentHash = stored.contentHash,
+            intrinsicWidth = 1,
+            intrinsicHeight = 1,
+            mediaTitle = text(R.string.media_audio),
+            mediaDescription = "",
+        )
+        root.children += e
+        refreshAutoName(e)
+        selectedId = e.id
+        focusedBoxId = null
+        invalidate()
     }
     private fun isDescendantOf(id: String, ancestorId: String): Boolean { var p = parentOf(id); while (p != null) { if (p.id == ancestorId) return true; p = parentOf(p.id) }; return false }
 
@@ -733,35 +947,35 @@ class EditorState(private val context: Context) : PrivateVault.Participant {
         fun walk(e: Element, parent: NRect) { if (found != null) return; val r = parent.child(e.rect); if (e.id == id) { found = r; return }; e.children.forEach { walk(it, r) } }
         root.children.forEach { walk(it, NRect(0f, 0f, 1f, 1f)) }; return found
     }
-    fun cameraTarget(): NRect {
-        if (mode != EditMode.Foreground) return NRect(0f, 0f, 1f, 1f)
-        val r = globalRectFor(focusedBoxId) ?: return NRect(0f, 0f, 1f, 1f)
-        val mx = r.w * .06f; val my = r.h * .06f
-        val left = (r.x - mx).coerceAtLeast(0f); val top = (r.y - my).coerceAtLeast(0f)
-        val right = (r.x + r.w + mx).coerceAtMost(1f); val bottom = (r.y + r.h + my).coerceAtMost(1f)
-        return NRect(left, top, (right-left).coerceAtLeast(.02f), (bottom-top).coerceAtLeast(.02f))
-    }
+    fun cameraTarget(): NRect = NRect(0f, 0f, 1f, 1f)
 
     fun hitTest(nxPage: Float, nyPage: Float): HitResult {
         val root = doc.pages[pageIndex].root
+        val pageRect = NRect(0f, 0f, 1f, 1f)
         return when (mode) {
             EditMode.Background -> {
-                val candidates = root.children.filter { it.type == ElementType.Stamp }.sortedByDescending { it.rect.zIndex }
-                candidates.firstNotNullOfOrNull { e -> val r=NRect(0f,0f,1f,1f).child(e.rect); if(r.contains(nxPage,nyPage)) HitResult(e.id,root.id,r,NRect(0f,0f,1f,1f)) else null }
-                    ?: HitResult(root.id,null,NRect(0f,0f,1f,1f),NRect(0f,0f,1f,1f))
+                val candidates = root.children
+                    .filter { it.type == ElementType.Stamp }
+                    .sortedByDescending { it.rect.zIndex }
+                candidates.firstNotNullOfOrNull { e ->
+                    val r = pageRect.child(e.rect)
+                    if (r.contains(nxPage, nyPage)) HitResult(e.id, root.id, r, pageRect) else null
+                } ?: HitResult(root.id, null, pageRect, pageRect)
             }
-            EditMode.Boxes -> {
-                val candidates = root.children.filter { it.type != ElementType.Stamp }.sortedByDescending { it.rect.zIndex }
-                candidates.firstNotNullOfOrNull { e -> val r=NRect(0f,0f,1f,1f).child(e.rect); if(r.contains(nxPage,nyPage)) HitResult(e.id,root.id,r,NRect(0f,0f,1f,1f)) else null }
-                    ?: HitResult(root.id,null,NRect(0f,0f,1f,1f),NRect(0f,0f,1f,1f))
-            }
-            EditMode.Foreground -> {
-                val focus = findElement(focusedBoxId) ?: return HitResult(root.id,null,NRect(0f,0f,1f,1f),NRect(0f,0f,1f,1f))
-                val focusRect = globalRectFor(focus.id) ?: NRect(0f,0f,1f,1f)
-                val hits = mutableListOf<Pair<Int,HitResult>>()
-                fun walk(e: Element, parentRect: NRect, parentId: String) { val r=parentRect.child(e.rect); if(e.rect.visible && r.contains(nxPage,nyPage)) hits += e.rect.zIndex to HitResult(e.id,parentId,r,parentRect); e.children.forEach { walk(it,r,e.id) } }
-                focus.children.forEach { walk(it,focusRect,focus.id) }
-                hits.maxByOrNull { it.first }?.second ?: HitResult(focus.id,root.id,focusRect,NRect(0f,0f,1f,1f))
+            EditMode.Foreground, EditMode.Boxes -> {
+                // New foreground items live directly on the page. Walk old nested boxes too so
+                // existing profiles remain editable without preserving a separate "inside box" mode.
+                val hits = mutableListOf<Pair<Int, HitResult>>()
+                fun walk(e: Element, parentRect: NRect, parentId: String, depth: Int) {
+                    if (!e.rect.visible || e.type == ElementType.Stamp) return
+                    val r = parentRect.child(e.rect)
+                    if (r.contains(nxPage, nyPage)) {
+                        hits += (depth * 100_000 + e.rect.zIndex) to HitResult(e.id, parentId, r, parentRect)
+                    }
+                    e.children.forEach { walk(it, r, e.id, depth + 1) }
+                }
+                root.children.forEach { walk(it, pageRect, root.id, 0) }
+                hits.maxByOrNull { it.first }?.second ?: HitResult(root.id, null, pageRect, pageRect)
             }
         }
     }
@@ -771,23 +985,25 @@ class EditorState(private val context: Context) : PrivateVault.Participant {
         val hitElement = findElement(hit.elementId)
         if (inlineTextEditId != null && inlineTextEditId != hit.elementId) finishInlineTextEdit()
         selectedId = hit.elementId
+        focusedBoxId = null
         if (mode == EditMode.Foreground && doubleTap && hitElement?.type == ElementType.Text) {
             beginInlineTextEdit(hitElement.id)
             return
         }
-        if (mode == EditMode.Boxes && hitElement?.type == ElementType.Block) {
-            focusedBoxId = hit.elementId; if (doubleTap) enterBox(hit.elementId)
-        }
         uiRevision++
     }
+
     fun beginDrag(nxPage: Float, nyPage: Float): Boolean {
-        val hit = hitTest(nxPage,nyPage); selectedId=hit.elementId; dragParentRect=hit.parentRect
-        val e=selected(); dragElement=when(mode){
-            EditMode.Background -> if(e?.type==ElementType.Stamp)e else null
-            EditMode.Boxes -> if(e!=null && e.id!=doc.pages[pageIndex].root.id)e else null
-            EditMode.Foreground -> if(e!=null && e.id!=focusedBoxId)e else null
+        val hit = hitTest(nxPage, nyPage)
+        selectedId = hit.elementId
+        dragParentRect = hit.parentRect
+        val e = selected()
+        dragElement = when (mode) {
+            EditMode.Background -> if (e?.type == ElementType.Stamp) e else null
+            EditMode.Foreground, EditMode.Boxes ->
+                if (e != null && e.id != doc.pages[pageIndex].root.id && e.type != ElementType.Stamp) e else null
         }
-        if(dragElement!=null)pushUndo()
+        if (dragElement != null) pushUndo()
         return dragElement != null
     }
     fun dragBy(dxNormPage: Float,dyNormPage: Float){val e=dragElement?:return;val pw=dragParentRect.w.coerceAtLeast(.001f);val ph=dragParentRect.h.coerceAtLeast(.001f);e.rect.x=(e.rect.x+dxNormPage/pw).coerceIn(0f,1f-e.rect.width);e.rect.y=(e.rect.y+dyNormPage/ph).coerceIn(0f,1f-e.rect.height);renderRevision++}
@@ -882,11 +1098,8 @@ class EditorState(private val context: Context) : PrivateVault.Participant {
         widgetProgramCache[pkg.manifest.widgetId] = pkg.manifest.sourceHash to program
     }
     private fun foregroundParent(): Element? {
-        val root = doc.pages.getOrNull(pageIndex)?.root ?: return null
-        if (mode != EditMode.Foreground) return null
-        val focus = findElement(focusedBoxId) ?: return null
-        val s = selected()
-        return if (s?.type == ElementType.Block && s.id != root.id && isDescendantOf(s.id, focus.id)) s else focus
+        if (mode != EditMode.Foreground && mode != EditMode.Boxes) return null
+        return doc.pages.getOrNull(pageIndex)?.root
     }
     fun placeWidget(pkg: WidgetPackage) {
         val replaceTarget = findElement(widgetReplaceTargetId)?.takeIf { it.type == ElementType.Widget }
@@ -1071,7 +1284,7 @@ class EditorState(private val context: Context) : PrivateVault.Participant {
     fun open(fileName:String){
         try {
             val bytes=vault.getNamedBlob("profiles", fileName, PROFILE_MAX_LOCAL_BYTES) ?: error("saved profile is missing")
-            doc=ProfileCodec.decodeText(bytes.toString(Charsets.UTF_8));currentFileName=fileName;savedSnapshot=doc.deepCopy();undo.clear();redo.clear();pageIndex=0;selectedId=doc.pages[0].root.id;focusedBoxId=firstBoxId();mode=EditMode.Boxes;showOpen=false;toast(R.string.opened_profile,fileName.removeSuffix(".txt"))
+            doc=ProfileCodec.decodeText(bytes.toString(Charsets.UTF_8));currentFileName=fileName;savedSnapshot=doc.deepCopy();undo.clear();redo.clear();pageIndex=0;selectedId=doc.pages[0].root.id;focusedBoxId=null;mode=EditMode.Foreground;showOpen=false;toast(R.string.opened_profile,fileName.removeSuffix(".txt"))
         } catch(e:Exception){toast(R.string.open_failed,e.message?:"")}
     }
     fun publishLocal(){
@@ -1083,26 +1296,48 @@ class EditorState(private val context: Context) : PrivateVault.Participant {
 }
 
 internal val DesignerColorScheme = lightColorScheme(
+    // Individual/profile side: warm red identity.
     primary = Color(0xFFB24F5C),
     onPrimary = Color.White,
     primaryContainer = Color(0xFFFBE5E8),
     onPrimaryContainer = Color(0xFF64262F),
-    secondary = Color(0xFF6E8194),
+    secondary = Color(0xFF8F6670),
     onSecondary = Color.White,
-    secondaryContainer = Color(0xFFF0F5FA),
-    onSecondaryContainer = Color(0xFF35495C),
+    secondaryContainer = Color(0xFFF8EDEF),
+    onSecondaryContainer = Color(0xFF56343C),
     tertiary = Color(0xFFC77872),
-    background = Color(0xFFF8FAFC),
-    surface = Color(0xFFFEFFFF),
-    surfaceVariant = Color(0xFFF2F6FA),
-    outline = Color(0xFF8795A3),
-    outlineVariant = Color(0xFFDCE5ED),
+    background = Color(0xFFFFF8F9),
+    surface = Color(0xFFFFFCFC),
+    surfaceVariant = Color(0xFFF9EEF0),
+    outline = Color(0xFF987F85),
+    outlineVariant = Color(0xFFE9D8DC),
+    error = Color(0xFFB3261E),
+    errorContainer = Color(0xFFF9DEDC)
+)
+
+internal val GroupColorScheme = lightColorScheme(
+    // Group/community side: cool blue identity. Components using MaterialTheme.primary (buttons,
+    // selected tabs, links, progress indicators) automatically follow this palette.
+    primary = Color(0xFF3E72A8),
+    onPrimary = Color.White,
+    primaryContainer = Color(0xFFDCEBFA),
+    onPrimaryContainer = Color(0xFF173A5B),
+    secondary = Color(0xFF607F9D),
+    onSecondary = Color.White,
+    secondaryContainer = Color(0xFFE7F0F8),
+    onSecondaryContainer = Color(0xFF29465F),
+    tertiary = Color(0xFF5E86B1),
+    background = Color(0xFFF5F9FE),
+    surface = Color(0xFFFBFDFF),
+    surfaceVariant = Color(0xFFEAF2FA),
+    outline = Color(0xFF7C91A6),
+    outlineVariant = Color(0xFFD5E1ED),
     error = Color(0xFFB3261E),
     errorContainer = Color(0xFFF9DEDC)
 )
 
 @Composable
-fun EditorScreen(state: EditorState, onOpenBasic: () -> Unit, onBack: () -> Unit) {
+fun EditorScreen(state: EditorState, media: LocalMediaStore, onOpenBasic: () -> Unit, onBack: () -> Unit) {
     var confirmDiscard by remember { mutableStateOf(false) }
     val entrySnapshot = remember { state.doc.deepCopy() }
 
@@ -1138,24 +1373,32 @@ fun EditorScreen(state: EditorState, onOpenBasic: () -> Unit, onBack: () -> Unit
                     onDone = { state.persistActive(); onBack() },
                 )
                 Box(Modifier.weight(1f).fillMaxWidth().clipToBounds()) {
-                    PageWorkspace(state, Modifier.fillMaxSize())
+                    PageWorkspace(state, media, Modifier.fillMaxSize())
                     if (!state.panelCollapsed) {
                         // Always a narrow side panel. A bottom sheet was tried and swallowed
                         // half the canvas; the collapse bar already covers the case where the
                         // panel is in the way.
                         PropertiesPanel(
                             state,
+                            media,
                             Modifier.align(Alignment.CenterEnd).width(panelWidth).fillMaxHeight()
                         )
                     } else {
                         Surface(
-                            tonalElevation = 3.dp, shadowElevation = 3.dp,
+                            color = Color(0xFFD62828),
+                            contentColor = Color.White,
+                            tonalElevation = 4.dp, shadowElevation = 5.dp,
                             shape = RoundedCornerShape(topStart = 14.dp, bottomStart = 14.dp),
-                            modifier = Modifier.align(Alignment.TopEnd).width(44.dp).height(58.dp)
+                            modifier = Modifier.align(Alignment.TopEnd).width(46.dp).height(62.dp)
                         ) {
                             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                                TextButton(onClick = { state.panelCollapsed = false }, contentPadding = PaddingValues(0.dp), modifier = Modifier.size(36.dp)) {
-                                    Text("\u2039", style = MaterialTheme.typography.titleLarge)
+                                TextButton(
+                                    onClick = { state.updatePanelCollapsed(false) },
+                                    contentPadding = PaddingValues(0.dp),
+                                    modifier = Modifier.fillMaxSize(),
+                                    colors = ButtonDefaults.textButtonColors(contentColor = Color.White),
+                                ) {
+                                    Text("\u2039", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
                                 }
                             }
                         }
@@ -1168,16 +1411,16 @@ fun EditorScreen(state: EditorState, onOpenBasic: () -> Unit, onBack: () -> Unit
     if (confirmDiscard) {
         AlertDialog(
             onDismissRequest = { confirmDiscard = false },
-            title = { Text("Discard changes?") },
-            text = { Text("Everything you changed since opening the editor goes back to how it was. Anything already published stays published.") },
+            title = { Text(tr("Discard changes?")) },
+            text = { Text(tr("Everything you changed since opening the editor goes back to how it was. Anything already published stays published.")) },
             confirmButton = {
                 TextButton(onClick = {
                     confirmDiscard = false
                     state.replaceDocument(entrySnapshot)
                     onBack()
-                }) { Text("Discard") }
+                }) { Text(tr("Discard")) }
             },
-            dismissButton = { TextButton(onClick = { confirmDiscard = false }) { Text("Keep editing") } }
+            dismissButton = { TextButton(onClick = { confirmDiscard = false }) { Text(tr("Keep editing")) } }
         )
     }
     if (state.showSaveAs) SaveAsDialog(state)
@@ -1195,23 +1438,29 @@ private fun EditorHeader(
 ) {
     val page = state.doc.pages[state.pageIndex]
     Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 1.dp) {
-        Row(Modifier.fillMaxWidth().height(54.dp).padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = onDiscard, contentPadding = PaddingValues(horizontal = 8.dp)) { Text("Discard") }
-            Column(Modifier.weight(1f)) {
-                Text(state.doc.profileName, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, maxLines = 1)
-                Text(stringResource(R.string.workspace_page, page.name), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Row(
+            Modifier.fillMaxWidth().height(54.dp).padding(horizontal = 12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            TextButton(onClick = onDiscard, contentPadding = PaddingValues(horizontal = 8.dp)) {
+                Text(tr("Discard"))
             }
+            Text(
+                stringResource(R.string.workspace_page, page.name),
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
             TextButton(onClick = onOpenBasic, contentPadding = PaddingValues(horizontal = 8.dp)) {
-                Text("Basic", maxLines = 1, softWrap = false)
+                Text(tr("Basic"), maxLines = 1, softWrap = false)
             }
-            TextButton(onClick = { state.showWidgetStudio = true }) { Text("\u2318", style = MaterialTheme.typography.titleMedium) }
-            Button(onClick = onDone, contentPadding = PaddingValues(horizontal = 14.dp)) { Text("Done") }
-            Spacer(Modifier.width(8.dp))
-            Surface(color = MaterialTheme.colorScheme.primaryContainer, shape = RoundedCornerShape(999.dp)) {
-                Text(
-                    stringResource(state.mode.shortRes), modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-                    style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onPrimaryContainer, fontWeight = FontWeight.SemiBold
-                )
+            TextButton(onClick = { state.showWidgetStudio = true }) {
+                Text("\u2318", style = MaterialTheme.typography.titleMedium)
+            }
+            Button(onClick = onDone, contentPadding = PaddingValues(horizontal = 14.dp)) {
+                Text(tr("Done"))
             }
         }
     }
@@ -1226,7 +1475,7 @@ private fun WorkspaceHeader(state: EditorState, onSocial: () -> Unit) {
                 Text(stringResource(R.string.app_name), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                 Text(stringResource(R.string.workspace_page, page.name), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            TextButton(onClick = onSocial) { Text("◎ Social", style = MaterialTheme.typography.labelMedium) }
+            TextButton(onClick = onSocial) { Text("◎ ${tr("Social")}", style = MaterialTheme.typography.labelMedium) }
             TextButton(onClick = { state.showWidgetStudio = true }) {
                 Text("⌘ ${stringResource(R.string.open_widget_studio)}", style = MaterialTheme.typography.labelMedium)
             }
@@ -1241,7 +1490,7 @@ private fun WorkspaceHeader(state: EditorState, onSocial: () -> Unit) {
 }
 
 @Composable
-private fun PageWorkspace(state:EditorState,modifier:Modifier=Modifier){
+private fun PageWorkspace(state:EditorState,media:LocalMediaStore,modifier:Modifier=Modifier){
     val renderRevision=state.renderRevision
     val page=state.doc.pages[state.pageIndex]
     val cam=state.cameraTarget()
@@ -1320,6 +1569,7 @@ private fun PageWorkspace(state:EditorState,modifier:Modifier=Modifier){
             Box(Modifier.fillMaxSize().border(1.dp,MaterialTheme.colorScheme.outlineVariant,RoundedCornerShape(12.dp))){
                 ProfileCanvas(
                     state,
+                    media,
                     renderRevision,
                     NRect(left,top,width,height),
                     Modifier.fillMaxSize(),
@@ -1329,23 +1579,6 @@ private fun PageWorkspace(state:EditorState,modifier:Modifier=Modifier){
                         workspacePan = clampViewportPan(workspacePan + Offset(delta.x * workspaceZoom, delta.y * workspaceZoom))
                     }
                 )
-                if(state.mode==EditMode.Foreground){
-                    Surface(
-                        color=MaterialTheme.colorScheme.surface.copy(alpha=.94f),
-                        shape=RoundedCornerShape(bottomEnd=12.dp),
-                        shadowElevation = 2.dp,
-                        modifier=Modifier.align(Alignment.TopStart)
-                    ){
-                        Row(verticalAlignment=Alignment.CenterVertically){
-                            TextButton(onClick=state::exitBox){Text("←")}
-                            Text(
-                                state.text(R.string.box_zoom_hint,state.findElement(state.focusedBoxId)?.let{state.displayName(it)}?:""),
-                                style=MaterialTheme.typography.labelMedium,
-                                modifier=Modifier.padding(end=10.dp)
-                            )
-                        }
-                    }
-                }
             }
         }
         Surface(
@@ -1368,6 +1601,7 @@ private fun PageWorkspace(state:EditorState,modifier:Modifier=Modifier){
 @Composable
 private fun ProfileCanvas(
     state:EditorState,
+    media:LocalMediaStore,
     renderRevision:Int,
     camera:NRect,
     modifier:Modifier,
@@ -1421,6 +1655,7 @@ private fun ProfileCanvas(
                     strings=renderStrings,
                     inlineEditingId=state.inlineTextEditId,
                     widgetLookup=state::widgetProgramFor,
+                    imageLookup={ element -> media.bitmapFor(element.mediaContentHash) },
                     ownerKey=state.ownerKey
                 )
             }
@@ -1432,6 +1667,7 @@ private fun ProfileCanvas(
                         strings=renderStrings,
                         inlineEditingId=state.inlineTextEditId,
                         widgetLookup=state::widgetProgramFor,
+                        imageLookup={ element -> media.bitmapFor(element.mediaContentHash) },
                         ownerKey=state.ownerKey
                     )
                 }
@@ -1633,93 +1869,108 @@ internal fun DrawScope.drawElement(
 
 @Composable
 private fun ToolStrip(state:EditorState, modifier: Modifier = Modifier){
+    var showCreatePage by remember { mutableStateOf(false) }
+    var newPageName by remember { mutableStateOf("") }
+    val hasPrevious = state.pageIndex > 0
+    val hasNext = state.pageIndex < state.doc.pages.lastIndex
+    val canCreate = state.doc.pages.size < VspfLimits.MAX_PAGES
+
     Surface(
         color = MaterialTheme.colorScheme.surface,
         tonalElevation = 4.dp,
         shadowElevation = 5.dp,
-        modifier = modifier.height(92.dp)
+        modifier = modifier.height(78.dp)
     ) {
         Row(
-            Modifier.fillMaxSize().horizontalScroll(rememberScrollState()).padding(horizontal=10.dp,vertical=8.dp),
-            verticalAlignment=Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
+            Modifier.fillMaxSize().padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(7.dp)
         ) {
-            Text(
-                stringResource(R.string.modes_label),
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 2.dp)
-            )
-            EditMode.entries.forEach { mode ->
-                val active = mode == state.mode
-                ToolbarTile(
-                    glyph = when(mode) {
-                        EditMode.Background -> "◩"
-                        EditMode.Boxes -> ""
-                        EditMode.Foreground -> "⌗"
-                    },
-                    label = stringResource(mode.shortRes),
-                    active = active,
-                    onClick = { state.changeEditMode(mode) },
-                    description = stringResource(mode.labelRes),
-                    drawCube = mode == EditMode.Boxes
-                )
+            OutlinedButton(
+                onClick = { state.goToPage(state.pageIndex - 1) },
+                enabled = hasPrevious,
+                modifier = Modifier.width(58.dp).fillMaxHeight().semantics {
+                    contentDescription = state.text(R.string.previous_page)
+                },
+                contentPadding = PaddingValues(0.dp),
+                shape = RoundedCornerShape(16.dp),
+            ) {
+                Text("‹", style = MaterialTheme.typography.headlineSmall)
             }
 
-            // While editing inside a box, selecting one of its contents creates a fourth
-            // context tile (Text, Link, Button, etc.) immediately to the right of Contents.
-            // At that point the inspector is the editing surface for the object, so the
-            // add-tools strip is hidden until the box itself/empty canvas is selected again.
-            val selected = state.selected()
-            val contentItemSelected = state.mode == EditMode.Foreground &&
-                selected != null && selected.id != state.focusedBoxId
-            if (contentItemSelected && selected != null) {
-                val label = when (selected.type) {
-                    ElementType.Text -> stringResource(R.string.item_kind_text)
-                    ElementType.Link -> stringResource(R.string.item_kind_link)
-                    ElementType.Button -> stringResource(R.string.item_kind_button)
-                    ElementType.Block -> stringResource(R.string.item_kind_box)
-                    ElementType.Stamp -> stringResource(R.string.item_kind_stamp)
-                    ElementType.Media -> stringResource(R.string.item_kind_media)
-                    ElementType.Widget -> stringResource(R.string.item_kind_widget)
-                }
-                val glyph = when (selected.type) {
-                    ElementType.Text -> "T"
-                    ElementType.Link -> "↗"
-                    ElementType.Button -> "▰"
-                    ElementType.Block -> ""
-                    ElementType.Stamp -> "★"
-                    ElementType.Media -> "▧"
-                    ElementType.Widget -> "⌘"
-                }
-                ToolbarTile(
-                    glyph = glyph,
-                    label = label,
-                    active = true,
-                    onClick = { state.panelCollapsed = false },
-                    description = state.text(R.string.selected_item_description, label),
-                    drawCube = selected.type == ElementType.Block
-                )
-            } else {
-                VerticalDivider(Modifier.height(54.dp).padding(horizontal=5.dp))
-                Text(
-                    stringResource(R.string.add_label),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(horizontal = 2.dp)
-                )
-                state.allowedTools().forEach { tool ->
-                    ToolbarTile(
-                        glyph = tool.symbol,
-                        label = stringResource(tool.compactRes),
-                        active = tool == state.tool,
-                        onClick = { state.add(tool) },
-                        description = state.text(tool.descriptionRes),
-                        drawCube = tool == EditorTool.Block
+            listOf(EditMode.Background, EditMode.Foreground).forEach { mode ->
+                val active = state.mode == mode || (mode == EditMode.Foreground && state.mode == EditMode.Boxes)
+                FilledTonalButton(
+                    onClick = { state.changeEditMode(mode) },
+                    modifier = Modifier.weight(1f).fillMaxHeight(),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = ButtonDefaults.filledTonalButtonColors(
+                        containerColor = if (active) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                        contentColor = if (active) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+                    ),
+                ) {
+                    Text(
+                        stringResource(mode.shortRes),
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = if (active) FontWeight.Bold else FontWeight.Medium,
                     )
                 }
             }
+
+            OutlinedButton(
+                onClick = {
+                    if (hasNext) {
+                        state.goToPage(state.pageIndex + 1)
+                    } else if (canCreate) {
+                        newPageName = state.text(R.string.new_page)
+                        showCreatePage = true
+                    }
+                },
+                enabled = hasNext || canCreate,
+                modifier = Modifier.width(58.dp).fillMaxHeight().semantics {
+                    contentDescription = state.text(R.string.next_page)
+                },
+                contentPadding = PaddingValues(0.dp),
+                shape = RoundedCornerShape(16.dp),
+            ) {
+                Text("›", style = MaterialTheme.typography.headlineSmall)
+            }
         }
+    }
+
+    if (showCreatePage) {
+        AlertDialog(
+            onDismissRequest = { showCreatePage = false },
+            title = { Text(stringResource(R.string.create_next_page)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(stringResource(R.string.create_next_page_body))
+                    OutlinedTextField(
+                        value = newPageName,
+                        onValueChange = { newPageName = it.take(40) },
+                        label = { Text(stringResource(R.string.page_name)) },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    state.createPage(newPageName)
+                    showCreatePage = false
+                }) {
+                    Text(stringResource(R.string.create_page))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCreatePage = false }) {
+                    Text(stringResource(R.string.cancel))
+                }
+            },
+        )
     }
 }
 
@@ -1839,69 +2090,118 @@ private fun LabeledSlider(label:String,value:Float,range:ClosedFloatingPointRang
 private fun Choice(label:String,current:String,choices:List<String>,onPick:(Int)->Unit){var open by remember{mutableStateOf(false)};Column(Modifier.fillMaxWidth()){Text(label,style=MaterialTheme.typography.labelMedium);Box{OutlinedButton(onClick={open=true},modifier=Modifier.fillMaxWidth(),contentPadding=PaddingValues(horizontal=10.dp)){Text(current,maxLines=1)};DropdownMenu(expanded=open,onDismissRequest={open=false}){choices.forEachIndexed{i,s->DropdownMenuItem(text={Text(s)},onClick={open=false;onPick(i)})}}}}}
 
 @Composable
-private fun PropertiesPanel(state:EditorState,modifier:Modifier=Modifier){
-    @Suppress("UNUSED_VARIABLE") val rev=state.uiRevision
-    val e=state.selected()?:return
-    val scroll=rememberScrollState()
+private fun PropertiesPanel(
+    state: EditorState,
+    media: LocalMediaStore,
+    modifier: Modifier = Modifier,
+) {
+    @Suppress("UNUSED_VARIABLE") val rev = state.uiRevision
+    val e = state.selected() ?: return
+    val scroll = rememberScrollState()
+
     Surface(
         color = MaterialTheme.colorScheme.surface,
-        tonalElevation=3.dp,
+        tonalElevation = 3.dp,
         shadowElevation = 4.dp,
-        modifier=modifier
+        modifier = modifier,
     ) {
         Column(Modifier.fillMaxSize()) {
-            // Keep the inspector identity + collapse control pinned. Only the body below
-            // scrolls, so the sidebar can always be closed immediately.
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
-                verticalAlignment=Alignment.CenterVertically
-            ){
-                Column(Modifier.weight(1f)) {
-                    Text(stringResource(R.string.edit_panel),style=MaterialTheme.typography.titleMedium,fontWeight=FontWeight.Bold)
-                    Text(
-                        state.displayName(e),
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+            // The old "Inspector / Page: ..." title area is now intentionally just the
+            // collapse control. The selected object is obvious from the canvas/layers list.
+            Surface(
+                color = Color(0xFFFFE2E5),
+                contentColor = Color(0xFF8F1D2C),
+                modifier = Modifier.fillMaxWidth().height(48.dp),
+            ) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    TextButton(
+                        onClick = {
+                            state.finishInlineTextEdit()
+                            state.updatePanelCollapsed(true)
+                        },
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(0.dp),
+                        colors = ButtonDefaults.textButtonColors(contentColor = Color(0xFF8F1D2C)),
+                    ) {
+                        Text("›", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                    }
                 }
-                TextButton(
-                    onClick={ state.finishInlineTextEdit(); state.panelCollapsed=true },
-                    modifier = Modifier.size(40.dp),
-                    contentPadding = PaddingValues(0.dp)
-                ) { Text("›", style = MaterialTheme.typography.titleLarge) }
             }
             HorizontalDivider()
-            // Pages & layers now occupies the old mode-status slot directly below Inspector.
-            // Cap its expanded height so the selection tree cannot push the quick actions or
-            // property sections completely off-screen on profiles with many pages.
-            Box(Modifier.fillMaxWidth().heightIn(max = 260.dp).verticalScroll(rememberScrollState()).padding(horizontal=10.dp,vertical=8.dp)) {
-                HierarchyTree(state)
-            }
-            Column(Modifier.fillMaxWidth().padding(horizontal=10.dp,vertical=6.dp),verticalArrangement=Arrangement.spacedBy(7.dp)){
+
+            // Delete / copy / undo stay immediately under the collapse strip.
+            Column(
+                Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(7.dp),
+            ) {
                 QuickObjectActions(state)
             }
+
+            // Pages & layers now sits below the three object-action buttons.
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 260.dp)
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 10.dp, vertical = 6.dp)
+            ) {
+                HierarchyTree(state)
+            }
+
             HorizontalDivider()
+
             Column(
                 Modifier.weight(1f).fillMaxWidth().verticalScroll(scroll).padding(12.dp),
-                verticalArrangement=Arrangement.spacedBy(10.dp)
+                verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                val depthEnabled=state.depthTopFirst().isNotEmpty()
-                val moveSizeEnabled=!(state.mode==EditMode.Foreground&&e.id==state.focusedBoxId)
-                val appearanceEnabled=when{
-                    state.isPageRoot(e)&&state.mode!=EditMode.Background->false
-                    else->e.type in listOf(ElementType.Block,ElementType.Stamp,ElementType.Text,ElementType.Button)
+                val moveSizeEnabled = !(state.isPageRoot(e) && state.mode != EditMode.Background)
+                val appearanceEnabled = when {
+                    state.isPageRoot(e) && state.mode != EditMode.Background -> false
+                    else -> e.type in listOf(ElementType.Block, ElementType.Stamp, ElementType.Text, ElementType.Button)
                 }
-                val contentEnabled=e.type in listOf(ElementType.Text,ElementType.Link,ElementType.Button,ElementType.Media,ElementType.Widget)
+                val contentEnabled = e.type in listOf(
+                    ElementType.Text,
+                    ElementType.Link,
+                    ElementType.Button,
+                    ElementType.Media,
+                    ElementType.Widget,
+                )
                 val moveSizeTitle = if (state.mode == EditMode.Background && state.isPageRoot(e))
-                    stringResource(R.string.section_page_size) else stringResource(R.string.section_move_size)
-                Section(stringResource(R.string.section_depth),state.sectionExpanded(PanelSection.Depth),{state.toggleSection(PanelSection.Depth)},stringResource(R.string.depth_help),depthEnabled){DepthPanel(state)}
-                Section(moveSizeTitle,state.sectionExpanded(PanelSection.MoveSize),{state.toggleSection(PanelSection.MoveSize)},stringResource(R.string.move_size_help),moveSizeEnabled){MoveSizePanel(state,e)}
-                Section(stringResource(R.string.section_appearance),state.sectionExpanded(PanelSection.Appearance),{state.toggleSection(PanelSection.Appearance)},stringResource(R.string.appearance_help),appearanceEnabled){AppearancePanel(state,e)}
-                if(contentEnabled)
-                    Section(stringResource(R.string.section_content),state.sectionExpanded(PanelSection.Content),{state.toggleSection(PanelSection.Content)},stringResource(R.string.content_help),true){ContentPanel(state,e)}
-                Section(stringResource(R.string.section_file),state.sectionExpanded(PanelSection.FileActions),{state.toggleSection(PanelSection.FileActions)},stringResource(R.string.file_actions_help),true){FilePanel(state)}
+                    stringResource(R.string.section_page_size)
+                else
+                    stringResource(R.string.section_move_size)
+
+                AddElementPalette(state, media)
+                Section(
+                    moveSizeTitle,
+                    state.sectionExpanded(PanelSection.MoveSize),
+                    { state.toggleSection(PanelSection.MoveSize) },
+                    stringResource(R.string.move_size_help),
+                    moveSizeEnabled,
+                ) { MoveSizePanel(state, e) }
+                Section(
+                    stringResource(R.string.section_appearance),
+                    state.sectionExpanded(PanelSection.Appearance),
+                    { state.toggleSection(PanelSection.Appearance) },
+                    stringResource(R.string.appearance_help),
+                    appearanceEnabled,
+                ) { AppearancePanel(state, e) }
+                if (contentEnabled) {
+                    Section(
+                        stringResource(R.string.section_content),
+                        state.sectionExpanded(PanelSection.Content),
+                        { state.toggleSection(PanelSection.Content) },
+                        stringResource(R.string.content_help),
+                        true,
+                    ) { ContentPanel(state, e) }
+                }
+                Section(
+                    stringResource(R.string.section_file),
+                    state.sectionExpanded(PanelSection.FileActions),
+                    { state.toggleSection(PanelSection.FileActions) },
+                    stringResource(R.string.file_actions_help),
+                    true,
+                ) { FilePanel(state) }
                 Spacer(Modifier.height(12.dp))
             }
         }
@@ -1909,8 +2209,188 @@ private fun PropertiesPanel(state:EditorState,modifier:Modifier=Modifier){
 }
 
 @Composable
+private fun AddElementPalette(state: EditorState, media: LocalMediaStore) {
+    val scope = rememberCoroutineScope()
+    var importingImage by remember { mutableStateOf(false) }
+    var importingAudio by remember { mutableStateOf(false) }
+
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        importingImage = true
+        scope.launch {
+            val stored = media.importImage(uri)
+            importingImage = false
+            if (stored != null) state.addImportedImage(stored)
+        }
+    }
+    val audioPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        importingAudio = true
+        scope.launch {
+            val stored = media.importAudio(uri)
+            importingAudio = false
+            if (stored != null) state.addImportedAudio(stored)
+        }
+    }
+
+    Section(
+        stringResource(R.string.section_add),
+        state.sectionExpanded(PanelSection.Add),
+        { state.toggleSection(PanelSection.Add) },
+        null,
+        true,
+    ) {
+        if (state.mode == EditMode.Background) {
+            OutlinedButton(
+                onClick = { state.add(EditorTool.Stamp) },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(999.dp),
+            ) {
+                Text("★  ${stringResource(R.string.tool_stamp_short)}")
+            }
+        } else {
+            OutlinedButton(
+                onClick = { state.add(EditorTool.Text) },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(999.dp),
+            ) { Text("T  ${stringResource(R.string.tool_text_short)}") }
+
+            OutlinedButton(
+                onClick = {
+                    imagePicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                },
+                enabled = !importingImage,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(999.dp),
+            ) {
+                if (importingImage) {
+                    CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(6.dp))
+                }
+                Text("▧  ${stringResource(R.string.tool_image_short)}")
+            }
+
+            OutlinedButton(
+                onClick = { audioPicker.launch("audio/*") },
+                enabled = !importingAudio,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(999.dp),
+            ) {
+                if (importingAudio) {
+                    CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(6.dp))
+                }
+                Text("♫  ${stringResource(R.string.tool_audio_short)}")
+            }
+
+            OutlinedButton(
+                onClick = { state.add(EditorTool.Widget) },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(999.dp),
+            ) { Text("⌘  ${stringResource(R.string.tool_widget_short)}") }
+
+            OutlinedButton(
+                onClick = { state.add(EditorTool.Link) },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(999.dp),
+            ) { Text("↗  ${stringResource(R.string.tool_link_short)}") }
+
+            OutlinedButton(
+                onClick = { state.add(EditorTool.Button) },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(999.dp),
+            ) { Text("▰  ${stringResource(R.string.tool_button_short)}") }
+        }
+    }
+}
+
+private class HierarchyReorderVisualState {
+    var draggingId by mutableStateOf<String?>(null)
+        private set
+    var fromIndex by mutableIntStateOf(-1)
+        private set
+    var targetIndex by mutableIntStateOf(-1)
+        private set
+    var dragOffsetPx by mutableFloatStateOf(0f)
+        private set
+    private var activeIds by mutableStateOf<List<String>>(emptyList())
+    val measuredHeights = mutableStateMapOf<String, Int>()
+
+    fun start(id: String, index: Int, ids: List<String>) {
+        draggingId = id
+        activeIds = ids.toList()
+        fromIndex = index.coerceIn(ids.indices)
+        targetIndex = fromIndex
+        dragOffsetPx = 0f
+    }
+
+    fun dragBy(deltaY: Float, gapPx: Float) {
+        val id = draggingId ?: return
+        if (fromIndex !in activeIds.indices) return
+        dragOffsetPx += deltaY
+        val dragSpan = spanPx(id, gapPx)
+        var target = fromIndex
+        if (dragOffsetPx > 0f) {
+            var distance = 0f
+            for (i in (fromIndex + 1) until activeIds.size) {
+                val neighborSpan = spanPx(activeIds[i], gapPx)
+                val threshold = distance + (dragSpan + neighborSpan) / 2f
+                if (dragOffsetPx >= threshold) {
+                    target = i
+                    distance += neighborSpan
+                } else break
+            }
+        } else if (dragOffsetPx < 0f) {
+            var distance = 0f
+            for (i in (fromIndex - 1) downTo 0) {
+                val neighborSpan = spanPx(activeIds[i], gapPx)
+                val threshold = distance + (dragSpan + neighborSpan) / 2f
+                if (-dragOffsetPx >= threshold) {
+                    target = i
+                    distance += neighborSpan
+                } else break
+            }
+        }
+        targetIndex = target
+    }
+
+    fun isDragging(id: String): Boolean = draggingId == id
+
+    fun shiftFor(id: String, gapPx: Float): Float {
+        val activeDragId = draggingId ?: return 0f
+        if (id == activeDragId || fromIndex !in activeIds.indices || targetIndex !in activeIds.indices) return 0f
+        val index = activeIds.indexOf(id)
+        if (index < 0) return 0f
+        val draggedSpan = spanPx(activeDragId, gapPx)
+        return when {
+            targetIndex > fromIndex && index in (fromIndex + 1)..targetIndex -> -draggedSpan
+            targetIndex < fromIndex && index in targetIndex until fromIndex -> draggedSpan
+            else -> 0f
+        }
+    }
+
+    fun reset() {
+        draggingId = null
+        activeIds = emptyList()
+        fromIndex = -1
+        targetIndex = -1
+        dragOffsetPx = 0f
+    }
+
+    private fun spanPx(id: String, gapPx: Float): Float {
+        val fallback = draggingId?.let { measuredHeights[it] } ?: 42
+        return (measuredHeights[id] ?: fallback).toFloat() + gapPx
+    }
+}
+
+@Composable
 private fun HierarchyTree(state: EditorState) {
     val expandedPages = remember { mutableStateMapOf<String, Boolean>() }
+    val pageReorder = remember { HierarchyReorderVisualState() }
+    val density = LocalDensity.current
+    val pageGapPx = with(density) { 7.dp.toPx() }
+    val layerGapPx = with(density) { 2.dp.toPx() }
+    val liftedShadowPx = with(density) { 14.dp.toPx() }
     Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
         Surface(
             color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .6f),
@@ -1942,76 +2422,133 @@ private fun HierarchyTree(state: EditorState) {
         }
         AnimatedVisibility(!state.hierarchyCollapsed) {
             Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                val pageIds = state.doc.pages.map { it.id }
                 state.doc.pages.forEachIndexed { pi, page ->
-            val isCurrentPage = pi == state.pageIndex
-            val expanded = expandedPages[page.id] ?: isCurrentPage
-            val entries = state.hierarchyForPage(pi)
-            Surface(
-                shape = RoundedCornerShape(12.dp),
-                color = if(isCurrentPage) MaterialTheme.colorScheme.primaryContainer.copy(alpha = .55f)
-                else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .48f),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column {
-                    Row(
-                        Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 5.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        TextButton(
-                            onClick = { expandedPages[page.id] = !expanded },
-                            modifier = Modifier.size(34.dp),
-                            contentPadding = PaddingValues(0.dp)
-                        ) { Text(if(expanded) "⌄" else "›", style = MaterialTheme.typography.titleMedium) }
-                        Row(
-                            Modifier.weight(1f).clickable {
-                                state.select(HierarchyEntry(page.name, pi, page.root.id))
-                            }.padding(horizontal = 4.dp, vertical = 7.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                    key(page.id) {
+                        val isCurrentPage = pi == state.pageIndex
+                        val expanded = expandedPages[page.id] ?: isCurrentPage
+                        val entries = state.hierarchyForPage(pi)
+                        val layerReorder = remember(page.id) { HierarchyReorderVisualState() }
+                        val pageDragging = pageReorder.isDragging(page.id)
+                        val pageShiftTarget = pageReorder.shiftFor(page.id, pageGapPx)
+                        val pageShift by animateFloatAsState(
+                            targetValue = pageShiftTarget,
+                            animationSpec = tween(135),
+                            label = "page-reorder-shift"
+                        )
+                        val pageScale by animateFloatAsState(
+                            targetValue = if (pageDragging) 1.025f else 1f,
+                            animationSpec = tween(110),
+                            label = "page-reorder-scale"
+                        )
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = when {
+                                pageDragging -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = .96f)
+                                isCurrentPage -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = .55f)
+                                else -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .48f)
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .onSizeChanged { pageReorder.measuredHeights[page.id] = it.height }
+                                .zIndex(if (pageDragging) 20f else 0f)
+                                .graphicsLayer {
+                                    translationY = if (pageDragging) pageReorder.dragOffsetPx else pageShift
+                                    scaleX = pageScale
+                                    scaleY = pageScale
+                                    shadowElevation = if (pageDragging) liftedShadowPx else 0f
+                                    clip = false
+                                }
+                                .pointerInput(page.id, pageIds) {
+                                    detectDragGesturesAfterLongPress(
+                                        onDragStart = {
+                                            pageReorder.start(page.id, pi, pageIds)
+                                        },
+                                        onDragEnd = {
+                                            val target = pageReorder.targetIndex
+                                            if (target >= 0) state.movePageTo(page.id, target)
+                                            state.finishHierarchyReorder()
+                                            pageReorder.reset()
+                                        },
+                                        onDragCancel = {
+                                            pageReorder.reset()
+                                        },
+                                    ) { change, drag ->
+                                        change.consume()
+                                        pageReorder.dragBy(drag.y, pageGapPx)
+                                    }
+                                }
                         ) {
-                            Text("▤", modifier = Modifier.padding(end = 8.dp), color = MaterialTheme.colorScheme.primary)
-                            Text(
-                                stringResource(R.string.page_prefix, page.name),
-                                modifier = Modifier.weight(1f),
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                fontWeight = if(isCurrentPage) FontWeight.Bold else FontWeight.SemiBold
-                            )
-                            Text(
-                                entries.size.toString(),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(start = 6.dp)
-                            )
-                        }
-                    }
-                    AnimatedVisibility(expanded) {
-                        Column(
-                            Modifier.fillMaxWidth().padding(start = 10.dp, end = 8.dp, bottom = 8.dp),
-                            verticalArrangement = Arrangement.spacedBy(2.dp)
-                        ) {
-                            if(entries.isEmpty()) {
-                                Text(
-                                    stringResource(R.string.page_empty),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
-                                )
-                            }
-                            entries.forEach { entry ->
-                                HierarchyRow(state, entry)
+                            Column {
+                                Row(
+                                    Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 5.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text("⋮⋮", color = MaterialTheme.colorScheme.outline, modifier = Modifier.padding(horizontal = 3.dp))
+                                    TextButton(
+                                        onClick = { expandedPages[page.id] = !expanded },
+                                        modifier = Modifier.size(34.dp),
+                                        contentPadding = PaddingValues(0.dp)
+                                    ) { Text(if(expanded) "⌄" else "›", style = MaterialTheme.typography.titleMedium) }
+                                    Row(
+                                        Modifier.weight(1f).clickable {
+                                            state.select(HierarchyEntry(page.name, pi, page.root.id))
+                                        }.padding(horizontal = 4.dp, vertical = 7.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text("▤", modifier = Modifier.padding(end = 8.dp), color = MaterialTheme.colorScheme.primary)
+                                        Text(
+                                            stringResource(R.string.page_prefix, page.name),
+                                            modifier = Modifier.weight(1f),
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            fontWeight = if(isCurrentPage) FontWeight.Bold else FontWeight.SemiBold
+                                        )
+                                        Text(
+                                            entries.size.toString(),
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.padding(start = 6.dp)
+                                        )
+                                    }
+                                }
+                                AnimatedVisibility(expanded) {
+                                    Column(
+                                        Modifier.fillMaxWidth().padding(start = 10.dp, end = 8.dp, bottom = 8.dp),
+                                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                                    ) {
+                                        if(entries.isEmpty()) {
+                                            Text(
+                                                stringResource(R.string.page_empty),
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                                            )
+                                        }
+                                        entries.forEach { entry ->
+                                            key(entry.elementId) {
+                                                HierarchyRow(state, entry, layerReorder, layerGapPx, liftedShadowPx)
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
         }
-            }
-        }
     }
 }
 
 @Composable
-private fun HierarchyRow(state: EditorState, entry: HierarchyEntry) {
+private fun HierarchyRow(
+    state: EditorState,
+    entry: HierarchyEntry,
+    reorder: HierarchyReorderVisualState,
+    gapPx: Float,
+    liftedShadowPx: Float,
+) {
     val selected = state.pageIndex == entry.pageIndex && state.selectedId == entry.elementId
     val glyph = when(entry.type) {
         ElementType.Block -> ""
@@ -2023,15 +2560,65 @@ private fun HierarchyRow(state: EditorState, entry: HierarchyEntry) {
         ElementType.Widget -> "⌘"
         null -> "•"
     }
+    val dragging = reorder.isDragging(entry.elementId)
+    val shiftTarget = reorder.shiftFor(entry.elementId, gapPx)
+    val animatedShift by animateFloatAsState(
+        targetValue = shiftTarget,
+        animationSpec = tween(120),
+        label = "layer-reorder-shift"
+    )
+    val scale by animateFloatAsState(
+        targetValue = if (dragging) 1.04f else 1f,
+        animationSpec = tween(100),
+        label = "layer-reorder-scale"
+    )
     Surface(
-        color = if(selected) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent,
+        color = when {
+            dragging -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = .96f)
+            selected -> MaterialTheme.colorScheme.secondaryContainer
+            else -> Color.Transparent
+        },
         shape = RoundedCornerShape(9.dp),
-        modifier = Modifier.fillMaxWidth().clickable { state.select(entry) }
+        modifier = Modifier
+            .fillMaxWidth()
+            .onSizeChanged { reorder.measuredHeights[entry.elementId] = it.height }
+            .zIndex(if (dragging) 30f else 0f)
+            .graphicsLayer {
+                translationY = if (dragging) reorder.dragOffsetPx else animatedShift
+                scaleX = scale
+                scaleY = scale
+                shadowElevation = if (dragging) liftedShadowPx else 0f
+                clip = false
+            }
+            .pointerInput(entry.elementId, entry.pageIndex) {
+                detectDragGesturesAfterLongPress(
+                    onDragStart = {
+                        state.select(entry)
+                        val siblings = state.layerSiblingIds(entry)
+                        val index = siblings.indexOf(entry.elementId)
+                        if (index >= 0) reorder.start(entry.elementId, index, siblings)
+                    },
+                    onDragEnd = {
+                        val target = reorder.targetIndex
+                        if (target >= 0) state.moveLayerTo(entry, target)
+                        state.finishHierarchyReorder()
+                        reorder.reset()
+                    },
+                    onDragCancel = {
+                        reorder.reset()
+                    },
+                ) { change, drag ->
+                    change.consume()
+                    reorder.dragBy(drag.y, gapPx)
+                }
+            }
+            .clickable { state.select(entry) }
     ) {
         Row(
             Modifier.fillMaxWidth().padding(start = (8 + entry.depth * 16).dp, end = 8.dp, top = 7.dp, bottom = 7.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
+            Text("⋮⋮", modifier = Modifier.width(24.dp), color = MaterialTheme.colorScheme.outline)
             if(entry.type==ElementType.Block)
                 Box(Modifier.width(25.dp),contentAlignment=Alignment.CenterStart){IsometricCubeIcon(Modifier.size(18.dp),if(selected)MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant)}
             else Text(glyph, modifier = Modifier.width(25.dp), color = if(selected) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant)
@@ -2048,22 +2635,32 @@ private fun HierarchyRow(state: EditorState, entry: HierarchyEntry) {
 
 @Composable
 private fun QuickObjectActions(state:EditorState){
+    val canUndo = state.canUndo()
+    val actionShape = RoundedCornerShape(999.dp)
     Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(8.dp)){
         OutlinedButton(
             onClick=state::deleteSelected,
             modifier=Modifier.weight(1f).height(42.dp).semantics{contentDescription=state.text(R.string.delete)},
-            contentPadding=PaddingValues(0.dp)
+            contentPadding=PaddingValues(0.dp),
+            shape=actionShape
         ){Box(Modifier.fillMaxSize(),contentAlignment=Alignment.Center){Text("✕",style=MaterialTheme.typography.titleMedium)}}
         OutlinedButton(
             onClick=state::duplicateSelected,
             modifier=Modifier.weight(1f).height(42.dp).semantics{contentDescription=state.text(R.string.duplicate)},
-            contentPadding=PaddingValues(0.dp)
+            contentPadding=PaddingValues(0.dp),
+            shape=actionShape
         ){Box(Modifier.fillMaxSize(),contentAlignment=Alignment.Center){Text("⧉",style=MaterialTheme.typography.titleMedium)}}
         OutlinedButton(
             onClick=state::undo,
-            enabled=state.canUndo(),
+            enabled=canUndo,
             modifier=Modifier.weight(1f).height(42.dp).semantics{contentDescription=state.text(R.string.undo)},
-            contentPadding=PaddingValues(0.dp)
+            contentPadding=PaddingValues(0.dp),
+            shape=actionShape,
+            border=BorderStroke(
+                1.dp,
+                if (canUndo) MaterialTheme.colorScheme.outline
+                else MaterialTheme.colorScheme.outline.copy(alpha = .55f)
+            )
         ){Box(Modifier.fillMaxSize(),contentAlignment=Alignment.Center){Text("↶",style=MaterialTheme.typography.titleMedium)}}
     }
 }
@@ -2121,7 +2718,6 @@ private fun DepthPanel(state:EditorState){
 
 @Composable
 private fun MoveSizePanel(state:EditorState,e:Element){
-    if(state.mode==EditMode.Foreground&&e.id==state.focusedBoxId)return
     if(!state.isPageRoot(e)){
         LabeledSlider(stringResource(R.string.x_position),e.rect.x,0f..1f,{v->state.continuousEdit{it.rect.x=v.coerceAtMost(1f-it.rect.width)}},state::endContinuous)
         LabeledSlider(stringResource(R.string.y_position),e.rect.y,0f..1f,{v->state.continuousEdit{it.rect.y=v.coerceAtMost(1f-it.rect.height)}},state::endContinuous)
@@ -2864,7 +3460,7 @@ private fun WidgetProperties(state: EditorState, e: Element) {
     val pkg = state.widgetPackageCachedFor(e)
     val size = state.widgetLogicalSize(e)
     if (pkg == null && e.widgetRecordKey.isNotBlank()) {
-        Text("Loading widget details…", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+        Text(tr("Loading widget details…"), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
     }
     if (pkg != null && e.widgetSourceHash.isNotBlank() && pkg.manifest.sourceHash != e.widgetSourceHash) {
         Text(stringResource(R.string.widget_source_mismatch), color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodySmall)

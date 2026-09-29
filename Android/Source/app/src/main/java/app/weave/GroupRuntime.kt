@@ -110,6 +110,7 @@ class GroupRuntime(
     }
 
     fun refreshBranch(pointer: GroupBranchPointer): Pair<GroupRecord, GroupPulse?>? {
+        val wasKnownLocally = store.branchKnown(pointer.groupId, pointer.branchId)
         val header = branches.readHeader(pointer.branchRoot) ?: return null
         if (header.group.groupId != pointer.groupId) return null
         if (header.creatorRoot != pointer.creatorRoot) return null
@@ -128,7 +129,49 @@ class GroupRuntime(
         // upsertDiscovered persists the Pulse too; do not write it once here and then immediately
         // write the same encrypted Pulse a second time.
         store.upsertDiscovered(effectiveGroup, pulse, pointer.branchId)
+        if (!wasKnownLocally && pointer.kind == GroupBranchKind.Claim) {
+            redeliverPendingLocalEventsToNewClaim(pointer)
+        }
         return effectiveGroup to pulse
+    }
+
+    /**
+     * A post can be created while this device only knows the Original branch, then learn about a
+     * Claim a few seconds/minutes later through gossip. Preserve the original pending decision, but
+     * give the newly verified Claim one bounded copy too. Branch-state persistence makes this
+     * idempotent: the same event is not re-sent every time that Claim's Pulse refreshes.
+     */
+    private fun redeliverPendingLocalEventsToNewClaim(pointer: GroupBranchPointer) {
+        if (closed.get() || pointer.kind != GroupBranchKind.Claim || pointer.ownerMainDht == sessionMainDht) return
+        val group = store.byId(pointer.groupId) ?: return
+        if (group.policy.visibility == GroupVisibility.MembersOnly) return
+        val storeV2 = eventStoreV2 ?: return
+        val now = System.currentTimeMillis()
+        val candidates = storeV2.allEvents()
+            .asSequence()
+            .filter { stored ->
+                stored.event.groupId == pointer.groupId &&
+                    stored.event.authorMainDht == sessionMainDht &&
+                    stored.event.eventType in setOf(GroupEventTypeV2.PostSubmitted, GroupEventTypeV2.CommentSubmitted) &&
+                    stored.validation == GroupEventValidationV2.Valid &&
+                    (stored.event.expiresAt <= 0L || stored.event.expiresAt > now) &&
+                    stored.branchStates.values.any { it == GroupBranchEventStateV2.Pending } &&
+                    pointer.branchId !in stored.branchStates
+            }
+            .sortedByDescending { it.event.createdAt }
+            .take(MAX_NEW_CLAIM_REDELIVERY_EVENTS)
+            .toList()
+        if (candidates.isEmpty()) return
+
+        logger("[groups-v2] NEW_CLAIM_REDELIVERY group=${short(pointer.groupId)} branch=${short(pointer.branchId)} target=${short(pointer.ownerMainDht)} events=${candidates.size}")
+        candidates.forEach { stored ->
+            markBranchStateV2(stored.event.eventId, pointer.branchId, GroupBranchEventStateV2.Pending)
+            branches.sendCanonicalSubmissionV2(
+                event = stored.event,
+                authorities = listOf(pointer),
+                privateIntakeKey = null,
+            )
+        }
     }
 
     fun refreshSelected(groupId: String): Pair<GroupRecord, GroupPulse?>? {
@@ -307,7 +350,19 @@ class GroupRuntime(
             ref = ref,
         ) ?: error("Groups v2 event store is unavailable")
         deliverCanonicalSubmissionV2(group, storedV2.event)
-        processCanonicalForOwnedBranches(storedV2, message, GroupEventTransportV2.LocalCreated, ownMainDht())
+        // At this point the immutable post and signed Groups-v2 event already exist and transport
+        // has been scheduled. A local creator/claimer view update must not turn that durable
+        // submission into a UI-level "post creation failed" (which encourages duplicate retries).
+        // Public witness / recovery can replay the same idempotent event if the local branch view
+        // could not be updated immediately.
+        runCatching {
+            processCanonicalForOwnedBranches(storedV2, message, GroupEventTransportV2.LocalCreated, ownMainDht())
+        }.onFailure { error ->
+            logger(
+                "groups: post ${postId} created; local branch view update deferred: " +
+                    (error.message ?: error::class.java.simpleName)
+            )
+        }
         return conversationId
     }
 
@@ -823,7 +878,10 @@ class GroupRuntime(
                     if (claim.kind == GroupBranchKind.Claim &&
                         claim.ownerMainDht == sourceMainDht &&
                         claim.creatorRoot == creatorRoot) {
-                        store.rememberBranch(claim.pointer(), selectIfNone = false)
+                        val pointer = claim.pointer()
+                        val wasKnownLocally = store.branchKnown(pointer.groupId, pointer.branchId)
+                        store.rememberBranch(pointer, selectIfNone = false)
+                        if (!wasKnownLocally) redeliverPendingLocalEventsToNewClaim(pointer)
                         store.branchesFor(event.groupId)
                             .filter { it.ownerMainDht == ownMainDht() && it.branchId != claim.branchId }
                             .forEach { ownedPointer ->
@@ -1478,6 +1536,20 @@ class GroupRuntime(
             return
         }
         val stored = custody.storeEvent(request.event, sourceMainDht, request.requestedRetainUntil) ?: return
+
+        // A node can be selected as an ordinary custodian even when the sender has not yet learned
+        // that this same node owns a Claim branch. Do not strand the event in the custody vault in
+        // that case: the authenticated author->custodian message is also sufficient transport
+        // evidence to feed the canonical event into this account's moderation branch.
+        if (ownsBranch && request.event.authorMainDht == sourceMainDht) {
+            logger("[groups-v2] CUSTODY_AUTHORITY_PROMOTE event=${request.event.eventId.take(8)} group=${short(request.groupId)} source=${short(sourceMainDht)}")
+            receiveCanonicalEventV2(
+                packet = GroupEventTransportPacketV2(request.event),
+                sourceMainDht = sourceMainDht,
+                transport = GroupEventTransportV2.Direct,
+            )
+        }
+
         if (!request.receiptRequested) return
         val receipt = signCustodyReceiptV2(stored)
         val bytes = GroupCustodyWireCodecV2.encode(receipt)
@@ -2256,6 +2328,7 @@ class GroupRuntime(
         )
         private const val CONTENT_FETCH_WORKERS = 3
         private const val CONTENT_RECOVERY_WORKERS = 2
+        private const val MAX_NEW_CLAIM_REDELIVERY_EVENTS = 16
         fun postConversationId(postId: String): String = "post:$postId"
         fun postIdFromConversation(conversationId: String): String = conversationId.removePrefix("post:")
     }

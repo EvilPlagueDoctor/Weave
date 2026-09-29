@@ -1,0 +1,14 @@
+PASS: GroupRuntime no legacy stored.event.kind
+PASS: GroupRuntime uses SignedGroupEventV2.eventType
+PASS: No invalid onDispose import
+PASS: DisposableEffect cleanup retained
+PASS: Captured callback translation weaveGroupClipboardLabel
+PASS: Captured callback translation couldntLoadSourcePostText
+PASS: Captured callback translation featuredCommentLabel
+PASS: Captured callback translation weavePostClipboardLabel
+PASS: Captured callback translation featuredPostLabel
+PASS: Captured callback translation weaveImageClipboardLabel
+PASS: No clipboard tr() calls remain
+PASS: No callback toast tr() call remains
+PASS: versionCode 36
+PASS: versionName compile-fix

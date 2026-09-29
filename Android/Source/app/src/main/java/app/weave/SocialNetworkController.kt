@@ -1,6 +1,9 @@
 package app.weave
 
 import android.content.Context
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.widget.Toast
 import android.util.Base64
 import app.weave.backbone.*
 import kotlinx.coroutines.*
@@ -32,6 +35,7 @@ private const val GOSSIP_SUMMARY_LOG_REPEAT_MS = 60_000L
 private const val DIAGNOSTIC_LOG_MAX_BYTES = 1024 * 1024
 private const val DIAGNOSTIC_LOG_KEEP_BYTES = 700 * 1024
 private const val PROFILE_MAX_BYTES = 4 * 1024 * 1024
+private const val STARTUP_TRACE_MAX_CHARS = 120_000
 private val LOG_TIMESTAMP_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS z")
 
 data class SocialProfileRow(val hint: ProfileHint, val openable: Boolean)
@@ -117,6 +121,8 @@ class SocialNetworkController(context: Context) {
     private val loggedGroupGeneration = ConcurrentHashMap<String, Long>()
     @Volatile private var lastGroupGossipSendLogMs = 0L
     @Volatile private var lastDebugUiRefreshMs = 0L
+    private val startupTrace = StringBuilder()
+    @Volatile private var startupDiagnosticsCopied = false
 
     init {
         val tail = readPersistentLogTail()
@@ -124,39 +130,55 @@ class SocialNetworkController(context: Context) {
     }
 
     fun start() {
-        // The worker is a reconnect loop rather than a one-shot connection. Android's Binder
-        // service may stay alive while the native daemon logs out, restarts, or signs into a
-        // different VeilKnit profile, so a running Weave must notice that change itself.
+        // The worker is a reconnect loop rather than a one-shot connection. The embedded Rust
+        // core may remain alive while the Weave UI is recreated, or it may stop/restart under
+        // the foreground service, so a running Weave must notice identity changes itself.
         if (networkJob?.isActive == true) return
         networkJob = scope.launch {
             var reconnectFailures = 0
             var reconnectDelayMs = 0L
             while (isActive) {
                 try {
+                    resetStartupTrace()
+                    startupLog("network bootstrap begin")
                     resetNetworkIdentityState()
                     runCatching { daemon?.close("reconnect loop replacing previous client") }
                     daemon = DaemonClient(appContext)
 
-                    updateStatus("Connecting to VeilKnit daemon…")
-                    daemon!!.connect { updateStatus(it) }
+                    startupLog("created embedded DaemonClient")
+                    updateStatus("Connecting Weave to the VeilKnit core…")
+                    startupLog("calling DaemonClient.connect()")
+                    daemon!!.connect { status ->
+                        startupLog("daemon connect status: $status")
+                        updateStatus(status)
+                    }
+                    startupLog("DaemonClient.connect() completed")
                     loadPrivateMetadata()
+                    startupLog("private metadata loaded")
                     val daemonIdentity = daemon!!.activeDaemonIdentity()
                     daemonIdentity?.let {
                         log("connected to daemon profile ${short(it.profileId)} instance ${short(it.daemonInstanceId)}")
                     }
 
+                    startupLog("requesting daemon identity")
                     val identity = daemon!!.identity()
                     val mainDht = identity.getString("main_dht")
+                    startupLog("daemon identity ready: main_dht=${short(mainDht)}")
+                    // Do not expose the editable/profile UI until the application layer is actually
+                    // ready. In 6.11 this was marked connected here, so a later DHT/store exception
+                    // produced a ~single-frame profile screen followed by "Connection lost".
                     _ui.value = _ui.value.copy(
-                        connected = true,
+                        connected = false,
                         mainDht = mainDht,
-                        status = "Connected; preparing profile-page DHT…"
+                        status = "VeilKnit connected; preparing Weave profile storage…"
                     )
-                    WeaveDiagnostics.event(appContext, "NETWORK_CONNECTED", "main_dht=${short(mainDht)}")
                     log("Weave account active: main_dht=$mainDht")
+                    startupLog("binding Groups v2 event store")
                     groupEventsV2.bind(daemon!!, mainDht)
                     groupEventsV2.cleanup()
-                    ensureProfileStore()
+                    startupLog("Groups v2 event store bound; starting Weave profile store setup")
+                    ensureProfileStoreWithRetry()
+                    startupLog("Weave profile store setup complete: store_id=${profileStoreId ?: "(none)"} root=${short(_ui.value.profileRoot)}")
                     groupRuntime = GroupRuntime(
                         client = daemon!!,
                         store = groups,
@@ -172,19 +194,21 @@ class SocialNetworkController(context: Context) {
                     // It runs on its own bounded workers and cannot stall normal startup.
                     groupRuntime?.recoverPendingContentV2()
                     widgetNetwork = WidgetNetworkManager(appContext, daemon!!, { _ui.value.mainDht }, ::log)
-                    subscribeGroupOpenIntake()
-                    subscribeWidgetPublicNetwork()
+                    ensureLiveSubscriptions()
                     scope.launch { runCatching { widgetNetwork?.cleanupExpiredSessions() }.onFailure { log("widget session cleanup: ${it.message}") } }
-                    val advertisedGroups = groupRuntime?.publishMyDirectory() ?: 0
+                    val advertisedGroups = runCatching { groupRuntime?.publishMyDirectory() ?: 0 }
+                        .onFailure { log("group directory publish deferred: ${it.message}") }
+                        .getOrDefault(0)
                     log("group directory ready: $advertisedGroups owned/claimed branch advertisement(s)")
                     logGroupResponsibilities("startup")
                     readOwnRecord()
-                    subscribeMessages()
                     refreshPeers()
-                    groupRuntime?.recoverCustodyV2()
-                    gossipGroups()
+                    runCatching { groupRuntime?.recoverCustodyV2() }
+                        .onFailure { log("initial custody recovery deferred: ${it.message}") }
+                    runCatching { gossipGroups() }.onFailure { log("initial group gossip deferred: ${it.message}") }
                     updateSnapshots()
-                    setStatusQuiet(healthLine())
+                    _ui.value = _ui.value.copy(connected = true, status = healthLine())
+                    WeaveDiagnostics.event(appContext, "NETWORK_CONNECTED", "main_dht=${short(mainDht)}")
                     drainInbox(force = true)
                     reconnectFailures = 0
                     reconnectDelayMs = 0L
@@ -192,6 +216,7 @@ class SocialNetworkController(context: Context) {
                     var lastPeerRefresh = 0L
                     var lastGossip = 0L
                     var lastGroupGossip = 0L
+                    var lastSubscriptionCheck = 0L
                     var lastInboxDrain = System.currentTimeMillis()
                     while (isActive) {
                         // A different daemon_instance_id means every old session token is dead.
@@ -204,17 +229,24 @@ class SocialNetworkController(context: Context) {
                         val nowMs = System.currentTimeMillis()
                         if (nowMs - lastPeerRefresh >= PEER_REFRESH_MS) {
                             refreshPeers()
-                            groupRuntime?.recoverCustodyV2()
+                            runCatching { groupRuntime?.recoverCustodyV2() }
+                                .onFailure { log("custody recovery deferred: ${it.message}") }
                             lastPeerRefresh = nowMs
                         }
                         if (nowMs - lastInboxDrain >= INBOX_DRAIN_MS) {
                             drainInbox(force = false); lastInboxDrain = nowMs
                         }
                         if (nowMs - lastGossip >= GOSSIP_INTERVAL_MS) {
-                            gossipSummary(); lastGossip = nowMs
+                            runCatching { gossipSummary() }.onFailure { log("gossip summary deferred: ${it.message}") }
+                            lastGossip = nowMs
                         }
                         if (nowMs - lastGroupGossip >= GROUP_GOSSIP_INTERVAL_MS) {
-                            gossipGroups(); lastGroupGossip = nowMs
+                            runCatching { gossipGroups() }.onFailure { log("group gossip deferred: ${it.message}") }
+                            lastGroupGossip = nowMs
+                        }
+                        if (nowMs - lastSubscriptionCheck >= 5_000L) {
+                            ensureLiveSubscriptions()
+                            lastSubscriptionCheck = nowMs
                         }
                         activeIntent?.let(::runLocalSearch)
                         updateSnapshots()
@@ -242,7 +274,7 @@ class SocialNetworkController(context: Context) {
                     )
                     log("network connection lost: $detail")
                     log("reconnect backoff: attempt=$reconnectFailures delay=${reconnectDelayMs}ms")
-                    updateStatus("Connection lost; retrying…")
+                    updateStatus(if (startupDiagnosticsCopied) "Connection lost; startup log copied to clipboard; retrying…" else "Connection lost; retrying…")
                 } finally {
                     messageSubscription?.let { id -> runCatching { daemon?.unsubscribe(id) } }
                     groupServiceSubscription?.let { id -> runCatching { daemon?.unsubscribe(id) } }
@@ -721,7 +753,17 @@ class SocialNetworkController(context: Context) {
                 blob.optString("blob_id").takeIf { it.isNotBlank() }?.let { blobId ->
                     media.recordBlob(image.contentHash, blobId, recordKey)
                 }
-                thumbnailBase64 = media.thumbnailBase64For(image.contentHash)
+                // The full image lives in its own blob. Keep the copy embedded in the Group Pulse
+                // deliberately small so several image posts can coexist without approaching the
+                // daemon's per-value DHT limit. GroupBranchNetwork additionally pages the Pulse.
+                thumbnailBase64 = media.thumbnailBase64For(image.contentHash, maxEdge = 140, quality = 55)
+                if ((thumbnailBase64?.length ?: 0) > MessagePreview.MAX_PULSE_THUMBNAIL_BASE64_CHARS) {
+                    thumbnailBase64 = media.thumbnailBase64For(image.contentHash, maxEdge = 96, quality = 45)
+                }
+                if ((thumbnailBase64?.length ?: 0) > MessagePreview.MAX_PULSE_THUMBNAIL_BASE64_CHARS) {
+                    log("group post thumbnail omitted from Pulse: encoded thumbnail remains too large")
+                    thumbnailBase64 = null
+                }
                 fullMedia += WeaveObjectRef(
                     objectId = remoteHash,
                     recordKey = recordKey,
@@ -1475,30 +1517,84 @@ class SocialNetworkController(context: Context) {
         _ui.value = _ui.value.copy(searchResults = cache.search(intent, 100).filter { it.hint.mainDht != _ui.value.mainDht })
     }
 
-    private fun ensureProfileStore() {
-        val d = daemon ?: return
+    private suspend fun ensureProfileStoreWithRetry() {
+        var lastFailure: Throwable? = null
+        repeat(5) { index ->
+            val attempt = index + 1
+            try {
+                startupLog("profile store attempt $attempt/5 begin")
+                ensureProfileStore(attempt)
+                startupLog("profile store attempt $attempt/5 succeeded")
+                return
+            } catch (failure: Throwable) {
+                lastFailure = failure
+                startupLog("profile store attempt $attempt/5 failed: ${throwableSummary(failure)}")
+                startupLog("profile store attempt $attempt/5 stack: ${stackSummary(failure)}")
+                log("profile store setup attempt $attempt/5 failed: ${failure.message}")
+                if (attempt < 5) {
+                    _ui.value = _ui.value.copy(
+                        connected = false,
+                        status = "VeilKnit connected; retrying Weave profile storage ($attempt/5)…"
+                    )
+                    val retryDelay = 750L * attempt
+                    startupLog("profile store retry delay ${retryDelay}ms")
+                    delay(retryDelay)
+                } else {
+                    startupLog("profile store exhausted 5/5 attempts; copying startup diagnostics to clipboard")
+                    copyStartupDiagnosticsToClipboard(failure)
+                }
+            }
+        }
+        throw IllegalStateException(
+            "Weave profile storage setup failed after retries: ${lastFailure?.message ?: "unknown error"}",
+            lastFailure,
+        )
+    }
+
+    private fun ensureProfileStore(attempt: Int) {
+        val d = daemon ?: error("Embedded DaemonClient is null during profile-store setup")
+        startupLog("profile store $attempt/5: list_app_stores -> begin")
         val result = d.listStores()
         val stores = result.optJSONArray("stores")
+        startupLog("profile store $attempt/5: list_app_stores -> ok; count=${stores?.length() ?: 0}")
         var found: JSONObject? = null
         if (stores != null) for (i in 0 until stores.length()) {
             val store = stores.getJSONObject(i)
-            if (store.optString("name") == PROFILE_STORE_NAME) { found = store; break }
+            val name = store.optString("name")
+            startupLog("profile store $attempt/5: existing store[$i] name=$name id=${short(store.optString("store_id"))} root=${short(store.optString("record_key"))}")
+            if (name == PROFILE_STORE_NAME) { found = store; break }
         }
-        if (found == null) found = d.createStore(PROFILE_STORE_NAME, 4).getJSONObject("store")
-        profileStoreId = found.getString("store_id")
+        if (found == null) {
+            startupLog("profile store $attempt/5: $PROFILE_STORE_NAME missing; create_app_store -> begin")
+            found = d.createStore(PROFILE_STORE_NAME, 4).getJSONObject("store")
+            startupLog("profile store $attempt/5: create_app_store -> ok")
+        } else {
+            startupLog("profile store $attempt/5: reusing existing $PROFILE_STORE_NAME")
+        }
+        val storeId = found.getString("store_id")
         val root = found.getString("record_key")
+        startupLog("profile store $attempt/5: resolved store_id=${short(storeId)} root=${short(root)}")
+        profileStoreId = storeId
         // The app root stays the profile store. Everything else, including the comment index,
         // is reached through subkeys of that record rather than by claiming the root.
+        startupLog("profile store $attempt/5: register_app_root -> begin root=${short(root)}")
         d.registerAppRoot(root)
+        startupLog("profile store $attempt/5: register_app_root -> ok")
         _ui.value = _ui.value.copy(profileRoot = root)
         log("profile store ready: $root")
 
         runCatching {
+            startupLog("profile store $attempt/5: comment network ensureStores -> begin")
             val network = CommentNetwork(d).also { commentNetwork = it }
             network.ensureStores()
-            network.publishIndexPointer(found.getString("store_id"))
+            startupLog("profile store $attempt/5: comment network ensureStores -> ok")
+            network.publishIndexPointer(storeId)
+            startupLog("profile store $attempt/5: comment index pointer publish -> ok")
             log("comment chains ready")
-        }.onFailure { log("comment chains unavailable: ${it.message}") }
+        }.onFailure {
+            startupLog("profile store $attempt/5: comment chains unavailable (non-fatal): ${throwableSummary(it)}")
+            log("comment chains unavailable: ${it.message}")
+        }
     }
 
     private fun readOwnRecord() {
@@ -1522,32 +1618,62 @@ class SocialNetworkController(context: Context) {
         }.onFailure { log("own profile read: ${it.message}") }
     }
 
+    private fun ensureLiveSubscriptions() {
+        val d = daemon ?: return
+        if (!d.subscriptionActive(groupServiceSubscription)) {
+            runCatching { subscribeGroupOpenIntake() }
+                .onFailure { log("group intake subscription deferred: ${it.message}") }
+        }
+        if (!d.subscriptionActive(widgetServiceSubscription)) {
+            runCatching { subscribeWidgetPublicNetwork() }
+                .onFailure { log("widget subscription deferred: ${it.message}") }
+        }
+        if (!d.subscriptionActive(messageSubscription)) {
+            runCatching { subscribeMessages() }
+                .onFailure { log("message subscription deferred: ${it.message}") }
+        }
+    }
+
     private fun subscribeGroupOpenIntake() {
         val runtime = groupRuntime ?: return
         groupServiceSubscription?.let { runCatching { daemon?.unsubscribe(it) } }
-        groupServiceSubscription = runtime.subscribeOpenIntake { reason ->
+        var newId = 0L
+        newId = runtime.subscribeOpenIntake { reason ->
+            if (groupServiceSubscription == newId) groupServiceSubscription = null
             log("group intake stream closed: $reason")
         }
+        groupServiceSubscription = newId
         log("subscribed to group spectator intake")
     }
 
     private fun subscribeWidgetPublicNetwork() {
         val d = daemon ?: return
         widgetServiceSubscription?.let { runCatching { d.unsubscribe(it) } }
-        widgetServiceSubscription = d.subscribeServiceRequests(
+        var newId = 0L
+        newId = d.subscribeServiceRequests(
             serviceIdsHex = listOf(WidgetNetworkManager.PUBLIC_SERVICE_ID),
             onRequest = { raw -> scope.launch { runCatching { widgetNetwork?.receivePublicServiceRequest(raw) }.onFailure { log("widget public request rejected: ${it.message}") } } },
-            onClosed = { reason -> log("widget public-network request stream closed: $reason") },
+            onClosed = { reason ->
+                if (widgetServiceSubscription == newId) widgetServiceSubscription = null
+                log("widget public-network request stream closed: $reason")
+            },
         )
+        widgetServiceSubscription = newId
         log("subscribed to public widget requests")
     }
 
     private fun subscribeMessages() {
         val d = daemon ?: return
-        messageSubscription = d.subscribeMessages(
+        messageSubscription?.let { runCatching { d.unsubscribe(it) } }
+        var newId = 0L
+        newId = d.subscribeMessages(
             onMessage = { event -> scope.launch { processIncoming(event) } },
-            onClosed = { reason -> log(reason) }
+            onClosed = { reason ->
+                if (messageSubscription == newId) messageSubscription = null
+                log(reason)
+            }
         )
+        messageSubscription = newId
         log("subscribed to application messages")
     }
 
@@ -2275,6 +2401,85 @@ class SocialNetworkController(context: Context) {
     private fun setStatusQuiet(status: String) {
         if (_ui.value.status == status) return
         _ui.value = _ui.value.copy(status = status)
+    }
+
+    private fun resetStartupTrace() {
+        synchronized(startupTrace) {
+            startupTrace.setLength(0)
+        }
+        startupDiagnosticsCopied = false
+    }
+
+    private fun startupLog(message: String) {
+        val line = "[${formatLogTime(System.currentTimeMillis())}] $message"
+        synchronized(startupTrace) {
+            startupTrace.appendLine(line)
+            if (startupTrace.length > STARTUP_TRACE_MAX_CHARS) {
+                val keep = startupTrace.takeLast(STARTUP_TRACE_MAX_CHARS / 2)
+                startupTrace.setLength(0)
+                startupTrace.appendLine("--- older startup trace omitted ---")
+                startupTrace.append(keep)
+            }
+        }
+        log("startup: $message")
+        WeaveDiagnostics.event(appContext, "STARTUP", message.replace('\n', ' ').replace('\r', ' ').take(500))
+    }
+
+    private fun throwableSummary(t: Throwable): String {
+        val parts = ArrayList<String>()
+        var current: Throwable? = t
+        var depth = 0
+        while (current != null && depth < 5) {
+            val msg = current.message.orEmpty().replace('\n', ' ').replace('\r', ' ').take(500)
+            parts += "${current::class.java.name}${if (msg.isBlank()) "" else ": $msg"}"
+            current = current.cause
+            depth++
+        }
+        return parts.joinToString(" <- caused by ")
+    }
+
+    private fun stackSummary(t: Throwable): String =
+        t.stackTrace.take(18).joinToString(" <- ") { frame ->
+            "${frame.className.substringAfterLast('.')}.${frame.methodName}:${frame.lineNumber}"
+        }
+
+    private fun startupDiagnosticReport(finalFailure: Throwable?): String = buildString {
+        appendLine("Weave embedded VeilKnit startup diagnostic")
+        appendLine("generated: ${formatLogTime(System.currentTimeMillis())}")
+        appendLine("app id: ${DaemonClient.APP_ID}")
+        appendLine("status: ${_ui.value.status}")
+        appendLine("main dht: ${_ui.value.mainDht.ifBlank { "(none)" }}")
+        appendLine("profile store id: ${profileStoreId ?: "(none)"}")
+        appendLine("profile store root: ${_ui.value.profileRoot.ifBlank { "(none)" }}")
+        finalFailure?.let {
+            appendLine("final failure: ${throwableSummary(it)}")
+            appendLine("final stack: ${stackSummary(it)}")
+        }
+        appendLine()
+        appendLine("--- focused startup trace ---")
+        synchronized(startupTrace) { append(startupTrace.toString()) }
+        appendLine()
+        appendLine("--- recent lifecycle / daemon RPC breadcrumbs ---")
+        append(WeaveDiagnostics.tail(appContext, 80_000).ifBlank { "(none)\n" })
+    }.takeLast(STARTUP_TRACE_MAX_CHARS + 90_000)
+
+    private fun copyStartupDiagnosticsToClipboard(finalFailure: Throwable?) {
+        val report = startupDiagnosticReport(finalFailure)
+        val copied = runCatching {
+            val clipboard = appContext.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            clipboard.setPrimaryClip(ClipData.newPlainText("Weave startup diagnostics", report))
+            true
+        }.getOrElse { clipboardFailure ->
+            log("startup diagnostics clipboard copy failed: ${clipboardFailure.message}")
+            false
+        }
+        startupDiagnosticsCopied = copied
+        if (copied) {
+            log("startup diagnostics copied to clipboard after profile store attempt 5/5")
+            scope.launch(Dispatchers.Main) {
+                Toast.makeText(appContext, "Weave startup log copied to clipboard", Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     /**

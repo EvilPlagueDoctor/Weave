@@ -1,0 +1,16 @@
+Weave Phase 6.11.3 startup diagnostics static validation
+
+PASS - clipboard import
+PASS - clipdata import
+PASS - toast confirmation
+PASS - five attempts
+PASS - list stores logging
+PASS - create store logging
+PASS - register root logging
+PASS - exception chain
+PASS - stack trace
+PASS - rpc breadcrumbs
+PASS - copy on final attempt
+PASS - connection banner copied
+
+Result: 12/12 checks passed

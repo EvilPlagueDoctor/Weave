@@ -1,3 +1,5 @@
+import org.gradle.api.tasks.Exec
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
@@ -10,20 +12,31 @@ android {
         applicationId = "app.weave"
         minSdk = 29
         targetSdk = 36
-        versionCode = 30
-        versionName = "0.9.5-widget-receive-events-v1"
+        versionCode = 44
+        versionName = "0.11.6-startup-tips"
+        ndk {
+            abiFilters += listOf("arm64-v8a", "x86_64")
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    buildFeatures { compose = true; aidl = true }
+    buildFeatures {
+        compose = true
+    }
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
     buildTypes {
         getByName("release") {
             // Prototype performance build: optimized runtime, but signed with the
             // normal debug key so it stays easy to install while iterating.
             isMinifyEnabled = false
             signingConfig = signingConfigs.getByName("debug")
+            ndk { debugSymbolLevel = "none" }
         }
     }
 }
@@ -38,6 +51,10 @@ dependencies {
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.10.0")
+    implementation("androidx.lifecycle:lifecycle-service:2.10.0")
+    implementation("androidx.compose.material:material-icons-extended")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation(libs.onnxruntime.android)
     debugImplementation(libs.androidx.compose.ui.tooling)
 }
@@ -46,4 +63,57 @@ androidComponents {
     onVariants(selector().all()) { variant ->
         variant.outputs.forEach { it.outputFileName.set("Weave-${variant.name}.apk") }
     }
+}
+
+// The daemon remains a normal Rust cdylib. Weave simply packages the Android build and talks to
+// it through NativeDaemonBridge instead of requiring a second APK/process.
+val rustManifest = rootProject.file("native/veilknit-daemon/Cargo.toml")
+val rustOutput = layout.projectDirectory.dir("src/main/jniLibs")
+
+fun Exec.configureCargoNdk(release: Boolean) {
+    group = "rust"
+    description = "Build the embedded VeilKnit Rust core for Android"
+    val rustRoot = rootProject.file("native/veilknit-daemon")
+    workingDir(rustRoot)
+
+    if (release) {
+        val separator = "\u001f"
+        val flags = listOf(
+            "--remap-path-prefix=${rootProject.projectDir.absolutePath}=/_/weave/android",
+            "--remap-path-prefix=${System.getProperty("user.home")}=/_/home",
+            "-C", "debuginfo=0",
+            "-C", "strip=symbols"
+        )
+        environment("CARGO_ENCODED_RUSTFLAGS", flags.joinToString(separator))
+        environment("CARGO_INCREMENTAL", "0")
+    }
+
+    val args = mutableListOf(
+        "cargo", "ndk",
+        "--platform", "29",
+        "-t", "arm64-v8a",
+        "-t", "x86_64",
+        "-o", rustOutput.asFile.absolutePath,
+        "build", "--lib"
+    )
+    if (release) args.add("--release")
+    commandLine(args)
+
+    inputs.dir(rootProject.file("native/veilknit-daemon/src"))
+    inputs.file(rustManifest)
+    outputs.dir(rustOutput)
+}
+
+val buildRustDebug = tasks.register<Exec>("buildRustDebug") {
+    configureCargoNdk(release = false)
+}
+val buildRustRelease = tasks.register<Exec>("buildRustRelease") {
+    configureCargoNdk(release = true)
+}
+
+afterEvaluate {
+    tasks.matching { it.name == "preDebugBuild" }
+        .configureEach { dependsOn(buildRustDebug) }
+    tasks.matching { it.name == "preReleaseBuild" }
+        .configureEach { dependsOn(buildRustRelease) }
 }

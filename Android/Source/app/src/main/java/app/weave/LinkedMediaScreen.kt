@@ -29,7 +29,7 @@ fun LinkedMediaScreen(
             ) {
                 TextButton(onClick = onBack) { Text("←") }
                 Text(
-                    if (type == WeaveObjectType.Audio) "Audio" else "Image",
+                    if (type == WeaveObjectType.Audio) tr("Audio") else tr("Image"),
                     style = MaterialTheme.typography.titleMedium,
                 )
             }
@@ -37,7 +37,7 @@ fun LinkedMediaScreen(
         when (type) {
             WeaveObjectType.Audio -> {
                 WeaveAudioPlayer(
-                    title = "Linked audio",
+                    title = tr("Linked audio"),
                     contentHash = sha256,
                     recordKey = recordKey,
                     media = media,
@@ -47,7 +47,7 @@ fun LinkedMediaScreen(
             }
             WeaveObjectType.Image -> LinkedImageBody(recordKey, sha256, media, controller)
             else -> Text(
-                "This media link type is not supported.",
+                tr("This media link type is not supported."),
                 modifier = Modifier.padding(16.dp),
             )
         }
@@ -77,7 +77,7 @@ private fun LinkedImageBody(
             ) { gateModifier ->
                 Image(
                     bitmap = bitmap,
-                    contentDescription = "Linked image",
+                    contentDescription = tr("Linked image"),
                     modifier = gateModifier.fillMaxWidth(),
                     contentScale = ContentScale.Fit,
                 )
@@ -100,10 +100,10 @@ private fun LinkedImageBody(
                     loading = false
                 }
             }) {
-                Text("Load image")
+                Text(tr("Load image"))
             }
             Text(
-                "The full image is fetched only when you ask for it.",
+                tr("The full image is fetched only when you ask for it."),
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 8.dp),
@@ -112,11 +112,11 @@ private fun LinkedImageBody(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                 Spacer(Modifier.width(8.dp))
-                Text("Loading image…")
+                Text(tr("Loading image…"))
             }
         } else {
             Text(
-                error ?: "Image unavailable.",
+                error?.let { tr(it) } ?: tr("Image unavailable."),
                 color = MaterialTheme.colorScheme.error,
             )
         }

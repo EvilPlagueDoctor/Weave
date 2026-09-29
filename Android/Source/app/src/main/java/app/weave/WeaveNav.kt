@@ -45,6 +45,10 @@ sealed interface Destination {
     data class QuickEdit(val pageIndex: Int) : Destination
     data object Editor : Destination
     data object Settings : Destination
+    /** Hidden full VeilKnit diagnostics/management surface. */
+    data object VeilKnit : Destination
+    /** Normal Settings shortcut directly to VeilKnit's encrypted account-backup page. */
+    data object VeilKnitBackup : Destination
 
     data class Group(val groupId: String) : Destination
     data class GroupPost(val groupId: String, val conversationId: String) : Destination
@@ -60,6 +64,8 @@ private fun Destination.encode(): String = when (this) {
     Destination.Activity -> "activity"
     Destination.Editor -> "editor"
     Destination.Settings -> "settings"
+    Destination.VeilKnit -> "veilknit"
+    Destination.VeilKnitBackup -> "veilknit-backup"
     Destination.GroupModeration -> "group-moderation"
     is Destination.Profile -> "profile\u0000$mainDht"
     is Destination.QuickEdit -> "quickedit\u0000$pageIndex"
@@ -76,6 +82,8 @@ private fun decodeDestination(raw: String): Destination = when {
     raw == "activity" -> Destination.Activity
     raw == "editor" -> Destination.Editor
     raw == "settings" -> Destination.Settings
+    raw == "veilknit" -> Destination.VeilKnit
+    raw == "veilknit-backup" -> Destination.VeilKnitBackup
     raw == "group-moderation" -> Destination.GroupModeration
     raw.startsWith("profile\u0000") -> Destination.Profile(raw.substringAfter('\u0000'))
     raw.startsWith("quickedit\u0000") ->

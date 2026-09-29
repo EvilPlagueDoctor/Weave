@@ -33,6 +33,60 @@ private const val DIAGNOSTIC_CLIPBOARD_MAX_CHARS = 200_000
 private const val DIAGNOSTIC_CLIPBOARD_HEAD_CHARS = 24_000
 private const val DIAGNOSTIC_CLIPBOARD_FALLBACK_CHARS = 60_000
 
+
+// Startup trivia is intentionally random for now.
+// TODO(startup-tips): weight/contextualize tips later (unpublished profile, missing backup,
+// first Advanced-editor visit, etc.) instead of using a uniform random pool.
+private val EMBEDDED_STARTUP_TIPS = listOf(
+    "Don't forget to publish your profile!",
+    "Your profile stays unpublished until you choose to publish it.",
+    "You can switch between Basic and Advanced profile editing at any time.",
+    "Advanced profiles can use multiple pages.",
+    "Use Pages & Layers to change which elements appear in front.",
+    "Long-press a page or layer to move it.",
+    "Your profile can include images, audio, widgets, links, and more.",
+    "Widgets only load when you choose to open them.",
+    "You can disable widget loading in Settings.",
+    "External links show a warning before opening your browser.",
+    "Images are filtered locally on your device according to your settings.",
+    "Content filtering does not require uploading your images to a moderation server.",
+    "You can adjust content-filter sensitivity in Settings.",
+    "Group moderation is branch-based — you can choose which moderation branch you follow.",
+    "If a group's original moderator disappears, another user can claim a moderation branch.",
+    "Tap a group's Original/Claim label to switch moderation branches.",
+    "Posts can contain images and audio.",
+    "Full-size media is only fetched when you open it.",
+    "Comments on your profile can take a little while to arrive.",
+    "Weave has no private-message system — conversations are meant to stay visible.",
+    "Search can discover people, groups, and related content.",
+    "Your device helps carry public network information for other users.",
+    "Custody helps keep group submissions alive while moderators are offline.",
+    "Your account can be backed up from Settings → This identity.",
+    "Make an account backup before moving to a new device.",
+    "Your Weave identity is tied to your VeilKnit account.",
+    "You can copy group links and share them directly.",
+    "A group can have several moderation branches without changing the original group.",
+    "Profile comments can be kept or rejected by the profile owner.",
+    "You can unpublish your profile later from Settings.",
+    "The Advanced editor remembers whether you left its sidebar open or closed.",
+    "Use Undo if you move or resize something by accident.",
+    "Profile pages are ordered — Previous and Next follow the order shown in Pages & Layers.",
+    "Not everything has to be serious. Make your profile weird.",
+    "Old-school profile customization is encouraged.",
+    "Your profile does not have to look like everyone else's.",
+    "Try making more than one profile page.",
+    "A quiet network is still a network — discovery improves as more peers come online.",
+    "Yes, you can make your profile ugly on purpose.",
+    "Please do not teach the widgets to become sentient.",
+    "Moderation branches: because apparently one argument wasn't enough.",
+)
+
+private fun nextStartupTipIndex(current: Int): Int {
+    if (EMBEDDED_STARTUP_TIPS.size <= 1) return 0
+    val candidate = kotlin.random.Random.nextInt(EMBEDDED_STARTUP_TIPS.size - 1)
+    return if (candidate >= current) candidate + 1 else candidate
+}
+
 /**
  * Android transports clipboard contents through Binder. Large diagnostic reports can exceed the
  * process-wide Binder transaction buffer and crash ClipboardManager.setPrimaryClip(). Preserve the
@@ -125,12 +179,18 @@ class OnboardingState(context: Context) : PrivateVault.Participant {
 }
 
 /**
- * Shown while the daemon connection is being established. The daemon takes roughly 90
- * seconds from cold launch to READY, so this screen exists to be honest about waiting
- * rather than to hide it.
+ * Shown while VeilKnit or Weave is establishing network state.  The embedded daemon feeds
+ * its own startup status here, so a cold start reports the real operation (Veilid attach,
+ * DHT restore/create, mailbox setup, and application service startup) rather than looking
+ * like Weave is waiting on some separate application.
  */
 @Composable
-fun ConnectionGate(status: String, error: String?, onRetry: () -> Unit) {
+fun ConnectionGate(
+    status: String,
+    error: String?,
+    onRetry: () -> Unit,
+    embeddedDaemonStartup: Boolean = false,
+) {
     Column(
         Modifier.fillMaxSize().safeDrawingPadding().padding(32.dp),
         verticalArrangement = Arrangement.Center,
@@ -139,17 +199,35 @@ fun ConnectionGate(status: String, error: String?, onRetry: () -> Unit) {
         Text(tr("Weave"), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(20.dp))
         if (error == null) {
+            var startupTipIndex by remember {
+                mutableIntStateOf(kotlin.random.Random.nextInt(EMBEDDED_STARTUP_TIPS.size))
+            }
+            LaunchedEffect(embeddedDaemonStartup) {
+                if (!embeddedDaemonStartup) return@LaunchedEffect
+                while (true) {
+                    delay(4_000L)
+                    startupTipIndex = nextStartupTipIndex(startupTipIndex)
+                }
+            }
+
             CircularProgressIndicator()
             Spacer(Modifier.height(20.dp))
             Text(status, style = MaterialTheme.typography.bodyMedium)
             Text(
-                tr("Connecting to the VeilKnit daemon. A cold start takes a minute or two while the node finds peers."),
+                if (embeddedDaemonStartup)
+                    tr(EMBEDDED_STARTUP_TIPS[startupTipIndex])
+                else
+                    tr("Connecting to VeilKnit. A cold start can take a little while as the node restores state and finds peers."),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 10.dp)
             )
         } else {
-            Text(tr("Can't reach the daemon"), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text(
+                tr(if (embeddedDaemonStartup) "VeilKnit startup needs attention" else "Can't reach VeilKnit"),
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold
+            )
             Text(
                 error,
                 style = MaterialTheme.typography.bodySmall,
@@ -681,6 +759,7 @@ fun SettingsScreen(
     activityCount: Int,
     onActivity: () -> Unit,
     onClaimGroupLink: (String, (String) -> Unit) -> Unit,
+    onSetupAccountBackup: () -> Unit,
     onBack: () -> Unit,
 ) {
     val ui by controller.ui.collectAsState()
@@ -694,6 +773,7 @@ fun SettingsScreen(
     var confirmUnpublish by remember { mutableStateOf(false) }
     var claimGroupLink by remember { mutableStateOf("") }
     var claimGroupStatus by remember { mutableStateOf("") }
+    var claimGroupBusy by remember { mutableStateOf(false) }
     var claimConfirmation by remember { mutableStateOf<String?>(null) }
     // Reset the confirmation shortly after it appears, so a stale "Copied" does not imply
     // the clipboard still holds a report from ten minutes ago.
@@ -711,7 +791,7 @@ fun SettingsScreen(
         Column(Modifier.fillMaxSize().verticalScroll(scroll).padding(16.dp)) {
             Text(tr("Activity"), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
             Text(
-                "Review profile comments and profile activity that needs your attention.",
+                tr("Review profile comments and profile activity that needs your attention."),
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 4.dp),
@@ -777,6 +857,18 @@ fun SettingsScreen(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 12.dp)
             )
+            OutlinedButton(
+                onClick = onSetupAccountBackup,
+                modifier = Modifier.padding(top = 10.dp),
+            ) {
+                Text(tr("Setup account backup"))
+            }
+            Text(
+                tr("Create an encrypted VeilKnit identity backup and optional network recovery copy."),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+            )
 
             HorizontalDivider(Modifier.padding(vertical = 16.dp))
             Text(tr("Discovery"), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
@@ -794,9 +886,9 @@ fun SettingsScreen(
                 minLines = 2,
             )
             HorizontalDivider(Modifier.padding(vertical = 16.dp))
-            Text("Groups", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+            Text(tr("Groups"), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
             Text(
-                "Claim moderation of a public group by pasting its Weave group link. Claiming creates your own moderation branch; it does not fork the group.",
+                tr("Claim moderation of a public group by pasting its Weave group link. Claiming creates your own moderation branch; it does not fork the group."),
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 4.dp),
@@ -808,12 +900,16 @@ fun SettingsScreen(
                     claimGroupStatus = ""
                 },
                 modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
-                label = { Text("Weave group link") },
+                label = { Text(tr("Weave group link")) },
                 singleLine = true,
             )
             Button(
                 onClick = {
+                    if (claimGroupBusy) return@Button
+                    claimGroupBusy = true
+                    claimGroupStatus = ""
                     onClaimGroupLink(claimGroupLink) { result ->
+                        claimGroupBusy = false
                         if (result.startsWith("Group is now claimed")) {
                             claimGroupStatus = ""
                             claimConfirmation = result
@@ -822,9 +918,25 @@ fun SettingsScreen(
                         }
                     }
                 },
-                enabled = GroupLink.parse(claimGroupLink) != null,
+                enabled = !claimGroupBusy && GroupLink.parse(claimGroupLink) != null,
+                colors = ButtonDefaults.buttonColors(
+                    disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                    disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                ),
                 modifier = Modifier.padding(top = 8.dp),
-            ) { Text("Claim moderation of group") }
+            ) {
+                if (claimGroupBusy) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(tr("Claiming…"))
+                } else {
+                    Text(tr("Claim moderation of group"))
+                }
+            }
             if (claimGroupStatus.isNotBlank()) {
                 Text(
                     claimGroupStatus,
@@ -975,10 +1087,10 @@ fun SettingsScreen(
     claimConfirmation?.let { message ->
         AlertDialog(
             onDismissRequest = { claimConfirmation = null },
-            title = { Text("Group claimed") },
+            title = { Text(tr("Group claimed")) },
             text = { Text(message) },
             confirmButton = {
-                TextButton(onClick = { claimConfirmation = null }) { Text("OK") }
+                TextButton(onClick = { claimConfirmation = null }) { Text(tr("OK")) }
             },
         )
     }

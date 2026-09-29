@@ -1,0 +1,19 @@
+Weave Phase 6.12.2 static validation
+
+PASS 1  Sidebar default is collapsed when no saved UI preference exists.
+PASS 2  Sidebar collapsed/open state writes to SharedPreferences.
+PASS 3  Collapsed expansion tab uses bright red surface.
+PASS 4  Expanded collapse strip uses pale red surface.
+PASS 5  Expanded collapse arrow is centered.
+PASS 6  Visible Depth section removed from PropertiesPanel.
+PASS 7  Page long-press reorder path implemented.
+PASS 8  Page reorder preserves current page by ID and recalculates pageIndex.
+PASS 9  Layer long-press reorder path implemented.
+PASS 10 Layer reorder updates actual zIndex order.
+PASS 11 Add is a collapsible section.
+PASS 12 Foreground add controls are vertical/full-width.
+PASS 13 section_add localized EN/FR/ES/RU/ZH-CN.
+PASS 14 All strings.xml files parse as XML.
+PASS 15 versionCode/versionName bumped to 40 / 0.11.2-editor-sidebar-layers.
+
+Full Gradle compile could not be run in this environment because Gradle 9.4.1 is not cached and the sandbox cannot reach services.gradle.org.
