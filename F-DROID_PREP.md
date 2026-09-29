@@ -56,12 +56,13 @@ Current sources:
 1. `OwenElliott/image-safety-classifier-xs`
    - file: `onnx/image-safety-classifier-xs.onnx`
    - declared upstream license: MIT
-   - current known SHA-256: `8c28c49d9075f3ad15ebdc2961f02d5b3f99be944815b848b49c9f0e6f3fb689`
+   - the current download script follows the upstream `main` branch; the exact immutable revision and file hash still need to be recorded before an F-Droid build recipe downloads it
 
 2. `minuva/MiniLMv2-toxic-jigsaw-onnx`
    - file: `model_optimized_quantized.onnx`
    - declared upstream license: Apache-2.0
-   - SHA-256 already verified by Weave: `bcd9dfb48cad802ac8f7cd789e1294f1f0b22d532797bd41f5a11694e3c269a0`
+   - upstream immutable revision observed during this audit: `e5467ab824e6f5f04bee4f28139be118e1775b42`
+   - SHA-256 already verified by Weave and published upstream: `bcd9dfb48cad802ac8f7cd789e1294f1f0b22d532797bd41f5a11694e3c269a0`
    - `vocab.txt` comes from the same upstream model repository.
 
 Before F-Droid submission, the model downloader should use immutable upstream revisions and verify every downloaded artifact, including the image model and vocabulary file. The F-Droid build recipe can then fetch the exact approved FLOSS assets deterministically, or the F-Droid build can omit the optional models if preferred.
