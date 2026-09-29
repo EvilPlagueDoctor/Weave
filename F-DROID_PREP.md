@@ -25,20 +25,25 @@ The VeilKnit daemon/core is included as Rust source under:
 
 The app's Gradle build invokes `cargo ndk` and builds the Rust core as a `cdylib` for Android before packaging it in the APK.
 
-Normal release build entry point:
+Normal prototype release build:
 
 ```sh
 cd Android/Source
 ./build_project.sh
 ```
 
-The underlying Gradle task is:
+This preserves the existing convenient debug-signed optimized APK workflow.
+
+F-Droid/unsigned release build:
 
 ```sh
-./gradlew :app:assembleRelease
+cd Android/Source
+./gradlew -PweaveFdroidBuild=true :app:assembleRelease
 ```
 
-The build currently requires JDK 17+, Android SDK/NDK, Rust/rustup, and `cargo-ndk`.
+When `weaveFdroidBuild=true`, Gradle leaves the release APK unsigned so F-Droid can apply its own signing key. F-Droid metadata can pass this property with `gradleprops`.
+
+The build requires JDK 17+, Android SDK/NDK, Rust/rustup, and `cargo-ndk`.
 
 ## Dependency/repository notes
 
@@ -79,6 +84,7 @@ The Linux/macOS and Windows model downloaders now use those immutable revisions.
 - [x] Pin the toxicity ONNX download to an immutable revision and verify its SHA-256.
 - [x] Pin `vocab.txt` to the same immutable toxicity-model revision.
 - [x] Keep large optional model binaries out of Git.
+- [x] Add `-PweaveFdroidBuild=true` to produce an unsigned release without changing the existing prototype release workflow.
 
 ## Remaining work
 
@@ -90,19 +96,22 @@ Run the updated model downloader once on a clean machine, record the resulting `
 
 The current lockfile already resolves Veilid to the same exact commit, so runtime source does not change. A clean `cargo` resolution should refresh its source notation from the old branch-qualified URL to the new `rev`-qualified URL; commit that generated lockfile rather than hand-editing it.
 
-### 3. Release signing configuration
-
-The current Gradle `release` build explicitly uses the debug signing configuration. That is convenient for prototype builds, but the F-Droid build path should not depend on a developer debug key. Preserve the convenient prototype workflow while providing an unsigned/F-Droid release path.
-
-### 4. Clean Linux build test
+### 3. Clean Linux build test
 
 Test from a fresh clone with JDK 17+, Android SDK/NDK, Rust and cargo-ndk. Confirm that both the Gradle/Kotlin app and embedded Rust daemon build without relying on local/generated files.
 
-### 5. Create a tagged Weave release
+Test both paths:
+
+```sh
+./build_project.sh
+./gradlew -PweaveFdroidBuild=true :app:assembleRelease
+```
+
+### 4. Create a tagged Weave release
 
 Once the build path is settled, bump `versionCode`/`versionName` if needed and create an immutable Git tag for the version submitted to F-Droid.
 
-### 6. F-Droid metadata
+### 5. F-Droid metadata
 
 Create/test an `fdroiddata` recipe for package `app.weave` with:
 
@@ -110,9 +119,10 @@ Create/test an `fdroiddata` recipe for package `app.weave` with:
 - `RepoType: git`
 - `Repo: https://github.com/EvilPlagueDoctor/Weave.git`
 - `subdir: Android/Source`
-- the appropriate Gradle variant
+- `gradle: yes`
+- `gradleprops: [weaveFdroidBuild=true]`
 - Rust/cargo-ndk preparation commands as needed
-- exact Weave commit/tag
+- exact Weave commit hash (F-Droid build metadata should use the full commit hash)
 - deterministic preparation for the optional model assets if they are included in the F-Droid APK
 
 ## Likely F-Droid-friendly items already in place
@@ -129,8 +139,7 @@ Create/test an `fdroiddata` recipe for package `app.weave` with:
 ## Suggested order from here
 
 1. Record the `vocab.txt` hash and refresh `Cargo.lock` during the next clean local build.
-2. Add a dedicated F-Droid/unsigned release build path without breaking prototype installs.
-3. Test a fresh Linux build.
-4. Tag the release.
-5. Write/test the official `fdroiddata` recipe.
-6. Submit the App Inclusion merge request to F-Droid.
+2. Test both prototype and F-Droid release paths from a fresh Linux clone.
+3. Tag the release.
+4. Write/test the official `fdroiddata` recipe.
+5. Submit the App Inclusion merge request to F-Droid.
