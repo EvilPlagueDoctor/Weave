@@ -4,6 +4,9 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Target = Join-Path $Root 'app\src\main\assets\content_filter'
 New-Item -ItemType Directory -Force -Path $Target | Out-Null
 
+$ImageRev = '606ad3dfd6a023215e3ab0797040437cc365977b'
+$ToxicRev = 'edeaa44a3eed98842d1139619bfb5dc55fafcfad'
+
 function Download-Model([string]$Name, [string]$Url, [string]$Sha256 = '') {
     $Out = Join-Path $Target $Name
     $Tmp = "$Out.download"
@@ -26,16 +29,19 @@ function Download-Model([string]$Name, [string]$Url, [string]$Sha256 = '') {
 
 Download-Model `
     'image_safety_xs.onnx' `
-    'https://huggingface.co/OwenElliott/image-safety-classifier-xs/resolve/main/onnx/image-safety-classifier-xs.onnx?download=true'
+    "https://huggingface.co/OwenElliott/image-safety-classifier-xs/resolve/$ImageRev/onnx/image-safety-classifier-xs.onnx?download=true" `
+    '8c28c49d9075f3ad15ebdc2961f02d5b3f99be944815b848b49c9f0e6f3fb689'
 
 Download-Model `
     'toxic_minilm_int8.onnx' `
-    'https://huggingface.co/minuva/MiniLMv2-toxic-jigsaw-onnx/resolve/main/model_optimized_quantized.onnx?download=true' `
+    "https://huggingface.co/minuva/MiniLMv2-toxic-jigsaw-onnx/resolve/$ToxicRev/model_optimized_quantized.onnx?download=true" `
     'bcd9dfb48cad802ac8f7cd789e1294f1f0b22d532797bd41f5a11694e3c269a0'
 
+# vocab.txt comes from the same immutable toxicity-model revision. An
+# independent hash can be added once recorded from a clean local download.
 Download-Model `
     'vocab.txt' `
-    'https://huggingface.co/minuva/MiniLMv2-toxic-jigsaw-onnx/resolve/main/vocab.txt?download=true'
+    "https://huggingface.co/minuva/MiniLMv2-toxic-jigsaw-onnx/resolve/$ToxicRev/vocab.txt?download=true"
 
 Write-Host ''
-Write-Host 'Content-filter models installed. You can now build Weave normally.'
+Write-Host 'Content-filter models installed and pinned to immutable upstream revisions.'
