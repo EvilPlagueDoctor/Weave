@@ -15,6 +15,7 @@ val weaveFdroidBuild = providers.gradleProperty("weaveFdroidBuild")
 android {
     namespace = "app.weave"
     compileSdk { version = release(36) { minorApiLevel = 1 } }
+    ndkVersion = "28.2.13676358"
     defaultConfig {
         applicationId = "app.weave"
         minSdk = 29
@@ -31,6 +32,12 @@ android {
     }
     buildFeatures {
         compose = true
+    }
+    // Do not embed AGP's encrypted dependency metadata in distributable APKs/bundles.
+    // F-Droid builds and reviews dependencies from source instead.
+    dependenciesInfo {
+        includeInApk = false
+        includeInBundle = false
     }
     packaging {
         jniLibs {
