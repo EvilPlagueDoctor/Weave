@@ -76,6 +76,27 @@ androidComponents {
     }
 }
 
+// Release builds are intended for end users, so do not silently produce one with
+// non-functional content filtering. Debug builds remain model-optional.
+val requiredReleaseModelAssets = listOf(
+    "src/main/assets/content_filter/image_safety_xs.onnx",
+    "src/main/assets/content_filter/toxic_minilm_int8.onnx",
+    "src/main/assets/content_filter/vocab.txt",
+)
+val verifyReleaseContentFilterModels = tasks.register("verifyReleaseContentFilterModels") {
+    group = "verification"
+    description = "Require the local content-filter models for release APKs"
+    doLast {
+        val missing = requiredReleaseModelAssets.filter { !layout.projectDirectory.file(it).asFile.isFile }
+        check(missing.isEmpty()) {
+            "Release build is missing required content-filter assets:\n" +
+                missing.joinToString(separator = "\n") { "  - $it" } +
+                "\nRun ./download_content_filter_models.sh (Linux/macOS) or " +
+                "download_content_filter_models.bat (Windows) before building a release."
+        }
+    }
+}
+
 // The daemon remains a normal Rust cdylib. Weave simply packages the Android build and talks to
 // it through NativeDaemonBridge instead of requiring a second APK/process.
 val rustManifest = rootProject.file("native/veilknit-daemon/Cargo.toml")
@@ -126,5 +147,5 @@ afterEvaluate {
     tasks.matching { it.name == "preDebugBuild" }
         .configureEach { dependsOn(buildRustDebug) }
     tasks.matching { it.name == "preReleaseBuild" }
-        .configureEach { dependsOn(buildRustRelease) }
+        .configureEach { dependsOn(buildRustRelease, verifyReleaseContentFilterModels) }
 }
