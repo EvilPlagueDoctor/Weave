@@ -37,11 +37,10 @@ Download-Model `
     "https://huggingface.co/minuva/MiniLMv2-toxic-jigsaw-onnx/resolve/$ToxicRev/model_optimized_quantized.onnx?download=true" `
     'bcd9dfb48cad802ac8f7cd789e1294f1f0b22d532797bd41f5a11694e3c269a0'
 
-# vocab.txt comes from the same immutable toxicity-model revision. An
-# independent hash can be added once recorded from a clean local download.
 Download-Model `
     'vocab.txt' `
-    "https://huggingface.co/minuva/MiniLMv2-toxic-jigsaw-onnx/resolve/$ToxicRev/vocab.txt?download=true"
+    "https://huggingface.co/minuva/MiniLMv2-toxic-jigsaw-onnx/resolve/$ToxicRev/vocab.txt?download=true" `
+    '07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3'
 
 Write-Host ''
 Write-Host 'Content-filter models installed and pinned to immutable upstream revisions.'
