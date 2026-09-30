@@ -41,10 +41,8 @@ download toxic_minilm_int8.onnx \
   "https://huggingface.co/minuva/MiniLMv2-toxic-jigsaw-onnx/resolve/$TOXIC_REV/model_optimized_quantized.onnx?download=true" \
   'bcd9dfb48cad802ac8f7cd789e1294f1f0b22d532797bd41f5a11694e3c269a0'
 
-# This file is small and comes from the same immutable upstream revision as the
-# toxicity model. Add an independent hash here once it has been recorded from a
-# clean download; the immutable revision already prevents silent upstream drift.
 download vocab.txt \
-  "https://huggingface.co/minuva/MiniLMv2-toxic-jigsaw-onnx/resolve/$TOXIC_REV/vocab.txt?download=true"
+  "https://huggingface.co/minuva/MiniLMv2-toxic-jigsaw-onnx/resolve/$TOXIC_REV/vocab.txt?download=true" \
+  '07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3'
 
 echo 'Content-filter models installed and pinned to immutable upstream revisions.'
