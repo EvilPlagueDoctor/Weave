@@ -1,0 +1,8 @@
+Initial F-Droid release candidate.
+
+• Embedded VeilKnit networking inside Weave.
+• Startup tips while the network initializes.
+• Customizable profile pages and advanced editor.
+• Groups, posts, comments, Snapshot, search, and moderation branches.
+• Local image/text content filtering.
+• Sandboxed on-demand widgets.
