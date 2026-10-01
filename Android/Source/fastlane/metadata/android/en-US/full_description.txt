@@ -6,7 +6,7 @@ Features include:
 
 • Custom profile pages with backgrounds, foreground elements, text, images, audio, links, and widgets.
 • Search and discovery for people and shared content.
-• Groups with posts, comments, avatars, media, and Snapshot views of active conversations.
+• Groups with posts, comments, media, and Snapshot views of active conversations.
 • Moderation branches so users can choose which moderation view to follow, with support for moderation claiming and continuity.
 • Local on-device content filtering for supported image and text categories.
 • Sandboxed widgets that are loaded on demand and compiled locally from visible source.
