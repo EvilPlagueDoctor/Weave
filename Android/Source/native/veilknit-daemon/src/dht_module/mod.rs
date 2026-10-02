@@ -1722,7 +1722,7 @@ async fn open_one_snapshot_record_with_timeout(
 
     let opened = match timeout(
         operation_timeout,
-        rc.open_dht_record(record.record_key.clone(), None),
+        rc.open_dht_record(record.record_key.clone(), None, None),
     )
     .await
     {
@@ -2036,7 +2036,7 @@ async fn read_foreign_subkey_once(
     );
     let _ = timeout(
         DHT_SINGLE_OPERATION_TIMEOUT,
-        rc.open_dht_record(record_key.clone(), None),
+        rc.open_dht_record(record_key.clone(), None, None),
     )
     .await
     .map_err(|_| CreateDhtError::OperationTimedOut("open foreign DHT".to_string()))?
@@ -2120,7 +2120,7 @@ async fn read_all_foreign_dht_once(
 
     let descriptor = timeout(
         DHT_SINGLE_OPERATION_TIMEOUT,
-        rc.open_dht_record(record_key.clone(), None),
+        rc.open_dht_record(record_key.clone(), None, None),
     )
     .await
     .map_err(|_| CreateDhtError::OperationTimedOut("open foreign DHT".to_string()))?
@@ -2189,7 +2189,7 @@ async fn read_foreign_subkeys_once(
     );
     let descriptor = timeout(
         DHT_SINGLE_OPERATION_TIMEOUT,
-        rc.open_dht_record(record_key.clone(), None),
+        rc.open_dht_record(record_key.clone(), None, None),
     )
     .await
     .map_err(|_| CreateDhtError::OperationTimedOut("open foreign DHT".to_string()))?
