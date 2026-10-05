@@ -48,7 +48,14 @@ android {
         getByName("release") {
             // Prototype performance builds stay easy to install while iterating.
             // F-Droid builds deliberately omit the local signing configuration.
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isSrinkResources = true
+
+	    proguardFiles(
+	        getDefaultProguardFile("proguard-android-optimize.txt"),
+	        "proguard-rules.pro"
+	    )
+
             if (!weaveFdroidBuild.get()) {
                 signingConfig = signingConfigs.getByName("debug")
             } else {
