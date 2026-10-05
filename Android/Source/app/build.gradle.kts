@@ -49,7 +49,7 @@ android {
             // Prototype performance builds stay easy to install while iterating.
             // F-Droid builds deliberately omit the local signing configuration.
             isMinifyEnabled = true
-            isSrinkResources = true
+            isShrinkResources = true
 
 	    proguardFiles(
 	        getDefaultProguardFile("proguard-android-optimize.txt"),
