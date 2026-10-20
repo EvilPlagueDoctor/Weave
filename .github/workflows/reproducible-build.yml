@@ -1,0 +1,126 @@
+name: Reproducible Android Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_ref:
+        description: "Tag or commit to build"
+        required: true
+        default: "v0.11.6-startup-tips"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout release
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_ref }}
+          fetch-depth: 0
+
+      - name: Show release commit
+        run: |
+          echo "Building:"
+          git rev-parse HEAD
+          git describe --tags --always
+
+      - name: Reject tracked build artifacts
+        shell: bash
+        run: |
+          set -e
+
+          if git ls-files | grep -E '(^|/)target/'; then
+            echo
+            echo "ERROR: Rust target/ files are tracked by Git."
+            exit 1
+          fi
+
+          echo "No Rust target/ files are tracked."
+
+          rm -rf Android/Source/native/veilknit-daemon/target
+          rm -rf Android/Source/app/build
+
+      - name: Show disk space
+        run: df -h
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libc-dev
+
+      - name: Install Android SDK components
+        shell: bash
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+
+          "$SDKMANAGER" \
+            "platform-tools" \
+            "platforms;android-36.1" \
+            "build-tools;36.1.0" \
+            "build-tools;34.0.0" \
+            "ndk;28.2.13676358"
+
+      - name: Set up Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+
+          rustup target add \
+            --toolchain 1.97.1 \
+            aarch64-linux-android \
+            x86_64-linux-android
+
+          cargo install cargo-ndk@4.1.2 --locked
+
+          rustc --version
+          cargo --version
+          cargo ndk --version
+
+      - name: Fetch Rust dependencies
+        working-directory: Android/Source/native/veilknit-daemon
+        run: cargo fetch --locked
+
+      - name: Enable Gradle wrapper
+        run: chmod +x Android/Source/gradlew
+
+      - name: Build unsigned release APK
+        working-directory: Android/Source
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: |
+          ./gradlew --no-daemon \
+            -PweaveFdroidBuild=true \
+            clean :app:assembleRelease
+
+      - name: Collect APK
+        shell: bash
+        run: |
+          mkdir -p artifact
+
+          cp \
+            Android/Source/app/build/outputs/apk/release/Weave-release.apk \
+            artifact/Weave-${{ inputs.release_ref }}-unsigned.apk
+
+          sha256sum artifact/*.apk | tee artifact/SHA256SUMS.txt
+
+          ls -lh artifact/
+          df -h
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: weave-reproducible-build
+          path: artifact/
+          retention-days: 14
