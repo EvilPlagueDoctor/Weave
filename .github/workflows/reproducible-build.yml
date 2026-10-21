@@ -71,6 +71,23 @@ jobs:
             "build-tools;34.0.0" \
             "ndk;28.2.13676358"
 
+      - name: Pin Android NDK r28c
+        shell: bash
+        run: |
+          NDK="$ANDROID_HOME/ndk/28.2.13676358"
+
+          if [ ! -d "$NDK" ]; then
+            echo "ERROR: Expected NDK not found at $NDK"
+            exit 1
+          fi
+
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$NDK" >> "$GITHUB_ENV"
+
+          echo "Using NDK:"
+          cat "$NDK/source.properties"
+
       - name: Set up Rust
         shell: bash
         run: |
@@ -100,6 +117,9 @@ jobs:
         env:
           CARGO_INCREMENTAL: "0"
         run: |
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          grep '^Pkg.Revision' "$ANDROID_NDK_HOME/source.properties"
+
           ./gradlew --no-daemon \
             -PweaveFdroidBuild=true \
             clean :app:assembleRelease
