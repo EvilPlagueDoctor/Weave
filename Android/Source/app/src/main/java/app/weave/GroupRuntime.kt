@@ -21,6 +21,12 @@ import java.util.concurrent.atomic.AtomicLong
  *   - branch DHTs are authoritative moderated views;
  *   - direct/mailbox/ServiceRequest traffic is only delivery/intake.
  */
+data class GroupRawCommentUi(
+    val eventId: String,
+    val message: WeaveMessage,
+    val authorBound: Boolean,
+)
+
 class GroupRuntime(
     private val client: DaemonClient,
     private val store: GroupStore,
@@ -40,6 +46,9 @@ class GroupRuntime(
     private val closed = AtomicBoolean(false)
     private val sessionMainDht = ownMainDht()
     private val outboundRecoveryRequests = ConcurrentHashMap<String, OutboundCustodyRecoveryV2>()
+    // Prevent an unbounded number of delayed escalation tasks from retaining
+    // event payloads when a device is posting heavily or the network is offline.
+    private val custodyEscalationScheduled = ConcurrentHashMap.newKeySet<String>()
     private val lastCustodyRecoveryStartedAt = AtomicLong(0L)
     private val abuseGuardV2 = GroupAbuseGuardV2(logger)
     private val custodyPool = ThreadPoolExecutor(
@@ -512,6 +521,7 @@ class GroupRuntime(
                     states.any { it == GroupBranchEventStateV2.Accepted } -> "Accepted by a moderation branch"
                     states.any { it == GroupBranchEventStateV2.Rejected } -> "Rejected by a moderation branch"
                     stored.evidence.keys.any { it == GroupEventTransportV2.CustodyGossip || it == GroupEventTransportV2.CustodyRecovery } -> "Held by a curator"
+                    stored.evidence.containsKey(GroupEventTransportV2.LegacyBridge) -> "Retained signed submission · awaiting moderation"
                     else -> "Retained submission"
                 }
                 GroupCuratorPost(
@@ -519,12 +529,39 @@ class GroupRuntime(
                     conversationId = postConversationId(stored.event.payload.objectId),
                     authorMainDht = stored.event.authorMainDht,
                     createdAt = stored.event.createdAt,
-                    status = status,
-                    message = if (stored.contentState == GroupEventContentStateV2.HashMismatch) null
-                    else content.fetch(stored.event.payload.toWeaveRef()),
+                    status = status + if (stored.authorBinding == GroupEventAuthorBindingV2.RemoteUnbound) " · author identity not bound" else "",
+                    message = if (stored.contentState != GroupEventContentStateV2.Valid) null
+                    else content.fetch(stored.event.payload.toWeaveRef())?.takeIf {
+                        groupV2MessageHash(it).equals(stored.event.contentHashHex, ignoreCase = true)
+                    },
                 )
             }
             .toList()
+    }
+
+    /**
+     * Opt-in raw/public comment view; not the accepted moderation branch.
+     * Refuse unverifiable content even if its envelope was gossiped successfully.
+     */
+    fun rawComments(groupId: String, conversationId: String, limit: Int = 24): List<GroupRawCommentUi> {
+        if (store.byId(groupId)?.policy?.visibility != GroupVisibility.Public) return emptyList()
+        val now = System.currentTimeMillis()
+        return eventStoreV2?.eventsForGroup(groupId).orEmpty()
+            .asSequence()
+            .filter { it.event.eventType == GroupEventTypeV2.CommentSubmitted }
+            .filter { it.event.payload.parentObjectId == conversationId && it.event.expiresAt > now }
+            .filter { it.validation == GroupEventValidationV2.Valid && it.contentState == GroupEventContentStateV2.Valid }
+            .sortedByDescending { it.event.createdAt }
+            .take(limit.coerceIn(1, 60))
+            .mapNotNull { row ->
+                val message = content.fetch(row.event.payload.toWeaveRef()) ?: return@mapNotNull null
+                if (!groupV2MessageHash(message).equals(row.event.contentHashHex, ignoreCase = true)) return@mapNotNull null
+                GroupRawCommentUi(
+                    eventId = row.event.eventId,
+                    message = message,
+                    authorBound = row.authorBinding != GroupEventAuthorBindingV2.RemoteUnbound,
+                )
+            }.toList()
     }
 
     fun hydratePost(groupId: String, conversationId: String): GroupPostDetail? {
@@ -973,6 +1010,45 @@ class GroupRuntime(
         }
     }
 
+    /**
+     * An event discovered through gossip is never an approved post or proof of who controls
+     * the claimed author DHT. Only public groups already known locally are eligible.
+     * The signed envelope is validated independently, and its DHT payload is hash-checked
+     * asynchronously. It then becomes available in the opt-in Curator/raw view.
+     */
+    fun receiveGossipEventV2(event: SignedGroupEventV2, source: String): Boolean {
+        if (closed.get() || source.isBlank() || source == sessionMainDht) return false
+        val group = store.byId(event.groupId) ?: return false
+        if (group.policy.visibility != GroupVisibility.Public) return false
+        if (event.structuralError() != null) return false
+        val existing = eventStoreV2?.get(event.eventId)
+        if (existing?.validation == GroupEventValidationV2.Valid &&
+            existing.event.canonicalDigestHex() == event.canonicalDigestHex()
+        ) return false
+        if (!abuseGuardV2.allow(GroupAbuseActionV2.EventGossip, source, event.groupId)) return false
+        val stored = runCatching {
+            eventStoreV2?.ingest(event, GroupEventTransportV2.LegacyBridge, source)
+        }.onFailure {
+            logger("[groups-v2] GOSSIP_EVENT_REJECT event=${event.eventId.take(8)} reason=${it.message.orEmpty().take(80)}")
+        }.getOrNull() ?: return false
+        if (stored.validation != GroupEventValidationV2.Valid) {
+            logger("[groups-v2] GOSSIP_EVENT_REJECT event=${event.eventId.take(8)} validation=${stored.validation.name}")
+            return false
+        }
+        logger("[groups-v2] GOSSIP_EVENT_SIGNATURE_VERIFIED event=${event.eventId.take(8)} group=${short(event.groupId)} content=${stored.contentState.name}")
+        if (stored.contentState != GroupEventContentStateV2.Valid) {
+            enqueueContentValidationV2(
+                eventId = event.eventId,
+                transport = GroupEventTransportV2.LegacyBridge,
+                sourceMainDht = source,
+                publicExpiresAt = 0L,
+                delayMs = 0L,
+                reason = "gossip-reference",
+            )
+        }
+        return true
+    }
+
     /** Receive one canonical Groups-v2 event from an authenticated daemon path. */
     fun receiveCanonicalEventV2(
         packet: GroupEventTransportPacketV2,
@@ -1181,6 +1257,9 @@ class GroupRuntime(
                 return
             }
             val contentState = storeV2.verifyContentMessage(eventId, message, fetchStarted)
+            if (contentState == GroupEventContentStateV2.Valid && transport == GroupEventTransportV2.LegacyBridge) {
+                logger("[groups-v2] GOSSIP_EVENT_CONTENT_VERIFIED event=${eventId.take(8)} group=${short(stored.event.groupId)}")
+            }
             if (contentState != GroupEventContentStateV2.Valid) {
                 logger("[groups-v2] EVENT_PROCESS_DEFER event=${eventId.take(8)} content=${contentState.name}")
                 return
@@ -1190,6 +1269,14 @@ class GroupRuntime(
             }
             if (transport == GroupEventTransportV2.CustodyRecovery) {
                 recordCustodyContentVerifiedEvidenceV2(stored)
+            }
+            if (transport == GroupEventTransportV2.LegacyBridge) {
+                // Gossip is an *unauthenticated relay*. A valid envelope signature does not
+                // bind that key to the claimed profile, nor does it authorize this sender to
+                // submit on somebody else's behalf. Retain for opt-in raw viewing only;
+                // NEVER auto-moderate a gossip-derived event into an owned branch.
+                logger("[groups-v2] GOSSIP_EVENT_RETAINED_RAW event=${eventId.take(8)} group=${short(stored.event.groupId)}")
+                return
             }
             processCanonicalForOwnedBranches(stored, message, transport, sourceMainDht, publicExpiresAt)
         } finally {
@@ -1300,6 +1387,7 @@ class GroupRuntime(
         contentFetchPool.shutdownNow()
         custodyPool.shutdownNow()
         outboundRecoveryRequests.clear()
+        custodyEscalationScheduled.clear()
         logger("[groups-v2] CONTENT_RECOVERY_STOP session=${short(sessionMainDht)}")
     }
 
@@ -1356,12 +1444,11 @@ class GroupRuntime(
 
 
     /**
-     * Phase 3A custody is intentionally sent over authenticated direct/mailbox messages, not the
-     * 1024-byte ServiceRequest witness channel. Ordinary membership is private, so senders sample
-     * relevant app peers; receivers accept custody only when their own local group state says they
-     * joined the group. Unlisted/member-only groups are not sampled until Weave has a
-     * membership-addressable peer set, avoiding disclosure of a non-public group ID to unrelated
-     * app peers.
+     * Public-group custody is receipt driven. A verified, unexpired receipt for
+     * this group is the best evidence that a peer actually stores its events.
+     * For a new group with no such receipts we sample general app peers, but
+     * must not pretend that those peers are members or that a queued send means
+     * durable custody. Private-group identifiers never go to sampled peers.
      */
     private fun scheduleCustodyCopiesV2(
         group: GroupRecord,
@@ -1374,42 +1461,91 @@ class GroupRuntime(
             return
         }
         val authorityIds = authorities.map { it.ownerMainDht }.toSet()
-        val candidates = custodyCandidates()
+        val verifiedForGroup = custody.verifiedCustodiansForGroup(group.groupId)
+        val candidates = (verifiedForGroup + custodyCandidates())
             .asSequence()
             .filter { it.isNotBlank() && it != sessionMainDht && it !in authorityIds }
             .filter { trustStoreV2?.protocolEligible(it) != false }
             .distinct()
-            .sortedWith(
-                compareByDescending<String> { trustStoreV2?.protocolPreference(it) ?: 0 }
-                    .thenBy { sha256Hex("${event.eventId}|$it".encodeToByteArray()) }
-            )
-            .take(CUSTODY_TARGETS_PER_EVENT)
             .toList()
-        logger("[groups-v2] CUSTODY_SELECTED event=${event.eventId.take(8)} candidates=${candidates.size}")
-        candidates.forEach { peer ->
-            queueCustodyWork("store-${event.eventId.take(8)}") {
-                if (closed.get()) return@queueCustodyWork
-                runCatching {
-                    val request = signCustodyStoreRequestV2(
-                        event = event,
-                        requesterMainDht = sessionMainDht,
-                        requestedRetainUntil = minOf(event.expiresAt, System.currentTimeMillis() + GROUP_EVENT_RETENTION_MS_V2),
-                    )
-                    val bytes = GroupCustodyWireCodecV2.encode(request)
-                    client.sendMessage(
-                        recipientMainDht = peer,
-                        payload = bytes,
-                        expiresAtSeconds = (event.expiresAt / 1000L).takeIf { it > 0L },
-                        preferDirect = true,
-                    )
-                    logger("[groups-v2] CUSTODY_STORE_SENT event=${event.eventId.take(8)} target=${short(peer)} bytes=${bytes.size}")
-                }.onFailure {
-                    logger("[groups-v2] CUSTODY_STORE_SEND_FAILED event=${event.eventId.take(8)} target=${short(peer)} error=${it.message.orEmpty().take(180)}")
-                }
+        val plan = planGroupCustodyTargetsV2(
+            candidates = candidates,
+            provenGroupCustodians = verifiedForGroup,
+            preference = { trustStoreV2?.protocolPreference(it) ?: 0 },
+            eventId = event.eventId,
+            initialTargetCount = CUSTODY_INITIAL_TARGETS,
+            maximumTargetCount = CUSTODY_TARGETS_PER_EVENT,
+        )
+        logger("[groups-v2] CUSTODY_SELECTED event=${event.eventId.take(8)} total=${plan.total} initial=${plan.initial.size} standby=${plan.standby.size} candidates=${candidates.size} group_verified=${verifiedForGroup.size} target_receipts=$CUSTODY_MIN_RECEIPTS")
+        if (plan.standby.isEmpty() && plan.initial.size < CUSTODY_MIN_RECEIPTS) {
+            logger("[groups-v2] CUSTODY_CAPACITY_LOW event=${event.eventId.take(8)} eligible=${plan.initial.size} target_receipts=$CUSTODY_MIN_RECEIPTS")
+        }
+        plan.initial.forEach { peer -> enqueueCustodyStoreV2(event, peer, "initial") }
+        // When the first targets do not return enough cryptographically
+        // verified receipts, expand only to standby peers. This avoids six
+        // expensive mailbox commits for posts whose first copies succeeded.
+        if (plan.standby.isNotEmpty() && custodyEscalationScheduled.size < MAX_PENDING_CUSTODY_ESCALATIONS
+            && custodyEscalationScheduled.add(event.eventId)) {
+            try {
+                contentRecoveryScheduler.schedule({
+                    try {
+                        if (!closed.get()) {
+                            val confirmed = validCustodyReceiptCountV2(event)
+                            if (confirmed < CUSTODY_MIN_RECEIPTS) {
+                                logger("[groups-v2] CUSTODY_ESCALATE event=${event.eventId.take(8)} receipts=$confirmed standby=${plan.standby.size}")
+                                plan.standby.forEach { peer -> enqueueCustodyStoreV2(event, peer, "standby") }
+                            } else {
+                                logger("[groups-v2] CUSTODY_SATISFIED event=${event.eventId.take(8)} receipts=$confirmed standby_skipped=${plan.standby.size}")
+                            }
+                        }
+                    } finally {
+                        custodyEscalationScheduled.remove(event.eventId)
+                    }
+                }, CUSTODY_ESCALATION_DELAY_MS, TimeUnit.MILLISECONDS)
+            } catch (_: RejectedExecutionException) {
+                custodyEscalationScheduled.remove(event.eventId)
             }
         }
-        // Touch the store so its encrypted state is loaded/cleaned in the same account session.
         custody.cleanup()
+    }
+
+    /** Queued for direct/mailbox delivery is not a verified custody receipt. */
+    private fun enqueueCustodyStoreV2(event: SignedGroupEventV2, peer: String, stage: String) {
+        val scheduledAt = System.currentTimeMillis()
+        queueCustodyWork("store-${event.eventId.take(8)}") {
+            if (closed.get()) return@queueCustodyWork
+            val started = System.currentTimeMillis()
+            logger("[groups-v2] CUSTODY_STORE_START event=${event.eventId.take(8)} stage=$stage target=${short(peer)} queue_wait_ms=${started - scheduledAt}")
+            runCatching {
+                val request = signCustodyStoreRequestV2(
+                    event = event,
+                    requesterMainDht = sessionMainDht,
+                    requestedRetainUntil = minOf(event.expiresAt, System.currentTimeMillis() + GROUP_EVENT_RETENTION_MS_V2),
+                )
+                val bytes = GroupCustodyWireCodecV2.encode(request)
+                client.sendMessage(
+                    recipientMainDht = peer,
+                    payload = bytes,
+                    expiresAtSeconds = (event.expiresAt / 1000L).takeIf { it > 0L },
+                    preferDirect = true,
+                )
+                logger("[groups-v2] CUSTODY_STORE_QUEUED event=${event.eventId.take(8)} stage=$stage target=${short(peer)} bytes=${bytes.size} elapsed_ms=${System.currentTimeMillis() - started} receipt_pending=true")
+            }.onFailure {
+                logger("[groups-v2] CUSTODY_STORE_SEND_FAILED event=${event.eventId.take(8)} stage=$stage target=${short(peer)} elapsed_ms=${System.currentTimeMillis() - started} error=${it.message.orEmpty().take(180)}")
+            }
+        }
+    }
+
+    private fun validCustodyReceiptCountV2(event: SignedGroupEventV2): Int {
+        val now = System.currentTimeMillis()
+        val digest = event.canonicalDigestHex()
+        return custodyStoreV2?.receiptsForEvent(event.eventId).orEmpty()
+            .asSequence()
+            .filter { it.verified && it.groupId == event.groupId && it.retainUntil > now }
+            .filter { it.canonicalDigestHex.equals(digest, ignoreCase = true) }
+            .map { it.custodianMainDht }
+            .distinct()
+            .count()
     }
 
     /** Request recent retained refs for every branch owned by this account. Called after peer refresh. */
@@ -1510,8 +1646,16 @@ class GroupRuntime(
             return
         }
         val now = System.currentTimeMillis()
-        if (kotlin.math.abs(now - request.sentAt) > CUSTODY_REQUEST_FRESHNESS_MS) {
-            logger("[groups-v2] CUSTODY_REJECT event=${request.event.eventId.take(8)} reason=stale")
+        // A signed store request can be delivered from the daemon mailbox days late.
+        // Do not reject it merely because the envelope was queued for >15 minutes.
+        // The signed event itself must remain unexpired, and the request timestamp must
+        // fall inside the event's lifetime (+/- ordinary clock skew). Store is idempotent
+        // by event ID; existing rate limits also apply to replays.
+        if (request.sentAt < request.event.createdAt - CUSTODY_CLOCK_SKEW_MS ||
+            request.sentAt > now + CUSTODY_CLOCK_SKEW_MS ||
+            request.sentAt > request.event.expiresAt + CUSTODY_CLOCK_SKEW_MS
+        ) {
+            logger("[groups-v2] CUSTODY_REJECT event=${request.event.eventId.take(8)} reason=timestamp-outside-event")
             return
         }
         request.event.structuralError(now)?.let {
@@ -1535,7 +1679,12 @@ class GroupRuntime(
             logger("[groups-v2] CUSTODY_REJECT event=${request.event.eventId.take(8)} reason=event-${validation.name}")
             return
         }
-        val stored = custody.storeEvent(request.event, sourceMainDht, request.requestedRetainUntil) ?: return
+        val stored = custody.storeEvent(request.event, sourceMainDht, request.requestedRetainUntil)
+        if (stored == null) {
+            logger("[groups-v2] CUSTODY_STORE_SKIPPED event=${request.event.eventId.take(8)} group=${short(request.groupId)} reason=store-rejected-or-duplicate")
+            return
+        }
+        logger("[groups-v2] CUSTODY_STORED event=${request.event.eventId.take(8)} group=${short(request.groupId)} source=${short(sourceMainDht)} receipt_requested=${request.receiptRequested} retain_seconds=${((stored.retainUntil - now) / 1000L).coerceAtLeast(0L)}")
 
         // A node can be selected as an ordinary custodian even when the sender has not yet learned
         // that this same node owns a Claim branch. Do not strand the event in the custody vault in
@@ -1612,6 +1761,7 @@ class GroupRuntime(
             return
         }
         custody.rememberReceipt(receipt, GroupCustodyWireCodecV2.encode(receipt), verified = true)
+        logger("[groups-v2] CUSTODY_RECEIPT_VERIFIED event=${receipt.eventId.take(8)} group=${short(receipt.groupId)} custodian=${short(sourceMainDht)} valid_total=${validCustodyReceiptCountV2(local)}")
         trustStoreV2?.recordEvidence(
             peerMainDht = sourceMainDht,
             kind = GroupReputationEvidenceKindV2.CustodyReceiptVerified,
@@ -2307,6 +2457,10 @@ class GroupRuntime(
         private const val CUSTODY_WORKERS = 3
         private const val CUSTODY_WORK_QUEUE = 96
         private const val CUSTODY_TARGETS_PER_EVENT = 6
+        private const val CUSTODY_INITIAL_TARGETS = 3
+        private const val CUSTODY_MIN_RECEIPTS = 2
+        private const val CUSTODY_ESCALATION_DELAY_MS = 35_000L
+        private const val MAX_PENDING_CUSTODY_ESCALATIONS = 128
         private const val RECOVERY_CUSTODIANS_PER_GROUP = 4
         private const val MAX_RECOVERY_GROUPS_PER_SWEEP = 6
         private const val MAX_RECOVERY_REQUESTS_PER_SWEEP = 24
@@ -2314,7 +2468,6 @@ class GroupRuntime(
         private const val MAX_RECOVERY_PAGES = 8
         private const val MAX_RECOVERY_EVENTS_PER_SESSION = 96
         private const val MAX_RECOVERY_CURSOR_BYTES = 160
-        private const val CUSTODY_REQUEST_FRESHNESS_MS = 15L * 60L * 1000L
         private const val CUSTODY_CLOCK_SKEW_MS = 10L * 60L * 1000L
         private const val RECOVERY_REQUEST_FRESHNESS_MS = 15L * 60L * 1000L
         private const val RECOVERY_BATCH_FRESHNESS_MS = 30L * 60L * 1000L

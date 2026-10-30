@@ -30,6 +30,7 @@ private const val INBOX_DRAIN_LIMIT = 50
 private const val PEER_REFRESH_MS = 20_000L
 private const val GOSSIP_INTERVAL_MS = 12_000L
 private const val GROUP_GOSSIP_INTERVAL_MS = 8_000L
+private const val GROUP_EVENT_INVENTORY_INTERVAL_MS = 90_000L
 private val RECONNECT_BACKOFF_MS = longArrayOf(1_500L, 3_000L, 6_000L, 15_000L, 30_000L)
 private const val GOSSIP_SUMMARY_LOG_REPEAT_MS = 60_000L
 private const val DIAGNOSTIC_LOG_MAX_BYTES = 1024 * 1024
@@ -106,6 +107,7 @@ class SocialNetworkController(context: Context) {
     // oversight in KnowledgeCache is what crashed the app on the Home screen.
     private val fullRecords = ConcurrentHashMap<String, ProfilePageRecord>()
     private val profileDocuments = ConcurrentHashMap<String, String>()
+    private val profileFetchInFlight = ConcurrentHashMap.newKeySet<String>()
     private val knownPeers: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private val queryReplyAt = ConcurrentHashMap<String, Long>()
     private var profileStoreId: String? = null
@@ -114,12 +116,20 @@ class SocialNetworkController(context: Context) {
     private var nextRequestId = 1L
     private val gossipSentCount = AtomicLong(0)
     private val gossipReceivedCount = AtomicLong(0)
+    // Gossip failures are expected when cached peers go offline. Summarize them
+    // instead of letting hundreds of identical errors evict useful delivery logs.
+    private val gossipFailureTallies = ConcurrentHashMap<String, AtomicLong>()
+    private val lastGossipFailureSummaryAt = AtomicLong(0L)
     private val groupHintStamp = ConcurrentHashMap<String, Long>()
+    private val gossipEventInFlight = ConcurrentHashMap.newKeySet<String>()
+    private var eventInventoryCursor = 0
     private val gossipSummaryDigestBySource = ConcurrentHashMap<String, String>()
     private val gossipSummaryLogAtBySource = ConcurrentHashMap<String, Long>()
     private val groupHintInFlight = ConcurrentHashMap.newKeySet<String>()
     private val loggedGroupGeneration = ConcurrentHashMap<String, Long>()
     @Volatile private var lastGroupGossipSendLogMs = 0L
+    @Volatile private var lastGroupGossipDigest = ""
+    @Volatile private var lastGroupGossipBroadcastAtMs = 0L
     @Volatile private var lastDebugUiRefreshMs = 0L
     private val startupTrace = StringBuilder()
     @Volatile private var startupDiagnosticsCopied = false
@@ -206,6 +216,7 @@ class SocialNetworkController(context: Context) {
                     runCatching { groupRuntime?.recoverCustodyV2() }
                         .onFailure { log("initial custody recovery deferred: ${it.message}") }
                     runCatching { gossipGroups() }.onFailure { log("initial group gossip deferred: ${it.message}") }
+                    runCatching { gossipEventInventory() }.onFailure { log("initial event inventory deferred: ${it.message}") }
                     updateSnapshots()
                     _ui.value = _ui.value.copy(connected = true, status = healthLine())
                     WeaveDiagnostics.event(appContext, "NETWORK_CONNECTED", "main_dht=${short(mainDht)}")
@@ -216,12 +227,16 @@ class SocialNetworkController(context: Context) {
                     var lastPeerRefresh = 0L
                     var lastGossip = 0L
                     var lastGroupGossip = 0L
+                    var lastEventInventory = System.currentTimeMillis()
                     var lastSubscriptionCheck = 0L
                     var lastInboxDrain = System.currentTimeMillis()
                     while (isActive) {
                         // A different daemon_instance_id means every old session token is dead.
                         // A different profile_id additionally means all DHT/cache state belongs
                         // to another VeilKnit identity. Either case is a clean reconnect.
+                        if (daemon?.requiresNewSession() == true) {
+                            throw DaemonSessionInvalidException()
+                        }
                         if (daemon?.daemonIdentityChanged() != false) {
                             throw DaemonSessionChangedException()
                         }
@@ -244,6 +259,11 @@ class SocialNetworkController(context: Context) {
                             runCatching { gossipGroups() }.onFailure { log("group gossip deferred: ${it.message}") }
                             lastGroupGossip = nowMs
                         }
+                        if (nowMs - lastEventInventory >= GROUP_EVENT_INVENTORY_INTERVAL_MS) {
+                            runCatching { gossipEventInventory() }
+                                .onFailure { log("event inventory deferred: ${it.message}") }
+                            lastEventInventory = nowMs
+                        }
                         if (nowMs - lastSubscriptionCheck >= 5_000L) {
                             ensureLiveSubscriptions()
                             lastSubscriptionCheck = nowMs
@@ -253,6 +273,14 @@ class SocialNetworkController(context: Context) {
                         setStatusQuiet(healthLine())
                         delay(1000)
                     }
+                } catch (invalid: DaemonSessionInvalidException) {
+                    if (!isActive) break
+                    reconnectFailures = 0
+                    reconnectDelayMs = 1_000L
+                    _ui.value = _ui.value.copy(connected = false)
+                    log("Weave app session expired inside the embedded daemon; reauthenticating")
+                    WeaveDiagnostics.event(appContext, "NETWORK_RECONNECT", "reason=app_session_invalid")
+                    updateStatus("Restoring Weave's daemon session…")
                 } catch (changed: DaemonSessionChangedException) {
                     if (!isActive) break
                     reconnectFailures = 0
@@ -295,6 +323,7 @@ class SocialNetworkController(context: Context) {
     }
 
     private class DaemonSessionChangedException : RuntimeException()
+    private class DaemonSessionInvalidException : RuntimeException()
 
     /**
      * Forget only network/account-derived state. Editable local content is intentionally not
@@ -314,6 +343,7 @@ class SocialNetworkController(context: Context) {
         activeIntent = null
         fullRecords.clear()
         profileDocuments.clear()
+        profileFetchInFlight.clear()
         knownPeers.clear()
         queryReplyAt.clear()
         groupHintStamp.clear()
@@ -799,7 +829,12 @@ class SocialNetworkController(context: Context) {
                 fullMedia = fullMedia,
             ) ?: error("Group runtime is not ready")
             log("group post submitted: group=${short(groupId)} conversation=${short(conversationId)}")
-            gossipGroups()
+            // The post is durably saved already; gossip is a fast-path hint, not part of the
+            // confirmation latency. Do not block the composer on extra networking.
+            scope.launch {
+                runCatching { gossipGroups(); gossipEventInventory(groupId) }
+                    .onFailure { log("post gossip deferred: ${it.message}") }
+            }
             conversationId
         }.onFailure { log("group post creation failed: ${it.message}") }
         withContext(Dispatchers.Main.immediate) {
@@ -812,13 +847,17 @@ class SocialNetworkController(context: Context) {
         conversationId: String,
         body: String,
         authorName: String,
-        onDone: (Boolean) -> Unit = {},
+        onDone: (Boolean, String?) -> Unit = { _, _ -> },
     ) = scope.launch {
-        val ok = runCatching {
+        val result = runCatching {
             groupRuntime?.postComment(groupId, conversationId, body, authorName)
                 ?: error("Group runtime is not ready")
-        }.onFailure { log("group comment failed: ${it.message}") }.isSuccess
-        withContext(Dispatchers.Main.immediate) { onDone(ok) }
+        }.onFailure { log("group comment failed: ${it.message}") }
+        if (result.isSuccess) scope.launch {
+            runCatching { gossipEventInventory(groupId) }
+                .onFailure { log("comment gossip deferred: ${it.message}") }
+        }
+        withContext(Dispatchers.Main.immediate) { onDone(result.isSuccess, result.getOrNull()?.messageId) }
     }
 
     fun refreshGroupPost(
@@ -886,6 +925,17 @@ class SocialNetworkController(context: Context) {
             groupRuntime?.moderatePost(groupId, postId, conversationId, postHash, state, messageRef, reason)
                 ?: error("Group runtime is not ready")
         }.onFailure { log("group moderation action failed: ${it.message}") }
+    }
+
+    fun loadGroupRawComments(
+        groupId: String,
+        conversationId: String,
+        onDone: (List<GroupRawCommentUi>) -> Unit,
+    ) = scope.launch {
+        val items = runCatching {
+            groupRuntime?.rawComments(groupId, conversationId) ?: emptyList()
+        }.onFailure { log("raw group comments load failed: ${it.message}") }.getOrDefault(emptyList())
+        withContext(Dispatchers.Main.immediate) { onDone(items) }
     }
 
     fun loadGroupMessage(
@@ -1476,8 +1526,26 @@ class SocialNetworkController(context: Context) {
         }.onFailure { log("media fetch failed: ${it.message}") }.getOrNull()
     }
 
+    /** Prepare a nearby swipe target without fetching all discovery results at once.
+     * The in-flight set prevents repeat requests from the gesture, the prefetched neighbor,
+     * and the normal profile-opening path.
+     */
+    fun prefetchProfileAvailable(mainDht: String) {
+        if (mainDht.isBlank() || profileDocuments.containsKey(mainDht)) return
+        if (!profileFetchInFlight.add(mainDht)) return
+        scope.launch {
+            try {
+                val hint = cache.get(mainDht)?.hint ?: return@launch
+                if (!profileDocuments.containsKey(mainDht)) verifyProfile(mainDht, hint.profileRootDht)
+            } finally {
+                profileFetchInFlight.remove(mainDht)
+            }
+        }
+    }
+
     fun ensureProfileAvailable(mainDht: String) = scope.launch {
         val hint = cache.get(mainDht)?.hint ?: return@launch
+        prefetchProfileAvailable(mainDht)
 
         // Group discovery is independent of the decorated-profile blob cache. A profile may have
         // been cached before its owner created/claimed a group, so always refresh subkey 2.
@@ -1488,9 +1556,6 @@ class SocialNetworkController(context: Context) {
             log("group directory refresh ${short(mainDht)} failed: ${it.message}")
         }
 
-        if (!profileDocuments.containsKey(mainDht)) {
-            verifyProfile(mainDht, hint.profileRootDht)
-        }
         updateSnapshots()
     }
 
@@ -1722,6 +1787,24 @@ class SocialNetworkController(context: Context) {
             }
             return
         }
+        GroupEventInventoryGossipV2.fromBytes(payload)?.let { packet ->
+            gossipReceivedCount.incrementAndGet()
+            if (source.isBlank() || source == _ui.value.mainDht) return
+            // A gossip sender isn't authenticated as the author. Check the event signature,
+            // local group policy and DHT content before exposing it in the raw view.
+            packet.events.forEach { event ->
+                if (!gossipEventInFlight.add(event.eventId)) return@forEach
+                scope.launch {
+                    try {
+                        log("[groups-v2] GOSSIP_EVENT_RECEIVED event=${event.eventId.take(8)} group=${short(event.groupId)} from=${short(source)}")
+                        groupRuntime?.receiveGossipEventV2(event, source)
+                    } finally {
+                        gossipEventInFlight.remove(event.eventId)
+                    }
+                }
+            }
+            return
+        }
         GroupGossipPacket.fromBytes(payload)?.let { packet ->
             gossipReceivedCount.incrementAndGet()
             receiveGroupGossip(packet, source)
@@ -1843,19 +1926,68 @@ class SocialNetworkController(context: Context) {
                 !_ui.value.published && hint.pointer.ownerMainDht == ownMainDht
             }
         if (hints.isEmpty() || knownPeers.isEmpty()) return
-        val packet = GroupGossipPacket(System.currentTimeMillis(), hints)
+        // No need to resend an unchanged branch inventory to six peers every eight seconds.
+        // Newly changed headers/pulses still announce on the next scheduled pass or right
+        // after creation. Periodic refresh remains for late-joining nodes.
+        val now = System.currentTimeMillis()
+        val digest = sha256Hex(GroupGossipPacket(0L, hints).toBytes()).take(16)
+        if (digest == lastGroupGossipDigest && now - lastGroupGossipBroadcastAtMs < 30_000L) return
+        val packet = GroupGossipPacket(now, hints)
         val bytes = packet.toBytes()
         if (bytes.size > 8 * 1024) {
             log("group gossip skipped: ${bytes.size} bytes exceeds gossip limit")
             return
         }
         val sent = sendGossipToSample(bytes, 6)
-        val now = System.currentTimeMillis()
-        // Gossip runs every few seconds, but the persisted diagnostic log should remain readable.
+        if (sent > 0) {
+            lastGroupGossipDigest = digest
+            lastGroupGossipBroadcastAtMs = now
+        }
+        // The persisted diagnostic log should remain readable.
         // Record a heartbeat at most once per minute; actual verified changes are logged immediately.
         if (sent > 0 && now - lastGroupGossipSendLogMs >= 60_000L) {
             lastGroupGossipSendLogMs = now
             log("group gossip heartbeat: ${hints.size} branch hint(s) sent to $sent peer(s)")
+        }
+    }
+
+    /**
+     * Rolling public-event anti-entropy. Immediate announces use the latest group events;
+     * the 90-second pass rotates through the seven-day event store for late joiners.
+     * Sending references only is not a durable remote custody receipt.
+     */
+    private fun gossipEventInventory(groupId: String? = null) {
+        val d = daemon ?: return
+        if (d.requiresNewSession() || knownPeers.isEmpty()) return
+        val now = System.currentTimeMillis()
+        val eligible = groupEventsV2.allEvents().asSequence()
+            .filter { it.validation == GroupEventValidationV2.Valid }
+            .filter { it.event.expiresAt > now }
+            .filter { groupId == null || it.event.groupId == groupId }
+            .filter { groups.byId(it.event.groupId)?.policy?.visibility == GroupVisibility.Public }
+            .sortedByDescending { it.event.createdAt }
+            .toList()
+        if (eligible.isEmpty()) return
+        val events = (if (groupId != null) {
+            eligible.take(GroupEventInventoryGossipV2.MAX_EVENTS)
+        } else {
+            val start = eventInventoryCursor % eligible.size
+            eventInventoryCursor = (start + GroupEventInventoryGossipV2.MAX_EVENTS) % eligible.size
+            List(minOf(eligible.size, GroupEventInventoryGossipV2.MAX_EVENTS)) {
+                eligible[(start + it) % eligible.size]
+            }
+        }).map { it.event }
+        // A single oversize event must not make the whole inventory fail.
+        val fitted = mutableListOf<SignedGroupEventV2>()
+        events.forEach { event ->
+            val trial = GroupEventInventoryGossipV2(now, fitted + event).toBytes()
+            if (trial.size <= GroupEventInventoryGossipV2.MAX_BYTES) fitted += event
+        }
+        if (fitted.isEmpty()) return
+        val bytes = GroupEventInventoryGossipV2(now, fitted).toBytes()
+        val sent = sendGossipToSample(bytes, 3)
+        if (sent > 0) {
+            log("[groups-v2] GOSSIP_EVENT_ANNOUNCED events=${fitted.joinToString(",") { it.eventId.take(8) }} peers=$sent bytes=${bytes.size} periodic=${groupId == null}")
         }
     }
 
@@ -1937,13 +2069,34 @@ class SocialNetworkController(context: Context) {
 
     private fun sendGossipToSample(bytes: ByteArray, limit: Int): Int {
         val d = daemon ?: return 0
+        if (d.requiresNewSession()) return 0
         var sent = 0
         deterministicPeerSample(knownPeers.toList(), nowSeconds(), limit).forEach { peer ->
             runCatching { d.sendGossip(peer, bytes) }
                 .onSuccess { gossipSentCount.incrementAndGet(); sent++ }
-                .onFailure { log("gossip to ${short(peer)} failed: ${it.message}") }
+                .onFailure { recordGossipFailure(it) }
         }
         return sent
+    }
+
+    private fun recordGossipFailure(error: Throwable) {
+        val detail = error.message.orEmpty()
+        val reason = when {
+            detail.contains("No route blob published", ignoreCase = true) -> "missing_route"
+            detail.contains("offline", ignoreCase = true) -> "offline"
+            detail.contains("timeout", ignoreCase = true) -> "timeout"
+            detail.contains("authentication_failed", ignoreCase = true) -> "local_session"
+            else -> "other"
+        }
+        gossipFailureTallies.computeIfAbsent(reason) { AtomicLong(0L) }.incrementAndGet()
+        val now = System.currentTimeMillis()
+        val last = lastGossipFailureSummaryAt.get()
+        if (now - last >= 60_000L && lastGossipFailureSummaryAt.compareAndSet(last, now)) {
+            val totals = gossipFailureTallies.entries.sortedBy { it.key }
+                .mapNotNull { (kind, count) -> count.getAndSet(0L).takeIf { it > 0L }?.let { "$kind=$it" } }
+                .joinToString(" ")
+            if (totals.isNotEmpty()) log("gossip send failures (aggregated, no payloads): $totals")
+        }
     }
 
     private fun updateSnapshots() {
@@ -2533,11 +2686,22 @@ class SocialNetworkController(context: Context) {
             groupTrustV2.diagnosticLines().forEach { appendLine(it) }
             groupRuntime?.abuseDiagnosticLinesV2()?.forEach { appendLine(it) }
             appendLine()
+            appendLine("--- recent messaging milestones (latest 100) ---")
+            // Put high-signal group/custody lines ahead of the large network log;
+            // Android's Copy Log limit can truncate older raw diagnostics.
+            val persisted = readPersistentLogTail(DIAGNOSTIC_LOG_KEEP_BYTES)
+            val important = persisted.lineSequence().filter { line ->
+                line.contains("[groups-v2]") && listOf(
+                    "EVENT_CREATE_", "EVENT_STORE_INSERT", "EVENT_PROCESS_",
+                    "TRANSPORT_", "WITNESS_", "CUSTODY_", "RECOVERY_", "GOSSIP_EVENT_",
+                ).any(line::contains) && !line.contains("RECOVERY_BEGIN groups=0 peers=0")
+            }.toList().takeLast(100)
+            if (important.isEmpty()) appendLine("(none)") else important.forEach { appendLine(it) }
+            appendLine()
             appendLine("--- lifecycle / daemon RPC breadcrumbs ---")
             val breadcrumbs = WeaveDiagnostics.tail(appContext)
             appendLine(if (breadcrumbs.isNotBlank()) breadcrumbs else "(none)")
             appendLine("--- network/group log ---")
-            val persisted = readPersistentLogTail(DIAGNOSTIC_LOG_KEEP_BYTES)
             append(if (persisted.isNotBlank()) persisted else state.debugLog)
         }
     }

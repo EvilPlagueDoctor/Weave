@@ -21,6 +21,7 @@ import java.nio.ByteOrder
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
@@ -45,7 +46,11 @@ class DaemonClient(private val context: Context) {
     private val requestId = AtomicLong(1L)
     private val subscriptionScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val subscriptionJobs = ConcurrentHashMap<Long, Job>()
-    private var sessionToken: String? = null
+    @Volatile private var sessionToken: String? = null
+    private val lostSession = AtomicBoolean(false)
+
+    /** An authenticated RPC reported a missing/expired local app session. Reconnect once. */
+    fun requiresNewSession(): Boolean = lostSession.get()
     private val credentialStore = SecureCredentialStore(context)
     private var connectedIdentity: DaemonIdentity? = null
 
@@ -55,6 +60,7 @@ class DaemonClient(private val context: Context) {
      * selects a different credential slot.
      */
     suspend fun connect(onStatus: (String) -> Unit) {
+        lostSession.set(false)
         sessionToken = null
         connectedIdentity = null
         WeaveDiagnostics.event(context, "DAEMON_CONNECT", "stage=embedded_bridge_begin")
@@ -106,6 +112,7 @@ class DaemonClient(private val context: Context) {
             "profile=${connectedIdentity?.profileId?.let(::short) ?: "(none)"} reason=${reason.take(180)}"
         )
         PrivateVault.get(context).detach(reason)
+        lostSession.set(false)
         sessionToken = null
         connectedIdentity = null
         subscriptionJobs.keys.toList().forEach(::unsubscribe)
@@ -163,6 +170,11 @@ class DaemonClient(private val context: Context) {
     }
 
     private fun rawRequest(action: String, authenticated: Boolean = true, block: JSONObject.() -> Unit = {}): JSONObject {
+        // Once the daemon rejects our app session, do not continue sending doomed RPCs.
+        // The controller's one network worker will reauthenticate the existing account.
+        if (authenticated && lostSession.get()) {
+            throw IllegalStateException("authentication_failed: local app session requires reconnect")
+        }
         val objectId = requestId.getAndIncrement()
         val request = JSONObject()
             .put("protocol_version", PROTOCOL_VERSION)
@@ -181,9 +193,16 @@ class DaemonClient(private val context: Context) {
             val response = JSONObject(responseText)
             if (!response.optBoolean("ok", false)) {
                 val error = response.optJSONObject("error")
-                val failure = IllegalStateException(
-                    "${error?.optString("code", "daemon_error")}: ${error?.optString("message", "unknown daemon error")}"
-                )
+                val errorCode = error?.optString("code", "daemon_error").orEmpty()
+                val errorMessage = error?.optString("message", "unknown daemon error").orEmpty()
+                if (authenticated && errorCode == "authentication_failed" &&
+                    (errorMessage.contains("session", ignoreCase = true) ||
+                        errorMessage.contains("token", ignoreCase = true)) &&
+                    lostSession.compareAndSet(false, true)
+                ) {
+                    WeaveDiagnostics.event(context, "DAEMON_SESSION_LOST", "action=$action reason=${errorMessage.take(120)}")
+                }
+                val failure = IllegalStateException("$errorCode: $errorMessage")
                 WeaveDiagnostics.rpc(
                     context, action, requestBytes, responseBytes,
                     SystemClock.elapsedRealtime() - started, false, failure

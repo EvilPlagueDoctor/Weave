@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -28,7 +29,7 @@ import app.weave.backbone.VerificationState
 fun HomeScreen(
     controller: SocialNetworkController,
     followStore: FollowStore,
-    onOpen: (String) -> Unit,
+    onOpen: (String, List<String>) -> Unit,
 ) {
     val state by controller.ui.collectAsState()
     val following = followStore.all()
@@ -37,6 +38,10 @@ fun HomeScreen(
     }
     val suggested = remember(state.recent, state.discoveryDescription, state.featuresText, following) {
         controller.suggestedPeople(excluding = following, limit = 3)
+    }
+
+    val visibleKeys = remember(rows, suggested) {
+        (rows.map { it.hint.mainDht } + suggested.map { it.mainDht }).distinct()
     }
 
     Column(Modifier.fillMaxSize()) {
@@ -77,7 +82,7 @@ fun HomeScreen(
                         enabled = true,
                         onClick = {
                             controller.ensureProfileAvailable(row.hint.mainDht)
-                            onOpen(row.hint.mainDht)
+                            onOpen(row.hint.mainDht, visibleKeys)
                         }
                     )
                     HorizontalDivider()
@@ -105,7 +110,7 @@ fun HomeScreen(
                         enabled = true,
                         onClick = {
                             controller.ensureProfileAvailable(hint.mainDht)
-                            onOpen(hint.mainDht)
+                            onOpen(hint.mainDht, visibleKeys)
                         },
                     )
                     HorizontalDivider()
@@ -148,19 +153,23 @@ fun ProfileRow(hint: ProfileHint, enabled: Boolean, onClick: () -> Unit) {
         Identicon(hint.mainDht, size = 44.dp)
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
-            Text(
-                hint.name.ifBlank { "Untitled" },
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1
-            )
-            if (hint.description.isNotBlank()) {
+            SelectionContainer {
                 Text(
-                    hint.description,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 2
+                    hint.name.ifBlank { "Untitled" },
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1
                 )
+            }
+            if (hint.description.isNotBlank()) {
+                SelectionContainer {
+                    Text(
+                        hint.description,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2
+                    )
+                }
             }
             Text(
                 provenanceLabel(hint.verification),
@@ -186,9 +195,13 @@ fun provenanceLabel(state: VerificationState): String = when (state) {
 }
 
 @Composable
-fun SearchScreen(controller: SocialNetworkController, onOpen: (String) -> Unit) {
+fun SearchScreen(controller: SocialNetworkController, onOpen: (String, List<String>) -> Unit) {
     val state by controller.ui.collectAsState()
     val context = LocalContext.current
+    val visibleKeys = remember(state.query, state.recent, state.searchResults) {
+        if (state.query.isBlank()) state.recent.map { it.hint.mainDht }
+        else state.searchResults.map { it.hint.mainDht }
+    }.distinct()
     var showStats by remember { mutableStateOf(false) }
     val report = remember(showStats, state.query, state.gossipSent, state.gossipReceived, state.recent) {
         if (showStats) controller.librarianReport(state.query) else ""
@@ -241,7 +254,7 @@ fun SearchScreen(controller: SocialNetworkController, onOpen: (String) -> Unit) 
                             enabled = true,
                             onClick = {
                                 controller.ensureProfileAvailable(row.hint.mainDht)
-                                onOpen(row.hint.mainDht)
+                                onOpen(row.hint.mainDht, visibleKeys)
                             }
                         )
                         HorizontalDivider()
@@ -257,7 +270,7 @@ fun SearchScreen(controller: SocialNetworkController, onOpen: (String) -> Unit) 
                             enabled = true,
                             onClick = {
                                 controller.ensureProfileAvailable(scored.hint.mainDht)
-                                onOpen(scored.hint.mainDht)
+                                onOpen(scored.hint.mainDht, visibleKeys)
                             }
                         )
                         Row(Modifier.padding(start = 72.dp, bottom = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -281,7 +294,9 @@ fun SearchScreen(controller: SocialNetworkController, onOpen: (String) -> Unit) 
             title = { Text(tr("Librarian data")) },
             text = {
                 Column(Modifier.heightIn(max = 430.dp).verticalScroll(androidx.compose.foundation.rememberScrollState())) {
-                    Text(report, style = MaterialTheme.typography.bodySmall)
+                    SelectionContainer {
+                        Text(report, style = MaterialTheme.typography.bodySmall)
+                    }
                 }
             },
             confirmButton = {
@@ -348,7 +363,9 @@ fun ActivityScreen(
                             Identicon(comment.authorKey.ifBlank { comment.authorName }, size = 32.dp)
                             Spacer(Modifier.width(10.dp))
                             Column(Modifier.weight(1f)) {
-                                Text(comment.authorName, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                                SelectionContainer {
+                                    Text(comment.authorName, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                                }
                                 Text(
                                     comment.pageKey.substringAfter('#'),
                                     style = MaterialTheme.typography.labelSmall,
@@ -368,7 +385,9 @@ fun ActivityScreen(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
-                        Text(comment.body, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 8.dp))
+                        SelectionContainer {
+                            Text(comment.body, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 8.dp))
+                        }
                         if (comment.state == CommentState.Held) {
                             Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.End) {
                                 TextButton(onClick = { onDrop(comment.id); localRevision++ }) {

@@ -3759,7 +3759,17 @@ async fn process_request(
             if let Some(operation_id) = operation_id {
                 context.backlog.stage(operation_id, "mailbox_network_commit").await;
             }
-            let message_id = app_mailbox
+            // Diagnostics only. The mailbox still controls persistence and network
+            // commits; this trace does not change the API's success semantics.
+            let commit_started = Instant::now();
+            crate::tprintln!(
+                "[delivery] request={:?} app={} stage=mailbox_commit_started bytes={} prior_elapsed_ms={}",
+                operation_id,
+                application_id,
+                payload_len,
+                delivery_started.elapsed().as_millis()
+            );
+            let message_id = match app_mailbox
                 .submit_outgoing_message(OutgoingMessageRequest {
                     application_id: application_id.clone(),
                     recipient_main_dht,
@@ -3770,7 +3780,25 @@ async fn process_request(
                     await_response,
                 })
                 .await
-                .map_err(|error| ("message_send_failed", error.to_string()))?;
+            {
+                Ok(message_id) => message_id,
+                Err(error) => {
+                    crate::tprintln!(
+                        "[delivery] request={:?} app={} stage=mailbox_commit_failed elapsed_ms={} error={}",
+                        operation_id,
+                        application_id,
+                        commit_started.elapsed().as_millis(),
+                        error.to_string().chars().take(160).collect::<String>()
+                    );
+                    return Err(("message_send_failed", error.to_string()));
+                }
+            };
+            crate::tprintln!(
+                "[delivery] request={:?} app={} stage=mailbox_commit_finished elapsed_ms={}",
+                operation_id,
+                application_id,
+                commit_started.elapsed().as_millis()
+            );
             crate::tprintln!(
                 "[delivery] request={:?} app={} recipient={} stage=mailbox_queued bytes={} elapsed_ms={}",
                 operation_id,

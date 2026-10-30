@@ -1,12 +1,7 @@
 package app.weave
 
 import android.content.Context
-import android.graphics.Paint as AndroidPaint
 import android.graphics.Color as AndroidColor
-import android.graphics.Typeface
-import android.text.Layout
-import android.text.StaticLayout
-import android.text.TextPaint
 import android.widget.Toast
 import androidx.annotation.StringRes
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -45,7 +40,6 @@ import androidx.compose.ui.graphics.*
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
@@ -59,6 +53,9 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.TextMeasurer
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -67,6 +64,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
@@ -1613,6 +1611,7 @@ private fun ProfileCanvas(
         widgetSuffix=stringResource(R.string.widget_preview_suffix),
         widgetPaused=stringResource(R.string.widget_paused_short)
     )
+    val textMeasurer = rememberTextMeasurer()
     BoxWithConstraints(modifier) {
         Canvas(
             Modifier.fillMaxSize()
@@ -1653,6 +1652,7 @@ private fun ProfileCanvas(
                     it,rootRect,
                     if(state.mode==EditMode.Background)state.selectedId else "",
                     strings=renderStrings,
+                    textMeasurer=textMeasurer,
                     inlineEditingId=state.inlineTextEditId,
                     widgetLookup=state::widgetProgramFor,
                     imageLookup={ element -> media.bitmapFor(element.mediaContentHash) },
@@ -1665,6 +1665,7 @@ private fun ProfileCanvas(
                         it,rootRect,state.selectedId,
                         selectChildren=state.mode==EditMode.Foreground,
                         strings=renderStrings,
+                        textMeasurer=textMeasurer,
                         inlineEditingId=state.inlineTextEditId,
                         widgetLookup=state::widgetProgramFor,
                         imageLookup={ element -> media.bitmapFor(element.mediaContentHash) },
@@ -1691,18 +1692,7 @@ private fun ProfileCanvas(
             BasicTextField(
                 value = state.inlineTextDraft,
                 onValueChange = state::updateInlineText,
-                textStyle = androidx.compose.ui.text.TextStyle(
-                    color = Color(editElement.textArgb),
-                    fontSize = editElement.fontSize.sp,
-                    fontWeight = if(editElement.bold) FontWeight.Bold else FontWeight.Normal,
-                    fontStyle = if(editElement.italic) FontStyle.Italic else FontStyle.Normal,
-                    textDecoration = if(editElement.underline) TextDecoration.Underline else TextDecoration.None,
-                    textAlign = when(editElement.textAlign){
-                        TextAlignMode.Left -> TextAlign.Left
-                        TextAlignMode.Center -> TextAlign.Center
-                        TextAlignMode.Right -> TextAlign.Right
-                    }
-                ),
+                textStyle = authoredPageTextStyle(editElement),
                 modifier = Modifier
                     .offset(x = maxWidth * xFrac, y = maxHeight * yFrac)
                     .size(
@@ -1722,33 +1712,34 @@ internal fun DrawScope.drawBackground(r:Rect,bg:BackgroundSpec){if(bg.kind==Back
 private fun childRect(parent:Rect,q:RectSpec)=Rect(parent.left+q.x*parent.width,parent.top+q.y*parent.height,parent.left+(q.x+q.width)*parent.width,parent.top+(q.y+q.height)*parent.height)
 private fun DrawScope.drawBorderSpec(r:Rect,d:DecorationRef,thickness:Float){val n=if(d.kind==DecorationKind.DecorationPack)d.basedOnBuiltin.ifBlank{"Thin1"}else d.builtinName;if(n=="None"||n.isBlank())return;val stroke=max(1f,thickness*density);val color=if(n=="Thick1")Color(0xFF2D3340)else Color(0xFF636873);if(n=="Dotted1")drawRect(color,r.topLeft,r.size,style=Stroke(stroke,pathEffect=PathEffect.dashPathEffect(floatArrayOf(6f,6f))))else{drawRect(color,r.topLeft,r.size,style=Stroke(stroke));if(n=="Thick1")drawRect(color,Offset(r.left+4f,r.top+4f),Size(max(0f,r.width-8f),max(0f,r.height-8f)),style=Stroke(stroke))}}
 private fun DrawScope.drawStamp(r:Rect,e:Element,ownerKey:String=""){val n=if(e.stampDecoration.kind==DecorationKind.DecorationPack)e.stampDecoration.basedOnBuiltin.ifBlank{"Star1"}else e.stampDecoration.builtinName;val alpha=e.opacity.coerceIn(0f,1f);rotate(e.rotationDegrees,pivot=r.center){when(n){SELF_IDENTICON_STAMP->drawIdenticonStamp(r,ownerKey,alpha);"Dot1"->drawOval(Color(0xFF7866DC).copy(alpha=alpha),r.topLeft,r.size);"Moon1"->{val outer=Path().apply{addOval(r)};val cut=Path().apply{addOval(Rect(r.left+r.width*.34f,r.top-r.height*.08f,r.right+r.width*.10f,r.bottom-r.height*.08f))};drawPath(Path.combine(PathOperation.Difference,outer,cut),Color(0xFFF6D36B).copy(alpha=alpha))};else->{val p=Path();val cx=r.center.x;val cy=r.center.y;val ro=min(r.width,r.height)*.48f;val ri=ro*.43f;repeat(10){i->val a=-PI/2+i*PI/5;val rr=if(i%2==0)ro else ri;val x=cx+cos(a).toFloat()*rr;val y=cy+sin(a).toFloat()*rr;if(i==0)p.moveTo(x,y)else p.lineTo(x,y)};p.close();drawPath(p,if(n=="Star2")Color(0xFF4EA8DE).copy(alpha=alpha)else Color(0xFF7866DC).copy(alpha=alpha))}}}}
-private fun DrawScope.drawTextWrapped(text:String,r:Rect,e:Element,color:Int=e.textArgb,align:Layout.Alignment?=null){
-    drawIntoCanvas { canvas ->
-        val paint = TextPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
-            this.color = color
-            textSize = e.fontSize * density
-            isUnderlineText = e.underline
-            typeface = when {
-                e.bold && e.italic -> Typeface.create(Typeface.DEFAULT, Typeface.BOLD_ITALIC)
-                e.bold -> Typeface.DEFAULT_BOLD
-                e.italic -> Typeface.create(Typeface.DEFAULT, Typeface.ITALIC)
-                else -> Typeface.DEFAULT
-            }
-        }
-        val a = align ?: when(e.textAlign){
-            TextAlignMode.Left -> Layout.Alignment.ALIGN_NORMAL
-            TextAlignMode.Center -> Layout.Alignment.ALIGN_CENTER
-            TextAlignMode.Right -> Layout.Alignment.ALIGN_OPPOSITE
-        }
-        val layout = StaticLayout.Builder.obtain(text,0,text.length,paint,max(1,r.width.toInt()))
-            .setAlignment(a)
-            .setIncludePad(false)
-            .build()
-        canvas.nativeCanvas.save()
-        canvas.nativeCanvas.translate(r.left,r.top)
-        layout.draw(canvas.nativeCanvas)
-        canvas.nativeCanvas.restore()
-    }
+/**
+ * The editor and published viewer must measure text with the same Compose paragraph
+ * engine. Drawing Android StaticLayout here while the viewer uses Compose Text causes
+ * different glyph sizes and line breaks, especially with accessibility font scaling.
+ *
+ * The authored rectangle defines the line-breaking width, not a maximum height: a
+ * paragraph can extend below its authored box just as it does in the published view.
+ */
+private fun DrawScope.drawTextWrapped(
+    text: String,
+    r: Rect,
+    e: Element,
+    textMeasurer: TextMeasurer,
+    color: Int = e.textArgb,
+    align: TextAlignMode = e.textAlign,
+) {
+    if (text.isEmpty() || r.width <= 0f) return
+    val layout = textMeasurer.measure(
+        text = text,
+        style = authoredPageTextStyle(e, color, align),
+        constraints = Constraints(
+            minWidth = max(1, r.width.roundToInt()),
+            maxWidth = max(1, r.width.roundToInt()),
+        ),
+        overflow = TextOverflow.Clip,
+        softWrap = true,
+    )
+    drawText(layout, topLeft = r.topLeft)
 }
 
 /**
@@ -1797,6 +1788,8 @@ internal fun DrawScope.drawElement(
     imageLookup:(Element)->ImageBitmap? = { null },
     ownerKey:String = "",
     skipImageIds:Set<String> = emptySet(),
+    skipTextIds:Set<String> = emptySet(),
+    textMeasurer: TextMeasurer,
 ){
     if(!e.rect.visible)return
     val r=childRect(parent,e.rect)
@@ -1804,23 +1797,19 @@ internal fun DrawScope.drawElement(
         ElementType.Block->{
             drawBackground(r,e.background)
             drawBorderSpec(r,e.border,e.borderThickness)
-            e.children.sortedBy{it.rect.zIndex}.forEach{drawElement(it,r,if(selectChildren)selectedId else "",selectChildren,strings,inlineEditingId,widgetLookup,imageLookup,ownerKey,skipImageIds)}
+            e.children.sortedBy{it.rect.zIndex}.forEach{drawElement(it,r,if(selectChildren)selectedId else "",selectChildren,strings,inlineEditingId,widgetLookup,imageLookup,ownerKey,skipImageIds,skipTextIds,textMeasurer)}
         }
         ElementType.Stamp->drawStamp(r,e,ownerKey)
-        ElementType.Text-> if(e.id != inlineEditingId) drawTextWrapped(e.text,r,e)
+        ElementType.Text-> if(e.id != inlineEditingId && e.id !in skipTextIds) drawTextWrapped(e.text,r,e,textMeasurer)
         ElementType.Link-> drawTextWrapped(
-            e.label,r,e.copy(fontSize=16f,textAlign=TextAlignMode.Center),
+            e.label,r,e.copy(fontSize=16f,textAlign=TextAlignMode.Center),textMeasurer,
             if(e.targetType==LinkTargetType.External)0xFFB42832.toInt()else 0xFF3747B4.toInt(),
-            Layout.Alignment.ALIGN_CENTER
+            TextAlignMode.Center
         )
         ElementType.Button->{
             drawBackground(r,e.background)
             drawBorderSpec(r,e.buttonDecoration,1f)
-            drawTextWrapped(e.label,r,e,e.textArgb,when(e.textAlign){
-                TextAlignMode.Left->Layout.Alignment.ALIGN_NORMAL
-                TextAlignMode.Center->Layout.Alignment.ALIGN_CENTER
-                TextAlignMode.Right->Layout.Alignment.ALIGN_OPPOSITE
-            })
+            drawTextWrapped(e.label,r,e,textMeasurer)
         }
         ElementType.Media->{
             val bitmap = if(e.mediaKind==MediaKind.Image) imageLookup(e) else null
@@ -1852,15 +1841,15 @@ internal fun DrawScope.drawElement(
             }
             drawRect(Color(0xFFE5E7EB),r.topLeft,r.size)
             drawRect(Color(0xFF6B7280),r.topLeft,r.size,style=Stroke(1f))
-            drawTextWrapped("${strings.mediaKinds[e.mediaKind.ordinal]}\n${e.mediaTitle}\n${e.intrinsicWidth} × ${e.intrinsicHeight}\n${strings.mediaSuffix}",r,e.copy(fontSize=13f,textAlign=TextAlignMode.Center),0xFF374151.toInt(),Layout.Alignment.ALIGN_CENTER)
+            drawTextWrapped("${strings.mediaKinds[e.mediaKind.ordinal]}\n${e.mediaTitle}\n${e.intrinsicWidth} × ${e.intrinsicHeight}\n${strings.mediaSuffix}",r,e.copy(fontSize=13f,textAlign=TextAlignMode.Center),textMeasurer,0xFF374151.toInt(),TextAlignMode.Center)
         }
         ElementType.Widget->{
             val program=widgetLookup(e)
-            if(program!=null) drawWidgetProgramStatic(program,r,strings.widgetPaused)
+            if(program!=null) drawWidgetProgramStatic(program,r,strings.widgetPaused,textMeasurer)
             else {
                 drawRect(Color(0xFFEEF0F4),r.topLeft,r.size)
                 drawRect(Color(0xFF6B7280),r.topLeft,r.size,style=Stroke(1f,pathEffect=PathEffect.dashPathEffect(floatArrayOf(7f,6f))))
-                drawTextWrapped("${e.widgetLabel}\n${strings.widgetSuffix}",r,e.copy(fontSize=13f,textAlign=TextAlignMode.Center),0xFF374151.toInt(),Layout.Alignment.ALIGN_CENTER)
+                drawTextWrapped("${e.widgetLabel}\n${strings.widgetSuffix}",r,e.copy(fontSize=13f,textAlign=TextAlignMode.Center),textMeasurer,0xFF374151.toInt(),TextAlignMode.Center)
             }
         }
     }
@@ -3262,7 +3251,7 @@ private fun SaveAsDialog(state:EditorState){AlertDialog(onDismissRequest={state.
 @Composable
 private fun OpenDialog(state:EditorState){val files=state.localProfiles();AlertDialog(onDismissRequest={state.showOpen=false},title={Text(stringResource(R.string.open_local_profile))},text={Column(Modifier.heightIn(max=420.dp).verticalScroll(rememberScrollState())){if(files.isEmpty())Text(stringResource(R.string.no_saved_profiles));files.forEach{f->TextButton(onClick={state.open(f)},modifier=Modifier.fillMaxWidth()){Text(f.removeSuffix(".txt"),modifier=Modifier.fillMaxWidth())}}}},confirmButton={},dismissButton={TextButton(onClick={state.showOpen=false}){Text(stringResource(R.string.close))}})}
 
-private fun DrawScope.drawWidgetProgramStatic(program: WidgetProgram, r: Rect, pausedText: String) {
+private fun DrawScope.drawWidgetProgramStatic(program: WidgetProgram, r: Rect, pausedText: String, textMeasurer: TextMeasurer) {
     drawRect(Color(program.backgroundArgb), r.topLeft, r.size)
     program.nodes.filter { it.visible }.forEach { n ->
         val nr = Rect(
@@ -3288,7 +3277,7 @@ private fun DrawScope.drawWidgetProgramStatic(program: WidgetProgram, r: Rect, p
                     underline = n.underline,
                     textAlign = when(n.align){WidgetTextAlign.Left->TextAlignMode.Left;WidgetTextAlign.Center->TextAlignMode.Center;WidgetTextAlign.Right->TextAlignMode.Right}
                 )
-                drawTextWrapped(n.text, nr, fake, n.textArgb, when(n.align){WidgetTextAlign.Left->Layout.Alignment.ALIGN_NORMAL;WidgetTextAlign.Center->Layout.Alignment.ALIGN_CENTER;WidgetTextAlign.Right->Layout.Alignment.ALIGN_OPPOSITE})
+                drawTextWrapped(n.text, nr, fake, textMeasurer)
             }
         }
     }

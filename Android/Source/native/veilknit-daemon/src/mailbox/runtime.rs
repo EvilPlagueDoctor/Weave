@@ -831,7 +831,10 @@ impl MailboxRuntime {
                 read: true,
             }
         };
-        self.persist().await?;
+        // This modifies only the encrypted local inbox read flag. Exporting the
+        // entire DHT snapshot here can take network time and needlessly block
+        // the mailbox actor (including other inbox reads and outgoing sends).
+        self.persist_local_only()?;
         Ok(result)
     }
 
@@ -840,7 +843,9 @@ impl MailboxRuntime {
             .inbox_messages
             .remove(&message_id)
             .ok_or(MailboxError::MessageNotFound)?;
-        self.persist().await
+        // Inbox deletion changes no Veilid record/package state; keep the
+        // encrypted local write, not an unrelated DHT snapshot export.
+        self.persist_local_only()
     }
 
     async fn advertisement(&self) -> Result<MailboxAdvertisement, MailboxError> {
@@ -1159,10 +1164,17 @@ async fn mailbox_actor(
                         let _ = reply.send(runtime.status().await);
                     }
                     MailboxCommand::ListInbox { reply } => {
-                        let _ = reply.send(Ok(runtime.inbox_summaries()));
+                        if !reply.is_closed() {
+                            let _ = reply.send(Ok(runtime.inbox_summaries()));
+                        }
                     }
                     MailboxCommand::ReadInbox { message_id, reply } => {
-                        let _ = reply.send(runtime.read_inbox_message(message_id).await);
+                        // The API caller may already have timed out while a
+                        // preceding network commit occupied this actor. Avoid
+                        // marking a message read for a response nobody can see.
+                        if !reply.is_closed() {
+                            let _ = reply.send(runtime.read_inbox_message(message_id).await);
+                        }
                     }
                     MailboxCommand::DeleteInbox { message_id, reply } => {
                         let _ = reply.send(runtime.delete_inbox_message(message_id).await);

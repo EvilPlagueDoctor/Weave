@@ -23,7 +23,13 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
@@ -146,9 +152,15 @@ fun PageCanvas(
     val renderedImageIds = visibleImagePlacements
         .mapNotNull { placement -> imageLookup(placement.element)?.let { placement.element.id } }
         .toSet()
+    val selectableText = remember(page) { page.selectableTextPlacements() }
+    val selectableTextIds = remember(selectableText) { selectableText.map { it.element.id }.toSet() }
+    val textMeasurer = rememberTextMeasurer()
 
-    BoxWithConstraints(modifier.then(hitTest)) {
-        Canvas(Modifier.matchParentSize()) {
+    // Attach the legacy widget/image hit-test to the canvas rather than the parent.
+    // A parent detectTapGestures can consume the long press before a text child can
+    // activate selection handles. Visible image overlays handle their own long press.
+    BoxWithConstraints(modifier) {
+        Canvas(Modifier.matchParentSize().then(hitTest)) {
             val root = page.root
             val rootRect = Rect(0f, 0f, size.width, size.height)
             drawBackground(rootRect, root.background)
@@ -162,6 +174,8 @@ fun PageCanvas(
                     imageLookup = imageLookup,
                     ownerKey = ownerKey,
                     skipImageIds = renderedImageIds,
+                    skipTextIds = selectableTextIds,
+                    textMeasurer = textMeasurer,
                 )
             }
         }
@@ -173,6 +187,9 @@ fun PageCanvas(
                     Modifier
                         .offset(x = maxWidth * placement.x, y = maxHeight * placement.y)
                         .size(width = maxWidth * placement.width, height = maxHeight * placement.height)
+                        .pointerInput(placement.element.id, onImageLongPress) {
+                            detectTapGestures(onLongPress = { onImageLongPress?.invoke(placement.element) })
+                        }
                 ) {
                     FilteredImage(
                         contentId = "profile-image:${placement.element.mediaContentHash.ifBlank { placement.element.id }}",
@@ -187,6 +204,27 @@ fun PageCanvas(
                         )
                     }
                 }
+            }
+        }
+
+        // Every text node has its own selection registrar. That keeps selections inside
+        // the authored rectangle and avoids making the whole profile swallow swipe gestures.
+        selectableText.forEach { placement ->
+            val element = placement.element
+            SelectionContainer(
+                modifier = Modifier
+                    .offset(x = maxWidth * placement.x, y = maxHeight * placement.y)
+                    // Canvas text wraps to the authored width but does not clip to the
+                    // authored height. Match that behavior so long paragraphs stay visible.
+                    .width(maxWidth * placement.width)
+                    .wrapContentHeight(unbounded = true)
+            ) {
+                Text(
+                    text = element.text,
+                    modifier = Modifier.fillMaxWidth(),
+                    style = authoredPageTextStyle(element),
+                    overflow = TextOverflow.Clip,
+                )
             }
         }
     }
@@ -283,6 +321,8 @@ fun ProfileViewerScreen(
     onOpenLink: (DetectedLink) -> Unit = {},
     isFollowing: Boolean,
     onToggleFollow: () -> Unit,
+    swipeIndex: Int,
+    swipeCount: Int,
     onPrevProfile: (() -> Unit)?,
     onNextProfile: (() -> Unit)?,
     onBack: () -> Unit,
@@ -337,6 +377,7 @@ fun ProfileViewerScreen(
 
     Column(Modifier.fillMaxSize()) {
         ViewerHeader(profile, isFollowing, onToggleFollow, onBack, onNameClick = { showProfileMenu = true })
+        ProfileSwipeBar(swipeIndex, swipeCount, onPrevProfile, onNextProfile)
         BoxWithConstraints(
             Modifier
                 .weight(1f)
@@ -484,7 +525,9 @@ private fun ProfileGroupsSection(
             ) {
                 Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
-                        Text(group.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                        SelectionContainer {
+                            Text(group.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                        }
                         Text(
                             if (group.kind == GroupBranchKind.Original) "Created" else "Claimed moderation",
                             style = MaterialTheme.typography.labelSmall,
@@ -742,7 +785,9 @@ fun CommentsSection(
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                    Text(pending.body, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 4.dp))
+                    SelectionContainer {
+                        Text(pending.body, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 4.dp))
+                    }
                 }
             }
         }

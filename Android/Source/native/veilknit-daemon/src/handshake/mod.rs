@@ -2162,7 +2162,7 @@ impl HandshakeManager {
 
         let blob = fetch_route_blob(&self.dht_module, &msg.sender_dht).await?;
 
-        crate::tprintln!("[handshake] Sending type 2 to {:?}", blob);
+        crate::tprintln!("[handshake] Sending type 2 to {} route_bytes={}", msg.sender_dht, blob.blob.len());
 
         let reply_bytes = encode_handshake_message(&reply)?;
         send_raw_private_route_message(&self.veilid, &blob.blob, reply_bytes.clone()).await?;
@@ -2396,7 +2396,6 @@ impl HandshakeManager {
         &mut self,
         msg: HandshakeMessage,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-	crate::tprintln!("handle checkin");
         let state = match self.sessions.get_mut(&msg.sender_dht) {
             Some(s) => s,
             None => {

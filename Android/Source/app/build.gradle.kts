@@ -20,8 +20,8 @@ android {
         applicationId = "app.weave"
         minSdk = 29
         targetSdk = 36
-        versionCode = 44
-        versionName = "0.11.6-startup-tips"
+        versionCode = 45
+        versionName = "0.12.0-dev1"
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
         }
@@ -72,6 +72,7 @@ dependencies {
     implementation(libs.androidx.compose.material3)
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.foundation)
+    implementation("androidx.compose.animation:animation")
     implementation(libs.androidx.compose.ui.graphics)
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.core.ktx)
@@ -82,6 +83,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation(libs.onnxruntime.android)
     debugImplementation(libs.androidx.compose.ui.tooling)
+    testImplementation(libs.junit)
 }
 
 androidComponents {

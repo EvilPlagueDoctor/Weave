@@ -22,6 +22,7 @@ enum class GroupAbuseActionV2(
     CustodyReceipt(10L * 60L * 1000L, 240, 120),
     RecoveryRequest(10L * 60L * 1000L, 90, 30),
     RecoveryBatch(10L * 60L * 1000L, 120, 60),
+    EventGossip(10L * 60L * 1000L, 180, 60),
 }
 
 class GroupAbuseGuardV2(

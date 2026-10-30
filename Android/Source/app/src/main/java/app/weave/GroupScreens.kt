@@ -10,6 +10,7 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -30,6 +31,14 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private const val GROUP_OPEN_REFRESH_MS = 10_000L
+
+data class LocalPendingGroupCommentUi(
+    val localId: Long,
+    val body: String,
+    val messageId: String? = null,
+    val status: String = "Sending…",
+    val failed: Boolean = false,
+)
 
 data class LocalPendingPostUi(
     val title: String,
@@ -559,8 +568,8 @@ fun GroupDetailScreen(
                                 DropdownMenuItem(
                                     text = {
                                         Column {
-                                            Text(tr("Curator"))
-                                            Text(tr("Retained and pending submissions"),
+                                            Text(tr("Raw / Curator"))
+                                            Text(tr("Retained and pending submissions · not moderator approved"),
                                                 style = MaterialTheme.typography.labelSmall,
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                             )
@@ -756,7 +765,7 @@ fun GroupDetailScreen(
 
             if (curatorView) {
                 item {
-                    Text(tr("This view shows post submissions still retained by this device's curator/custody layer, including items that a moderation branch has not exposed."),
+                    Text(tr("Unapproved public submissions known to this device (gossip, witness, or custody). Signatures and content hashes are checked; a claimed author identity may not yet be verified. References expire after about a week."),
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -993,7 +1002,9 @@ fun GroupDetailScreen(
                                 submissionUi.submittedConversationId = conversationId
                                 submissionUi.optimisticPost = submissionUi.optimisticPost?.copy(
                                     conversationId = conversationId,
-                                    status = "Not visible yet · waiting for the selected moderation branch",
+                                    status = if (group.policy.visibility == GroupVisibility.Public)
+                                        "Submitted · available through Raw / Curator while awaiting branch approval"
+                                    else "Submitted · waiting for the selected moderation branch",
                                     failed = false,
                                 )
                                 submissionUi.notice = "Post uploaded and submitted."
@@ -1284,7 +1295,7 @@ fun GroupPostScreen(
     ownMainDht: String,
     onBack: () -> Unit,
     onRefresh: () -> Unit,
-    onPostComment: (String) -> Unit,
+    onPostComment: (String, (Boolean, String?) -> Unit) -> Unit,
     onPinComment: (String, Boolean) -> Unit,
     onSetFeatured: (FeaturedSlot) -> Unit,
     onOpenLink: (DetectedLink) -> Unit,
@@ -1308,7 +1319,44 @@ fun GroupPostScreen(
     val canFeature = ownsBranch || ownGrant?.canEditFeatured == true
     val canComment = group?.joined == true || group?.ownerId == ownMainDht
 
-    var commentText by remember { mutableStateOf("") }
+    var commentText by remember(groupId, conversationId) { mutableStateOf("") }
+    val pendingComments = remember(groupId, conversationId) { mutableStateListOf<LocalPendingGroupCommentUi>() }
+    var nextPendingCommentId by remember(groupId, conversationId) { mutableLongStateOf(1L) }
+    var showRawComments by remember(groupId, conversationId) { mutableStateOf(false) }
+    var rawLoading by remember(groupId, conversationId) { mutableStateOf(false) }
+    var rawComments by remember(groupId, conversationId) { mutableStateOf<List<GroupRawCommentUi>>(emptyList()) }
+
+    fun refreshRawComments() {
+        rawLoading = true
+        controller.loadGroupRawComments(groupId, conversationId) { result ->
+            rawComments = result
+            rawLoading = false
+        }
+    }
+    LaunchedEffect(showRawComments, groupId, conversationId) {
+        if (showRawComments) refreshRawComments()
+    }
+
+    fun sendComment(body: String, retryId: Long? = null) {
+        val localId = retryId ?: nextPendingCommentId++
+        val existing = pendingComments.indexOfFirst { it.localId == localId }
+        val sending = LocalPendingGroupCommentUi(localId, body, status = "Sending…")
+        if (existing >= 0) pendingComments[existing] = sending else pendingComments.add(sending)
+        onPostComment(body) { ok, messageId ->
+            val position = pendingComments.indexOfFirst { it.localId == localId }
+            if (position >= 0) {
+                pendingComments[position] = sending.copy(
+                    messageId = messageId,
+                    status = if (ok) {
+                        if (group?.policy?.visibility == GroupVisibility.Public)
+                            "Submitted · awaiting approval (see raw/unapproved replies)"
+                        else "Submitted · awaiting moderation"
+                    } else "Could not confirm submission · check raw view before retry",
+                    failed = !ok,
+                )
+            }
+        }
+    }
 
     val currentPostRefresh by rememberUpdatedState(onRefresh)
     LaunchedEffect(groupId, conversationId, selected?.branchId) {
@@ -1321,6 +1369,11 @@ fun GroupPostScreen(
 
     val root = detail?.root
     val comments = detail?.comments.orEmpty()
+    // Once this branch actually exposes the comment, the optimistic copy is no longer needed.
+    LaunchedEffect(comments.map { it.message.messageId }) {
+        val visibleIds = comments.mapTo(hashSetOf()) { it.message.messageId }
+        pendingComments.removeAll { it.messageId != null && it.messageId in visibleIds }
+    }
 
     Column(Modifier.fillMaxSize()) {
         Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 2.dp) {
@@ -1376,18 +1429,22 @@ fun GroupPostScreen(
                 item {
                     ElevatedCard(Modifier.fillMaxWidth().padding(16.dp)) {
                         Column(Modifier.padding(16.dp)) {
-                            Text(
-                                root.message.authorName,
-                                style = MaterialTheme.typography.labelMedium,
-                                fontWeight = FontWeight.SemiBold,
-                            )
-                            root.message.title?.takeIf { it.isNotBlank() }?.let {
+                            SelectionContainer {
                                 Text(
-                                    it,
-                                    style = MaterialTheme.typography.titleLarge,
-                                    fontWeight = FontWeight.Bold,
-                                    modifier = Modifier.padding(top = 6.dp),
+                                    root.message.authorName,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.SemiBold,
                                 )
+                            }
+                            root.message.title?.takeIf { it.isNotBlank() }?.let {
+                                SelectionContainer {
+                                    Text(
+                                        it,
+                                        style = MaterialTheme.typography.titleLarge,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(top = 6.dp),
+                                    )
+                                }
                             }
                             if (!root.message.curatedBy.isNullOrBlank()) {
                                 Text(tr("Modified for this curated version · original source unchanged"),
@@ -1429,7 +1486,74 @@ fun GroupPostScreen(
                     )
                 }
 
-                if (comments.isEmpty()) {
+                if (group?.policy?.visibility == GroupVisibility.Public) {
+                    item {
+                        TextButton(
+                            onClick = { showRawComments = !showRawComments },
+                            modifier = Modifier.padding(horizontal = 12.dp),
+                        ) {
+                            Text(tr(if (showRawComments) "Hide raw / unapproved replies" else "Show raw / unapproved replies"))
+                        }
+                    }
+                    if (showRawComments) {
+                        item {
+                            Text(
+                                tr("Raw replies are not necessarily moderator-approved. An author's claimed identity may not be verified."),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(horizontal = 16.dp),
+                            )
+                        }
+                        item {
+                            TextButton(onClick = ::refreshRawComments, enabled = !rawLoading, modifier = Modifier.padding(horizontal = 12.dp)) {
+                                Text(tr("Refresh raw replies"))
+                            }
+                        }
+                        if (rawLoading) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
+                        items(rawComments.filter { raw ->
+                            comments.none { it.message.messageId == raw.message.messageId } &&
+                                pendingComments.none { it.messageId == raw.message.messageId }
+                        }, key = { "raw:${it.eventId}" }) { raw ->
+                            ElevatedCard(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
+                                Column(Modifier.padding(12.dp)) {
+                                    Text(
+                                        tr("Raw · awaiting moderation") + if (raw.authorBound) "" else " · unverified author identity",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.primary,
+                                    )
+                                    SelectionContainer {
+                                        Text(raw.message.authorName + ": " + raw.message.body, style = MaterialTheme.typography.bodyMedium)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (pendingComments.isNotEmpty()) {
+                    items(pendingComments, key = { "pending:${it.localId}" }) { pending ->
+                        ElevatedCard(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 5.dp)) {
+                            Column(Modifier.padding(12.dp)) {
+                                SelectionContainer { Text(pending.body, style = MaterialTheme.typography.bodyMedium) }
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    if (pending.messageId == null && !pending.failed) {
+                                        CircularProgressIndicator(Modifier.size(13.dp), strokeWidth = 2.dp)
+                                        Spacer(Modifier.width(6.dp))
+                                    }
+                                    Text(
+                                        tr(pending.status),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (pending.failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    if (pending.failed) {
+                                        TextButton(onClick = { sendComment(pending.body, pending.localId) }) { Text(tr("Retry (may duplicate)")) }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (comments.isEmpty() && pendingComments.isEmpty() && (!showRawComments || rawComments.isEmpty())) {
                     item { HintText(tr("No comments yet.")) }
                 } else {
                     items(comments, key = { it.message.messageId }) { view ->
@@ -1473,7 +1597,7 @@ fun GroupPostScreen(
                                 onClick = {
                                     val body = commentText.trim()
                                     if (body.isNotBlank()) {
-                                        onPostComment(body)
+                                        sendComment(body)
                                         commentText = ""
                                     }
                                 },
@@ -1505,7 +1629,9 @@ private fun GroupFullCommentRow(
         TinyThumbnail(view.message.thumbnailBase64, "group-thumb:${view.message.messageId}")
         Column(Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(view.message.authorName, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                SelectionContainer {
+                    Text(view.message.authorName, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                }
                 if (view.pinned) Text(" \uD83D\uDCCC", style = MaterialTheme.typography.labelSmall)
             }
             FilteredAutoLinkText(
@@ -1544,7 +1670,9 @@ private fun GroupPostCard(
         Row(Modifier.padding(14.dp), verticalAlignment = Alignment.Top) {
             TinyThumbnail(root.thumbnailBase64, "group-thumb:${root.messageId}")
             Column(Modifier.weight(1f)) {
-                Text(post.title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+                SelectionContainer {
+                    Text(post.title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+                }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
                         root.authorName,
@@ -1612,7 +1740,9 @@ private fun PendingLocalPostCard(post: LocalPendingPostUi) {
     ElevatedCard(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)) {
         Column(Modifier.padding(14.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(post.title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                SelectionContainer(Modifier.weight(1f)) {
+                    Text(post.title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+                }
                 if (!post.failed && post.conversationId == null) {
                     CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                 }
@@ -1623,7 +1753,9 @@ private fun PendingLocalPostCard(post: LocalPendingPostUi) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 4.dp),
             )
-            Text(post.body, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 6.dp))
+            SelectionContainer {
+                Text(post.body, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 6.dp))
+            }
             Text(
                 tr(post.status),
                 style = MaterialTheme.typography.labelSmall,
@@ -1640,11 +1772,13 @@ private fun CuratorPostCard(post: GroupCuratorPost) {
     ElevatedCard(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)) {
         Column(Modifier.padding(14.dp)) {
             val message = post.message
-            Text(
-                message?.title?.takeIf { it.isNotBlank() } ?: tr("Retained post"),
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.Bold,
-            )
+            SelectionContainer {
+                Text(
+                    message?.title?.takeIf { it.isNotBlank() } ?: tr("Retained post"),
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
             Text(
                 message?.authorName?.takeIf { it.isNotBlank() } ?: shortBranchOwner(post.authorMainDht),
                 style = MaterialTheme.typography.labelSmall,
@@ -1652,13 +1786,15 @@ private fun CuratorPostCard(post: GroupCuratorPost) {
                 modifier = Modifier.padding(top = 4.dp),
             )
             if (message != null) {
-                Text(
-                    message.body,
-                    style = MaterialTheme.typography.bodyMedium,
-                    maxLines = 4,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(top = 6.dp),
-                )
+                SelectionContainer {
+                    Text(
+                        message.body,
+                        style = MaterialTheme.typography.bodyMedium,
+                        maxLines = 4,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(top = 6.dp),
+                    )
+                }
             } else {
                 Text(tr("The retained event is known, but its payload is not currently available or failed hash verification."),
                     style = MaterialTheme.typography.bodySmall,
@@ -1835,7 +1971,9 @@ private fun GroupCommentRow(
         TinyThumbnail(message.thumbnailBase64, "group-thumb:${message.messageId}")
         Column(Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(message.authorName, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                SelectionContainer {
+                    Text(message.authorName, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                }
                 if (message.pinned) Text(" \uD83D\uDCCC", style = MaterialTheme.typography.labelSmall)
             }
             FilteredPlainText(
@@ -2117,7 +2255,9 @@ private fun GroupPulseCard(group: GroupRecord, pulse: GroupPulse, onClick: () ->
         Row(verticalAlignment = Alignment.CenterVertically) {
             GroupThumbnail(group.thumbnailBase64, group.groupId, group.name, size = 48.dp)
             Spacer(Modifier.width(10.dp))
-            Text(group.name, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+            SelectionContainer(Modifier.weight(1f)) {
+                Text(group.name, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+            }
             if (pulse.conversations.isNotEmpty()) {
                 Text(
                     "${pulse.conversations.sumOf { it.recentUniqueAuthors }} ${tr("active")}",
@@ -2133,7 +2273,9 @@ private fun GroupPulseCard(group: GroupRecord, pulse: GroupPulse, onClick: () ->
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Column(Modifier.padding(10.dp)) {
-                    Text(conversation.title, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                    SelectionContainer {
+                        Text(conversation.title, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                    }
                     conversation.rootMessage?.let { root ->
                         MessagePreviewLine(root)
                     }
@@ -2147,13 +2289,15 @@ private fun GroupPulseCard(group: GroupRecord, pulse: GroupPulse, onClick: () ->
             }
         }
         if (pulse.conversations.isEmpty()) {
-            Text(
-                group.description.ifBlank { tr("No cached conversation activity yet.") },
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            SelectionContainer {
+                Text(
+                    group.description.ifBlank { tr("No cached conversation activity yet.") },
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 }
@@ -2297,10 +2441,12 @@ private fun FeaturedCard(
                 )
             } else {
                 if (slot.title.isNotBlank()) {
-                    Text(slot.title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+                    SelectionContainer { Text(slot.title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold) }
                 }
                 if (slot.body.isNotBlank()) {
-                    Text(slot.body, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 4.dp))
+                    SelectionContainer {
+                        Text(slot.body, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 4.dp))
+                    }
                 }
             }
         }
@@ -2323,15 +2469,17 @@ private fun GroupRow(
         GroupThumbnail(group.thumbnailBase64, group.groupId, group.name, size = 46.dp)
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
-            Text(group.name, fontWeight = FontWeight.SemiBold)
+            SelectionContainer { Text(group.name, fontWeight = FontWeight.SemiBold) }
             if (group.description.isNotBlank()) {
-                Text(
-                    group.description,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                SelectionContainer {
+                    Text(
+                        group.description,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         }
         Text("${group.approximateMembers}", style = MaterialTheme.typography.labelSmall)

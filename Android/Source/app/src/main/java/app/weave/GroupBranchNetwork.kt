@@ -705,8 +705,10 @@ class GroupBranchNetwork(
         target: String,
         operation: () -> String,
     ) {
+        val scheduledAt = System.currentTimeMillis()
         V2_TRANSPORT_POOL.execute {
             val started = System.currentTimeMillis()
+            logger("[groups-v2] TRANSPORT_${label}_START event=${eventId.take(8)} target=${short(target)} queue_wait_ms=${started - scheduledAt}")
             runCatching(operation)
                 .onSuccess { receipt ->
                     logger("[groups-v2] TRANSPORT_${label}_QUEUED event=${eventId.take(8)} target=${short(target)} receipt=${receipt.take(16)} elapsed=${System.currentTimeMillis() - started}ms")

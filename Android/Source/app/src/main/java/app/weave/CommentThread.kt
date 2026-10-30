@@ -260,11 +260,13 @@ private fun CommentEntry(
         ) {
             Identicon(comment.authorKey.ifBlank { comment.authorName }, size = if (item.depth == 0) 26.dp else 20.dp)
             Spacer(Modifier.width(8.dp))
-            Text(
-                comment.authorName,
-                style = MaterialTheme.typography.labelMedium,
-                fontWeight = FontWeight.SemiBold,
-            )
+            SelectionContainer {
+                Text(
+                    comment.authorName,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
             commentStatusLabel(comment)?.let { label ->
                 Spacer(Modifier.width(6.dp))
                 Surface(
