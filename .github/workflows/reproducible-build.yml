@@ -126,12 +126,17 @@ jobs:
 
       - name: Collect APK
         shell: bash
+        env:
+          RELEASE_REF: ${{ inputs.release_ref }}
         run: |
           mkdir -p artifact
 
+          # Replace characters unsuitable for filenames.
+          SAFE_REF="$(printf '%s' "$RELEASE_REF" | sed 's#[^A-Za-z0-9._-]#-#g')"
+
           cp \
             Android/Source/app/build/outputs/apk/release/Weave-release.apk \
-            artifact/Weave-${{ inputs.release_ref }}-unsigned.apk
+            "artifact/Weave-${SAFE_REF}-unsigned.apk"
 
           sha256sum artifact/*.apk | tee artifact/SHA256SUMS.txt
 
