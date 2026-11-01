@@ -143,6 +143,75 @@ jobs:
           ls -lh artifact/
           df -h
 
+
+      - name: Sign release APK for direct installation
+        shell: bash
+        env:
+          WEAVE_KEYSTORE_BASE64: ${{ secrets.WEAVE_KEYSTORE_BASE64 }}
+          WEAVE_KEYSTORE_PASSWORD: ${{ secrets.WEAVE_KEYSTORE_PASSWORD }}
+          WEAVE_KEY_ALIAS: ${{ secrets.WEAVE_KEY_ALIAS }}
+          WEAVE_KEY_PASSWORD: ${{ secrets.WEAVE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          # Check that all signing secrets exist.
+          for VAR in \
+            WEAVE_KEYSTORE_BASE64 \
+            WEAVE_KEYSTORE_PASSWORD \
+            WEAVE_KEY_ALIAS \
+            WEAVE_KEY_PASSWORD; do
+            if [ -z "${!VAR}" ]; then
+              echo "ERROR: Missing signing secret: $VAR"
+              exit 1
+            fi
+          done
+
+          BT="$ANDROID_HOME/build-tools/36.1.0"
+          KEYSTORE="$RUNNER_TEMP/weave-release.jks"
+          ALIGNED="$RUNNER_TEMP/weave-aligned.apk"
+
+          trap 'rm -f "$KEYSTORE" "$ALIGNED"' EXIT
+
+          # Restore release keystore from GitHub Secrets.
+          printf '%s' "$WEAVE_KEYSTORE_BASE64" \
+            | base64 --decode > "$KEYSTORE"
+
+          # Find the unsigned APK produced by Gradle.
+          UNSIGNED="$(find artifact -maxdepth 1 \
+            -name '*-unsigned.apk' -print -quit)"
+
+          if [ -z "$UNSIGNED" ]; then
+            echo "ERROR: Unsigned APK not found"
+            exit 1
+          fi
+
+          SIGNED="${UNSIGNED%-unsigned.apk}-signed.apk"
+
+          # Align before signing.
+          "$BT/zipalign" -P 16 -f 4 \
+            "$UNSIGNED" "$ALIGNED"
+
+          # Sign using the release keystore.
+          "$BT/apksigner" sign \
+            --ks "$KEYSTORE" \
+            --ks-key-alias "$WEAVE_KEY_ALIAS" \
+            --ks-pass env:WEAVE_KEYSTORE_PASSWORD \
+            --key-pass env:WEAVE_KEY_PASSWORD \
+            --out "$SIGNED" \
+            "$ALIGNED"
+
+          # Verify the resulting signature.
+          "$BT/apksigner" verify \
+            --verbose --print-certs "$SIGNED"
+
+          # Generate checksums for BOTH APKs.
+          sha256sum artifact/*.apk \
+            > artifact/SHA256SUMS.txt
+
+          echo "Successfully generated:"
+          ls -lh artifact/
+
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
