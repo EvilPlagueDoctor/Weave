@@ -20,8 +20,8 @@ android {
         applicationId = "app.weave"
         minSdk = 29
         targetSdk = 36
-        versionCode = 58
-        versionName = "0.12.0-dev14-gossip-priority-discovery-veilid-0.5.8"
+        versionCode = 59
+        versionName = "0.12.0"
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
         }
