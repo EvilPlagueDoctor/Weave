@@ -169,6 +169,16 @@ private val UI_TRANSLATIONS = mapOf(
     "Preparing the image…" to arrayOf("Préparation de l’image…", "Preparando la imagen…", "Подготовка изображения…", "正在处理图片…"),
     "Images keep transparent areas; photos are still compressed to save bandwidth." to arrayOf("Les zones transparentes sont conservées ; les photos restent compressées pour économiser la bande passante.", "Las áreas transparentes se conservan; las fotos siguen comprimidas para ahorrar ancho de banda.", "Прозрачные области сохраняются; фотографии всё равно сжимаются для экономии трафика.", "透明区域会被保留；普通照片仍会压缩以节省带宽。"),
     "Language" to arrayOf("Langue", "Idioma", "Язык", "语言"),
+    "Accessibility" to arrayOf("Accessibilité", "Accesibilidad", "Специальные возможности", "无障碍"),
+    "Profile text size" to arrayOf("Taille du texte des profils", "Tamaño del texto de los perfiles", "Размер текста профилей", "个人资料文字大小"),
+    "100% is the original compact profile text size. This setting only changes how you read profiles on this device; it does not edit anyone's profile." to arrayOf(
+        "100 % correspond à la taille compacte d’origine. Ce réglage modifie seulement la lecture des profils sur cet appareil, sans changer les profils publiés.",
+        "100 % es el tamaño compacto original. Este ajuste solo cambia cómo lees perfiles en este dispositivo; no modifica los perfiles publicados.",
+        "100 % — исходный компактный размер. Настройка меняет только отображение профилей на этом устройстве, не изменяя сами профили.",
+        "100% 是原来的紧凑字体大小。此设置只影响本设备上的个人资料阅读，不会修改任何人的资料。"
+    ),
+    "Example profile text" to arrayOf("Exemple de texte de profil", "Ejemplo de texto de perfil", "Пример текста профиля", "个人资料文字示例"),
+    "Reset to default" to arrayOf("Réinitialiser", "Restablecer", "Сбросить", "恢复默认"),
     "Widgets" to arrayOf("Widgets", "Widgets", "Виджеты", "小组件"),
     "Discovery" to arrayOf("Découverte", "Descubrimiento", "Поиск людей", "发现"),
     "Diagnostics" to arrayOf("Diagnostics", "Diagnóstico", "Диагностика", "诊断"),

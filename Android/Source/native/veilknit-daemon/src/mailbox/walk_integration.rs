@@ -586,7 +586,7 @@ impl MailboxRuntime {
             || request.expires_at
                 > request
                     .posted_at
-                    .saturating_add(self.config.max_service_request_ttl_secs)
+                    .saturating_add(service_request_ttl_cap_secs(&request.service_id, self.config.max_service_request_ttl_secs))
             || now >= request.expires_at
         {
             return Err(MailboxError::InvalidMessage(

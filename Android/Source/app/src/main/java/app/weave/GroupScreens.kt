@@ -297,6 +297,7 @@ fun GroupDetailScreen(
     onSelectBranch: ((GroupBranchPointer) -> Unit)? = null,
     onCreatePost: ((String, String, LocalMediaStore.Stored?, LocalMediaStore.AudioStored?, (Boolean, String?) -> Unit) -> Unit)? = null,
     onSetFeatured: ((FeaturedSlot) -> Unit)? = null,
+    onSetAutoShowNewSubmissions: ((Boolean) -> Unit)? = null,
     onAddModerator: ((GroupModeratorGrant) -> Unit)? = null,
     onLoadCuratorPosts: (((List<GroupCuratorPost>) -> Unit) -> Unit)? = null,
     onLoadMessage: ((WeaveObjectRef, (WeaveMessage?) -> Unit) -> Unit)? = null,
@@ -470,8 +471,25 @@ fun GroupDetailScreen(
         .filter { it.conversation.objectId.startsWith("post:") && it.rootMessage != null }
         .sortedByDescending { it.lastActivity }
 
-    LaunchedEffect(curatorView, groupId) {
-        if (!curatorView) return@LaunchedEffect
+    // Signed retained submissions supplement the selected moderator's published Pulse.
+    // Load on entry and when the event store changes; never treat a raw entry as approved.
+    val autoVisibleRawPosts = if (group.policy.visibility == GroupVisibility.Public &&
+        selectedHeader?.autoShowNewSubmissions != false && !curatorView) {
+        val acceptedIds = posts.mapTo(hashSetOf()) { it.conversation.objectId }
+        val removedIds = pulse.removedPosts.mapTo(hashSetOf()) { it.postId }
+        curatorPosts.filter { item ->
+            item.conversationId !in acceptedIds &&
+                GroupRuntime.postIdFromConversation(item.conversationId) !in removedIds &&
+                item.selectedBranchState != GroupBranchEventStateV2.Rejected &&
+                item.selectedBranchState != GroupBranchEventStateV2.Ignored &&
+                item.selectedBranchState != GroupBranchEventStateV2.Accepted &&
+                item.signatureVerified && item.message != null
+        }
+    } else emptyList()
+
+    LaunchedEffect(curatorView, groupId, revision, selected?.branchId, selectedHeader?.autoShowNewSubmissions) {
+        if (!curatorView && (group.policy.visibility != GroupVisibility.Public ||
+                selectedHeader?.autoShowNewSubmissions == false)) return@LaunchedEffect
         val loader = onLoadCuratorPosts ?: return@LaunchedEffect
         curatorLoading = true
         loader { loaded ->
@@ -763,6 +781,20 @@ fun GroupDetailScreen(
                 }
             }
 
+            if (ownsBranch && !curatorView && selectedHeader != null && onSetAutoShowNewSubmissions != null) {
+                item {
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically) {
+                        Text(tr("Automatically show new submissions"), Modifier.weight(1f),
+                            style = MaterialTheme.typography.labelMedium)
+                        Switch(
+                            checked = selectedHeader.autoShowNewSubmissions,
+                            onCheckedChange = onSetAutoShowNewSubmissions,
+                        )
+                    }
+                }
+            }
+
             if (curatorView) {
                 item {
                     Text(tr("Unapproved public submissions known to this device (gossip, witness, or custody). Signatures and content hashes are checked; a claimed author identity may not yet be verified. References expire after about a week."),
@@ -779,14 +811,14 @@ fun GroupDetailScreen(
                     }
                     curatorPosts.isEmpty() -> item { HintText(tr("No retained post submissions are available on this device.")) }
                     else -> items(curatorPosts, key = { "curator:${it.eventId}" }) { item ->
-                        CuratorPostCard(item)
+                        CuratorPostCard(item, onClick = if (item.signatureVerified && item.message != null) ({ onOpenPost(item.conversationId) }) else null)
                     }
                 }
             } else {
                 submissionUi.optimisticPost?.let { pending ->
                     item(key = "local-pending-post") { PendingLocalPostCard(pending) }
                 }
-                if (posts.isEmpty() && submissionUi.optimisticPost == null) {
+                if (posts.isEmpty() && autoVisibleRawPosts.isEmpty() && submissionUi.optimisticPost == null) {
                     item { HintText(tr("No posts yet.")) }
                 } else {
                     items(posts, key = { it.conversation.objectId }) { post ->
@@ -816,6 +848,11 @@ fun GroupDetailScreen(
                                 }
                             },
                         )
+                    }
+                    if (autoVisibleRawPosts.isNotEmpty()) {
+                        items(autoVisibleRawPosts, key = { "event:${it.eventId}" }) { item ->
+                            CuratorPostCard(item, onClick = { onOpenPost(item.conversationId) })
+                        }
                     }
                 }
 
@@ -1312,6 +1349,24 @@ fun GroupPostScreen(
         selected?.branchId?.let { store.postDetail(groupId, it, conversationId) }
     }
 
+    // A signed public submission is viewable before the chosen moderator publishes a Pulse.
+    // This belongs in GroupPostScreen (which has conversationId and controller), not the
+    // group-level screen. Never retain a fallback across moderation-branch switches.
+    var publicFallback by remember(groupId, conversationId, selected?.branchId) {
+        mutableStateOf<GroupMessageView?>(null)
+    }
+    LaunchedEffect(
+        groupId, conversationId, selected?.branchId, revision, detail?.root,
+        group?.policy?.visibility, selectedHeader?.autoShowNewSubmissions,
+    ) {
+        if (detail?.root != null || group?.policy?.visibility != GroupVisibility.Public ||
+            selectedHeader?.autoShowNewSubmissions == false) {
+            publicFallback = null
+        } else {
+            controller.loadGroupPublicPost(groupId, conversationId) { publicFallback = it }
+        }
+    }
+
     val ownGrant = selectedHeader?.moderators?.firstOrNull { it.moderatorMainDht == ownMainDht }
     val ownsBranch = selected?.ownerMainDht == ownMainDht ||
         (selected == null && group?.ownerId == ownMainDht)
@@ -1322,7 +1377,10 @@ fun GroupPostScreen(
     var commentText by remember(groupId, conversationId) { mutableStateOf("") }
     val pendingComments = remember(groupId, conversationId) { mutableStateListOf<LocalPendingGroupCommentUi>() }
     var nextPendingCommentId by remember(groupId, conversationId) { mutableLongStateOf(1L) }
-    var showRawComments by remember(groupId, conversationId) { mutableStateOf(false) }
+    val autoShowReplies = group?.policy?.visibility == GroupVisibility.Public &&
+        (selectedHeader?.autoShowNewSubmissions != false)
+    var rawReplyOverride by remember(groupId, conversationId) { mutableStateOf<Boolean?>(null) }
+    val showRawComments = rawReplyOverride ?: autoShowReplies
     var rawLoading by remember(groupId, conversationId) { mutableStateOf(false) }
     var rawComments by remember(groupId, conversationId) { mutableStateOf<List<GroupRawCommentUi>>(emptyList()) }
 
@@ -1333,7 +1391,7 @@ fun GroupPostScreen(
             rawLoading = false
         }
     }
-    LaunchedEffect(showRawComments, groupId, conversationId) {
+    LaunchedEffect(showRawComments, autoShowReplies, groupId, conversationId) {
         if (showRawComments) refreshRawComments()
     }
 
@@ -1367,7 +1425,7 @@ fun GroupPostScreen(
         }
     }
 
-    val root = detail?.root
+    val root = detail?.root ?: publicFallback
     val comments = detail?.comments.orEmpty()
     // Once this branch actually exposes the comment, the optimistic copy is no longer needed.
     LaunchedEffect(comments.map { it.message.messageId }) {
@@ -1429,6 +1487,12 @@ fun GroupPostScreen(
                 item {
                     ElevatedCard(Modifier.fillMaxWidth().padding(16.dp)) {
                         Column(Modifier.padding(16.dp)) {
+                            if (detail?.root == null && publicFallback != null) {
+                                Text(tr("Retained public submission · pending moderator decision"),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.padding(bottom = 6.dp))
+                            }
                             SelectionContainer {
                                 Text(
                                     root.message.authorName,
@@ -1489,7 +1553,7 @@ fun GroupPostScreen(
                 if (group?.policy?.visibility == GroupVisibility.Public) {
                     item {
                         TextButton(
-                            onClick = { showRawComments = !showRawComments },
+                            onClick = { rawReplyOverride = !showRawComments },
                             modifier = Modifier.padding(horizontal = 12.dp),
                         ) {
                             Text(tr(if (showRawComments) "Hide raw / unapproved replies" else "Show raw / unapproved replies"))
@@ -1768,8 +1832,9 @@ private fun PendingLocalPostCard(post: LocalPendingPostUi) {
 }
 
 @Composable
-private fun CuratorPostCard(post: GroupCuratorPost) {
-    ElevatedCard(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)) {
+private fun CuratorPostCard(post: GroupCuratorPost, onClick: (() -> Unit)? = null) {
+    ElevatedCard(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)
+        .clickable(enabled = onClick != null) { onClick?.invoke() }) {
         Column(Modifier.padding(14.dp)) {
             val message = post.message
             SelectionContainer {

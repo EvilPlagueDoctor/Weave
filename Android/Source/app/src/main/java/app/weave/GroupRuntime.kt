@@ -526,10 +526,13 @@ class GroupRuntime(
                 }
                 GroupCuratorPost(
                     eventId = stored.event.eventId,
+                    selectedBranchState = store.selectedBranch(groupId)?.branchId?.let(stored.branchStates::get),
+                    signatureVerified = stored.validation == GroupEventValidationV2.Valid,
                     conversationId = postConversationId(stored.event.payload.objectId),
                     authorMainDht = stored.event.authorMainDht,
                     createdAt = stored.event.createdAt,
                     status = status + if (stored.authorBinding == GroupEventAuthorBindingV2.RemoteUnbound) " · author identity not bound" else "",
+                    contentRef = stored.event.payload.toWeaveRef(),
                     message = if (stored.contentState != GroupEventContentStateV2.Valid) null
                     else content.fetch(stored.event.payload.toWeaveRef())?.takeIf {
                         groupV2MessageHash(it).equals(stored.event.contentHashHex, ignoreCase = true)
@@ -537,6 +540,28 @@ class GroupRuntime(
                 )
             }
             .toList()
+    }
+
+    /** Load one signed/verified public post without depending on the selected moderator's Pulse. */
+    fun publicPostFromEvent(groupId: String, conversationId: String): GroupMessageView? {
+        if (store.byId(groupId)?.policy?.visibility != GroupVisibility.Public) return null
+        val now = System.currentTimeMillis()
+        val branchId = store.selectedBranch(groupId)?.branchId
+        val removed = store.pulse(groupId).removedPosts.any { it.conversationId == conversationId }
+        if (removed) return null
+        val stored = eventStoreV2?.eventsForGroup(groupId).orEmpty()
+            .firstOrNull { it.event.eventType == GroupEventTypeV2.PostSubmitted &&
+                postConversationId(it.event.payload.objectId) == conversationId &&
+                it.event.expiresAt > now && it.validation == GroupEventValidationV2.Valid &&
+                it.contentState == GroupEventContentStateV2.Valid &&
+                branchId?.let(it.branchStates::get) !in setOf(
+                    GroupBranchEventStateV2.Accepted, GroupBranchEventStateV2.Rejected,
+                    GroupBranchEventStateV2.Ignored)
+            } ?: return null
+        val ref = stored.event.payload.toWeaveRef()
+        val message = content.fetch(ref) ?: return null
+        if (!groupV2MessageHash(message).equals(stored.event.contentHashHex, ignoreCase = true)) return null
+        return GroupMessageView(message, ref)
     }
 
     /**
@@ -550,6 +575,13 @@ class GroupRuntime(
             .asSequence()
             .filter { it.event.eventType == GroupEventTypeV2.CommentSubmitted }
             .filter { it.event.payload.parentObjectId == conversationId && it.event.expiresAt > now }
+            // A branch's accepted/rejected history is authoritative: don't revive removed
+            // replies from a stale raw inventory after a moderator deletes them.
+            .filter { row ->
+                val state = store.selectedBranch(groupId)?.branchId?.let(row.branchStates::get)
+                state != GroupBranchEventStateV2.Rejected && state != GroupBranchEventStateV2.Ignored &&
+                    state != GroupBranchEventStateV2.Accepted
+            }
             .filter { it.validation == GroupEventValidationV2.Valid && it.contentState == GroupEventContentStateV2.Valid }
             .sortedByDescending { it.event.createdAt }
             .take(limit.coerceIn(1, 60))
@@ -780,6 +812,14 @@ class GroupRuntime(
                 listOf(selected),
             )
         }
+    }
+
+    fun setAutoShowNewSubmissions(groupId: String, enabled: Boolean) {
+        val selected = store.selectedBranch(groupId) ?: error("No selected branch")
+        require(selected.ownerMainDht == ownMainDht()) { "Only branch owners can change this setting" }
+        val header = branches.readHeader(selected.branchRoot) ?: error("Branch unavailable")
+        val updated = branches.setAutoShowNewSubmissions(header, enabled)
+        store.rememberBranchHeader(updated)
     }
 
     fun setFeatured(groupId: String, slot: FeaturedSlot) {
@@ -1668,10 +1708,16 @@ class GroupRuntime(
         }
         val group = store.byId(request.groupId)
         val ownsBranch = store.branchesFor(request.groupId).any { it.ownerMainDht == sessionMainDht }
-        val eligible = group != null && (group.joined || ownsBranch) &&
-            (group.policy.visibility != GroupVisibility.MembersOnly || ownsBranch || store.privateIntakeKey(request.groupId) != null)
+        // Every Weave installation may retain signed public-group events, even without
+        // joining that group. Unknown group IDs are stored as bounded opaque custody;
+        // they are never served to strangers until the group is known as public.
+        // Known private/unlisted groups still require membership/authority.
+        val eligible = when (group?.policy?.visibility) {
+            GroupVisibility.Public, null -> true
+            else -> group.joined || ownsBranch || store.privateIntakeKey(request.groupId) != null
+        }
         if (!eligible) {
-            logger("[groups-v2] CUSTODY_REJECT event=${request.event.eventId.take(8)} group=${short(request.groupId)} reason=not-local-member")
+            logger("[groups-v2] CUSTODY_REJECT event=${request.event.eventId.take(8)} group=${short(request.groupId)} reason=nonpublic-not-member")
             return
         }
         val validation = eventStoreV2?.validateStandalone(request.event) ?: GroupEventValidationV2.Unvalidated
@@ -1690,8 +1736,9 @@ class GroupRuntime(
         // that this same node owns a Claim branch. Do not strand the event in the custody vault in
         // that case: the authenticated author->custodian message is also sufficient transport
         // evidence to feed the canonical event into this account's moderation branch.
-        if (ownsBranch && request.event.authorMainDht == sourceMainDht) {
-            logger("[groups-v2] CUSTODY_AUTHORITY_PROMOTE event=${request.event.eventId.take(8)} group=${short(request.groupId)} source=${short(sourceMainDht)}")
+        if ((group?.policy?.visibility == GroupVisibility.Public || ownsBranch) &&
+            request.event.authorMainDht == sourceMainDht) {
+            logger("[groups-v2] CUSTODY_EVENT_INGEST event=${request.event.eventId.take(8)} group=${short(request.groupId)} source=${short(sourceMainDht)}")
             receiveCanonicalEventV2(
                 packet = GroupEventTransportPacketV2(request.event),
                 sourceMainDht = sourceMainDht,
@@ -1796,8 +1843,9 @@ class GroupRuntime(
             return
         }
         val localGroup = store.byId(request.groupId) ?: return
-        val localCanServe = localGroup.joined || store.branchesFor(request.groupId).any { it.ownerMainDht == sessionMainDht }
-        val requesterIsAuthority = localGroup.ownerId == sourceMainDht || store.branchesFor(request.groupId).any { it.ownerMainDht == sourceMainDht }
+        val isPublic = localGroup.policy.visibility == GroupVisibility.Public
+        val localCanServe = isPublic || localGroup.joined || store.branchesFor(request.groupId).any { it.ownerMainDht == sessionMainDht }
+        val requesterIsAuthority = isPublic || localGroup.ownerId == sourceMainDht || store.branchesFor(request.groupId).any { it.ownerMainDht == sourceMainDht }
         if (!localCanServe || !requesterIsAuthority) {
             logger("[groups-v2] RECOVERY_REQUEST_REJECT group=${short(request.groupId)} source=${short(sourceMainDht)} reason=membership-or-authority")
             return
@@ -2532,11 +2580,7 @@ class GroupRuntime(
 
             if (event.kind == GroupEventKind.PostSubmitted) {
                 val ref = envelope.contentRef ?: return
-                val auto = when (header.group.policy.posting) {
-                    GroupPostingPolicy.Everyone -> true
-                    GroupPostingPolicy.Established -> false
-                    GroupPostingPolicy.Approval -> false
-                }
+                val auto = header.autoShowNewSubmissions
                 if (auto) {
                     // DHT-level idempotency protects old/legacy duplicate deliveries as well as v2.
                     val existing = branches.readPostDecision(header.branchRoot, event.objectId)

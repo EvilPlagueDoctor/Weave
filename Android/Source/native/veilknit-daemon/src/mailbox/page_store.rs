@@ -103,6 +103,12 @@ fn xor_distance_fraction(a: &RecordKey, b: &RecordKey) -> f32 {
 // Copy-on-write paged store
 // ============================================================================
 
+// Readback is non-mutating: a bounded deadline prevents one inaccessible
+// subkey from blocking every mailbox command for minutes. Never impose this
+// timeout on writes: an ambiguous timed-out write must not be assumed absent.
+const COW_OWNED_READ_DEADLINE: Duration = Duration::from_secs(45);
+const COW_READBACK_PARALLELISM_LIMIT: usize = 16;
+
 #[derive(Clone)]
 struct LocalPage<T> {
     descriptor: Option<CowPageDescriptor>,
@@ -304,6 +310,7 @@ impl<T: PageEntry> CowPagedStore<T> {
         }
 
         let commit_started = std::time::Instant::now();
+        crate::tprintln!("[cow-timing] store={} stage=begin generation={} dirty_pages={}", self.name, self.generation(), pending_before);
         if let Some(context) = trace_context {
             crate::shutdown_debug!(
                 "mailbox commit[{context}]: store={} START package={} pending_pages={} current_generation={}",
@@ -414,6 +421,7 @@ impl<T: PageEntry> CowPagedStore<T> {
         }
 
         let page_write_started = std::time::Instant::now();
+        crate::tprintln!("[cow-timing] store={} stage=page_write_start count={} concurrency={}", self.name, page_writes.len(), config.dht_io_concurrency.max(1));
         if let Some(context) = trace_context {
             crate::shutdown_debug!(
                 "mailbox commit[{context}]: store={} PAGE WRITES START count={} concurrency={}",
@@ -422,22 +430,39 @@ impl<T: PageEntry> CowPagedStore<T> {
                 config.dht_io_concurrency.max(1)
             );
         }
+        let write_concurrency = config.dht_io_concurrency.max(1);
         let writes = stream::iter(page_writes.clone().into_iter().map(|(descriptor, bytes)| {
             let dht = dht.clone();
             let package = self.package_index;
             async move {
-                dht.write_to_dht(package, descriptor.subkey, bytes)
-                    .await
-                    .map_err(MailboxError::from)?;
+                let started = std::time::Instant::now();
+                let mut write = Box::pin(dht.write_to_dht(package, descriptor.subkey, bytes));
+                // A warning at 15s, but keep awaiting the write: cancelling a
+                // DHT mutation can produce an ambiguous COW generation.
+                let write_result = tokio::select! {
+                    result = &mut write => result,
+                    _ = time::sleep(Duration::from_secs(15)) => {
+                        crate::teprintln!("[cow-subkey] phase=page_write subkey={} elapsed_ms={} outcome=still_waiting", descriptor.subkey, started.elapsed().as_millis());
+                        write.await
+                    }
+                };
+                write_result.map_err(MailboxError::from)?;
+                if started.elapsed().as_millis() >= 3000 {
+                    crate::tprintln!("[cow-subkey] phase=page_write subkey={} elapsed_ms={} outcome=ok", descriptor.subkey, started.elapsed().as_millis());
+                }
                 Ok::<_, MailboxError>(descriptor)
             }
         }))
-        .buffer_unordered(config.dht_io_concurrency.max(1))
+        .buffer_unordered(write_concurrency)
         .collect::<Vec<_>>()
         .await;
         for result in writes {
-            result?;
+            if let Err(error) = result {
+                crate::teprintln!("[cow-timing] store={} stage=page_write_error elapsed_ms={} error={}", self.name, page_write_started.elapsed().as_millis(), error);
+                return Err(error);
+            }
         }
+        crate::tprintln!("[cow-timing] store={} stage=page_write_done elapsed_ms={}", self.name, page_write_started.elapsed().as_millis());
         if let Some(context) = trace_context {
             crate::shutdown_debug!(
                 "mailbox commit[{context}]: store={} PAGE WRITES END elapsed={}ms",
@@ -447,17 +472,54 @@ impl<T: PageEntry> CowPagedStore<T> {
         }
 
         // Read back every newly written page before making it reachable.
+        // Previously this loop awaited N reads sequentially (19+ on Nick's
+        // account). Read-only verification is independent across subkeys, so
+        // bounded parallelism is safe without introducing concurrent writers.
         let page_readback_started = std::time::Instant::now();
+        let read_concurrency = config.dht_io_concurrency.max(1).min(COW_READBACK_PARALLELISM_LIMIT);
+        crate::tprintln!("[cow-timing] store={} stage=page_readback_start count={} concurrency={}", self.name, page_writes.len(), read_concurrency);
         if let Some(context) = trace_context {
             crate::shutdown_debug!("mailbox commit[{context}]: store={} PAGE READBACK START count={}", self.name, page_writes.len());
         }
-        for (descriptor, _) in &page_writes {
-            let bytes = dht
-                .read_from_dht(self.package_index, descriptor.subkey, true)
-                .await?;
-            let page: CowDataPage<T> = deserialize(&bytes)?;
-            validate_page(&page, descriptor)?;
-        }
+        // Own all stream inputs before polling it.  In particular, do not
+        // carry a page_writes/self/config borrow across the await in the
+        // mailbox actor, which Tokio requires to be Send.
+        let readback_descriptors: Vec<CowPageDescriptor> = page_writes
+            .iter()
+            .map(|(descriptor, _)| descriptor.clone())
+            .collect();
+        let readback_dht = dht.clone();
+        let readback_name = self.name.clone();
+        let readback_package = self.package_index;
+        let readback_results = stream::iter(readback_descriptors.into_iter().map(move |descriptor| {
+            let dht = readback_dht.clone();
+            let name = readback_name.clone();
+            let package = readback_package;
+            let future: BoxFuture<'static, Result<(), MailboxError>> = Box::pin(async move {
+                let started = std::time::Instant::now();
+                let subkey = descriptor.subkey;
+                let bytes = match time::timeout(COW_OWNED_READ_DEADLINE, dht.read_from_dht(package, subkey, true)).await {
+                    Ok(Ok(bytes)) => bytes,
+                    Ok(Err(error)) => {
+                        crate::teprintln!("[cow-subkey] store={} phase=new_page_readback subkey={} elapsed_ms={} outcome=error error={:?}", name, subkey, started.elapsed().as_millis(), error);
+                        return Err(MailboxError::from(error));
+                    }
+                    Err(_) => {
+                        crate::teprintln!("[cow-subkey] store={} phase=new_page_readback subkey={} elapsed_ms={} outcome=timeout", name, subkey, started.elapsed().as_millis());
+                        return Err(MailboxError::Dht(format!("{name} readback subkey {subkey} exceeded {}s", COW_OWNED_READ_DEADLINE.as_secs())));
+                    }
+                };
+                let page: CowDataPage<T> = deserialize(&bytes)?;
+                validate_page(&page, &descriptor)?;
+                let elapsed = started.elapsed().as_millis();
+                if elapsed >= 3000 {
+                    crate::tprintln!("[cow-subkey] store={} phase=new_page_readback subkey={} elapsed_ms={} outcome=ok", name, subkey, elapsed);
+                }
+                Ok::<(), MailboxError>(())
+            });
+            future
+        })).buffer_unordered(read_concurrency).collect::<Vec<_>>().await;
+        for result in readback_results { result?; }
         if let Some(context) = trace_context {
             crate::shutdown_debug!(
                 "mailbox commit[{context}]: store={} PAGE READBACK END elapsed={}ms",
@@ -466,6 +528,7 @@ impl<T: PageEntry> CowPagedStore<T> {
             );
         }
 
+        crate::tprintln!("[cow-timing] store={} stage=page_readback_done elapsed_ms={}", self.name, page_readback_started.elapsed().as_millis());
         let mut index = CowIndex {
             version: MAILBOX_PROTOCOL_VERSION,
             generation: next_generation,
@@ -485,6 +548,7 @@ impl<T: PageEntry> CowPagedStore<T> {
             )));
         }
         let index_write_started = std::time::Instant::now();
+        crate::tprintln!("[cow-timing] store={} stage=index_write_start slot={} bytes={}", self.name, target_slot, index_bytes.len());
         if let Some(context) = trace_context {
             crate::shutdown_debug!("mailbox commit[{context}]: store={} INDEX WRITE START slot={} bytes={}", self.name, target_slot, index_bytes.len());
         }
@@ -494,13 +558,20 @@ impl<T: PageEntry> CowPagedStore<T> {
             crate::shutdown_debug!("mailbox commit[{context}]: store={} INDEX WRITE END elapsed={}ms", self.name, index_write_started.elapsed().as_millis());
         }
 
+        crate::tprintln!("[cow-timing] store={} stage=index_write_done elapsed_ms={}", self.name, index_write_started.elapsed().as_millis());
         let index_read_started = std::time::Instant::now();
+        crate::tprintln!("[cow-timing] store={} stage=index_readback_start slot={}", self.name, target_slot);
         if let Some(context) = trace_context {
             crate::shutdown_debug!("mailbox commit[{context}]: store={} INDEX READBACK START slot={}", self.name, target_slot);
         }
-        let readback = dht
-            .read_from_dht(self.package_index, target_slot, true)
-            .await?;
+        let readback = time::timeout(
+            COW_OWNED_READ_DEADLINE,
+            dht.read_from_dht(self.package_index, target_slot, true),
+        ).await.map_err(|_| {
+            crate::teprintln!("[cow-subkey] store={} phase=index_readback subkey={} elapsed_ms={} outcome=timeout",
+                self.name, target_slot, index_read_started.elapsed().as_millis());
+            MailboxError::Dht(format!("{} index readback subkey {} timed out", self.name, target_slot))
+        })??;
         let readback_index: CowIndex = deserialize(&readback)?;
         if readback_index.digest != index.digest || index_digest(&readback_index)? != index.digest {
             return Err(MailboxError::StoreCorrupt(
@@ -511,7 +582,9 @@ impl<T: PageEntry> CowPagedStore<T> {
             crate::shutdown_debug!("mailbox commit[{context}]: store={} INDEX READBACK END elapsed={}ms", self.name, index_read_started.elapsed().as_millis());
         }
 
+        crate::tprintln!("[cow-timing] store={} stage=index_readback_done elapsed_ms={}", self.name, index_read_started.elapsed().as_millis());
         let validate_started = std::time::Instant::now();
+        crate::tprintln!("[cow-timing] store={} stage=generation_validation_start pages={}", self.name, readback_index.pages.len());
         if let Some(context) = trace_context {
             crate::shutdown_debug!("mailbox commit[{context}]: store={} GENERATION VALIDATION START pages={}", self.name, readback_index.pages.len());
         }
@@ -526,6 +599,7 @@ impl<T: PageEntry> CowPagedStore<T> {
             crate::shutdown_debug!("mailbox commit[{context}]: store={} GENERATION VALIDATION END elapsed={}ms", self.name, validate_started.elapsed().as_millis());
         }
 
+        crate::tprintln!("[cow-timing] store={} stage=generation_validation_done elapsed_ms={}", self.name, validate_started.elapsed().as_millis());
         self.previous_index = self.current_index.take();
         self.current_index = Some(readback_index);
         self.active_index_slot = target_slot;
@@ -542,6 +616,7 @@ impl<T: PageEntry> CowPagedStore<T> {
                 next_generation
             );
         }
+        crate::tprintln!("[cow-timing] store={} stage=commit_done total_ms={} generation={}", self.name, commit_started.elapsed().as_millis(), next_generation);
         Ok(true)
     }
 
@@ -660,12 +735,27 @@ async fn load_and_validate_owned_pages<T: PageEntry>(
     config: &MailboxConfig,
 ) -> Result<Vec<LocalPage<T>>, MailboxError> {
     validate_index_shape(index)?;
-    let results = stream::iter(index.pages.clone().into_iter().map(|descriptor| {
-        let dht = dht.clone();
-        async move {
-            let bytes = dht
-                .read_from_dht(package_index, descriptor.subkey, true)
-                .await?;
+    // Snapshot the descriptors and concurrency as owned values before the
+    // asynchronous stream.  Its tasks must not retain borrows of the index or
+    // configuration across an actor await.
+    let descriptors = index.pages.clone();
+    let concurrency = config.dht_io_concurrency.max(1).min(COW_READBACK_PARALLELISM_LIMIT);
+    let verify_dht = dht.clone();
+    let results = stream::iter(descriptors.into_iter().map(move |descriptor| {
+        let dht = verify_dht.clone();
+        let future: BoxFuture<'static, Result<LocalPage<T>, MailboxError>> = Box::pin(async move {
+            let started = std::time::Instant::now();
+            let subkey = descriptor.subkey;
+            let bytes = time::timeout(
+                COW_OWNED_READ_DEADLINE,
+                dht.read_from_dht(package_index, subkey, true),
+            ).await.map_err(|_| {
+                crate::teprintln!("[cow-subkey] phase=generation_validation subkey={} elapsed_ms={} outcome=timeout", subkey, started.elapsed().as_millis());
+                MailboxError::Dht(format!("generation verification subkey {subkey} timed out"))
+            })??;
+            if started.elapsed().as_millis() >= 3000 {
+                crate::tprintln!("[cow-subkey] phase=generation_validation subkey={} elapsed_ms={} outcome=ok", subkey, started.elapsed().as_millis());
+            }
             if bytes.len() != descriptor.serialized_size as usize {
                 return Err(MailboxError::StoreCorrupt(format!(
                     "page {} serialized-size mismatch",
@@ -679,9 +769,10 @@ async fn load_and_validate_owned_pages<T: PageEntry>(
                 entries: page.entries,
                 dirty: false,
             })
-        }
+        });
+        future
     }))
-    .buffer_unordered(config.dht_io_concurrency.max(1))
+    .buffer_unordered(concurrency)
     .collect::<Vec<_>>()
     .await;
 

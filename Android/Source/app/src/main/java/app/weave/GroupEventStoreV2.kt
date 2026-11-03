@@ -493,6 +493,11 @@ class GroupEventStoreV2(
 
     @Synchronized fun get(eventId: String): StoredGroupEventV2? = events[eventId]
     @Synchronized fun allEvents(): List<StoredGroupEventV2> = events.values.toList()
+    /** Bounded, detached snapshot for diagnostic UI; never gives Compose mutable event-store maps. */
+    @Synchronized
+    fun monitorSnapshot(limit: Int = 250): List<StoredGroupEventV2> =
+        events.values.toList().takeLast(limit.coerceIn(1, 500)).map { StoredGroupEventV2.fromJson(it.toJson()) }
+
     @Synchronized fun eventsForGroup(groupId: String): List<StoredGroupEventV2> = events.values.filter { it.event.groupId == groupId }
     @Synchronized fun size(): Int = events.size
 

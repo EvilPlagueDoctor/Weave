@@ -359,6 +359,8 @@ data class GroupBranchHeader(
     val moderators: List<GroupModeratorGrant> = emptyList(),
     val bannedMainDhts: List<String> = emptyList(),
     val knownBranches: List<GroupBranchPointer> = emptyList(),
+    /** Branch-owner policy; null in older headers uses the group posting policy. */
+    val autoShowNewSubmissions: Boolean = true,
 ) {
     fun pointer(): GroupBranchPointer = GroupBranchPointer(
         groupId = group.groupId,
@@ -386,6 +388,7 @@ data class GroupBranchHeader(
         .put("pinned_posts", JSONArray(pinnedPostIds.distinct().take(100)))
         .put("moderators", JSONArray().apply { moderators.forEach { put(it.toJson()) } })
         .put("banned_authors", JSONArray(bannedMainDhts.distinct().take(512)))
+        .put("auto_show_new_submissions", autoShowNewSubmissions)
         .put("known_branches", JSONArray().apply { knownBranches.distinctBy { it.branchId }.take(64).forEach { put(it.toJson()) } })
 
     companion object {
@@ -426,6 +429,7 @@ data class GroupBranchHeader(
                 moderators = moderators,
                 bannedMainDhts = banned,
                 knownBranches = branches,
+                autoShowNewSubmissions = o.optBoolean("auto_show_new_submissions", group.policy.posting == GroupPostingPolicy.Everyone),
             )
         }.getOrNull()
     }

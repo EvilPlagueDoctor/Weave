@@ -32,6 +32,9 @@ fun HomeScreen(
     onOpen: (String, List<String>) -> Unit,
 ) {
     val state by controller.ui.collectAsState()
+    LaunchedEffect(state.mainDht, state.connected) {
+        if (state.connected) controller.refreshDiscoveryWhenVisible()
+    }
     val following = followStore.all()
     val rows = remember(state.recent, following) {
         state.recent.filter { it.hint.mainDht in following }
@@ -197,6 +200,9 @@ fun provenanceLabel(state: VerificationState): String = when (state) {
 @Composable
 fun SearchScreen(controller: SocialNetworkController, onOpen: (String, List<String>) -> Unit) {
     val state by controller.ui.collectAsState()
+    LaunchedEffect(state.mainDht, state.connected) {
+        if (state.connected) controller.refreshDiscoveryWhenVisible()
+    }
     val context = LocalContext.current
     val visibleKeys = remember(state.query, state.recent, state.searchResults) {
         if (state.query.isBlank()) state.recent.map { it.hint.mainDht }

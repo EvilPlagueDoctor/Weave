@@ -237,11 +237,14 @@ data class GroupRemovedPostNotice(
 /** A readable view of a still-retained Groups-v2 submission in the local curator/custody cache. */
 data class GroupCuratorPost(
     val eventId: String,
+    val selectedBranchState: GroupBranchEventStateV2? = null,
+    val signatureVerified: Boolean = false,
     val conversationId: String,
     val authorMainDht: String,
     val createdAt: Long,
     val status: String,
     val message: WeaveMessage?,
+    val contentRef: WeaveObjectRef? = null,
 )
 
 data class GroupRecord(

@@ -445,6 +445,19 @@ pub fn embedded_subscription_active(id: u64) -> bool {
         .unwrap_or(false)
 }
 
+/// Return the authenticated account username from the running Rust API, never
+/// the username Android *requested* to start. Used exclusively for a same-process
+/// account-isolation check before exposing Weave's private UI.
+#[cfg(target_os = "android")]
+pub fn embedded_username() -> String {
+    embedded_context_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .map(|context| context.username.clone())
+        .unwrap_or_default()
+}
+
 #[cfg(target_os = "android")]
 pub fn embedded_profile_id() -> String {
     embedded_context_slot()
@@ -1497,6 +1510,8 @@ pub enum ApiResult {
     },
     MessageQueued {
         message_id_hex: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        delivery_path: Option<String>,
     },
     ServiceRequestPublished {
         request_id_hex: String,
@@ -3731,6 +3746,7 @@ async fn process_request(
                     );
                     return Ok(ProcessResult::Response(ApiResult::MessageQueued {
                         message_id_hex: hex::encode(message_id),
+                        delivery_path: Some("direct_handshake".to_string()),
                     }));
                 }
                 Err(error) => {
@@ -3809,6 +3825,9 @@ async fn process_request(
             );
             Ok(ProcessResult::Response(ApiResult::MessageQueued {
                 message_id_hex: hex::encode(message_id),
+                delivery_path: Some(if prefer_direct && application_id != "veilknit.mailer" {
+                    "mailbox_fallback".to_string()
+                } else { "mailbox_only".to_string() }),
             }))
         }
         ApiRequest::SendGossip {
@@ -3850,6 +3869,7 @@ async fn process_request(
             .map_err(|error| ("gossip_send_failed", error))?;
             Ok(ProcessResult::Response(ApiResult::MessageQueued {
                 message_id_hex: hex::encode(message_id),
+                delivery_path: Some("gossip_datagram".to_string()),
             }))
         }
         ApiRequest::PublishGossipObject { session_token, object } => {
@@ -4629,6 +4649,7 @@ async fn process_request(
             session_token,
             message_id_hex,
         } => {
+            let route_started = Instant::now();
             let session = authenticate_token(&context.identities, &session_token).await?;
             session
                 .require_capability(AppCapability::ReceiveMessages)
@@ -4639,6 +4660,7 @@ async fn process_request(
                 .ok_or_else(|| ("service_unavailable", "mailbox service is unavailable".to_string()))?;
             let message_id = decode_fixed::<32>(&message_id_hex, "invalid_message_id")?;
             let app_id = canonical_application_id(&session.app_id().to_string());
+            let membership_started = Instant::now();
             let belongs_to_app = mailbox
                 .list_inbox()
                 .await
@@ -4648,13 +4670,18 @@ async fn process_request(
                     message.message_id == message_id
                         && canonical_application_id(&message.application_id) == app_id
                 });
+            crate::tprintln!("[inbox-route] action=read_inbox stage=membership_lookup elapsed_ms={} total_ms={}",
+                membership_started.elapsed().as_millis(), route_started.elapsed().as_millis());
             if !belongs_to_app {
                 return Err(("message_not_found", "message was not found in this application's inbox".to_string()));
             }
+            let store_read_started = Instant::now();
             let message = mailbox
                 .read_inbox(message_id)
                 .await
                 .map_err(|error| ("inbox_read_failed", error.to_string()))?;
+            crate::tprintln!("[inbox-route] action=read_inbox stage=local_store_read elapsed_ms={} total_ms={}",
+                store_read_started.elapsed().as_millis(), route_started.elapsed().as_millis());
             Ok(ProcessResult::Response(ApiResult::InboxMessage {
                 message: ApiInboxMessage {
                     message_id_hex: hex::encode(message.message_id),
@@ -4673,6 +4700,7 @@ async fn process_request(
             session_token,
             message_id_hex,
         } => {
+            let route_started = Instant::now();
             let session = authenticate_token(&context.identities, &session_token).await?;
             session
                 .require_capability(AppCapability::ReceiveMessages)
@@ -4683,6 +4711,7 @@ async fn process_request(
                 .ok_or_else(|| ("service_unavailable", "mailbox service is unavailable".to_string()))?;
             let message_id = decode_fixed::<32>(&message_id_hex, "invalid_message_id")?;
             let app_id = canonical_application_id(&session.app_id().to_string());
+            let membership_started = Instant::now();
             let belongs_to_app = mailbox
                 .list_inbox()
                 .await
@@ -4692,13 +4721,18 @@ async fn process_request(
                     message.message_id == message_id
                         && canonical_application_id(&message.application_id) == app_id
                 });
+            crate::tprintln!("[inbox-route] action=delete_inbox stage=membership_lookup elapsed_ms={} total_ms={}",
+                membership_started.elapsed().as_millis(), route_started.elapsed().as_millis());
             if !belongs_to_app {
                 return Err(("message_not_found", "message was not found in this application's inbox".to_string()));
             }
+            let store_delete_started = Instant::now();
             mailbox
                 .delete_inbox(message_id)
                 .await
                 .map_err(|error| ("inbox_delete_failed", error.to_string()))?;
+            crate::tprintln!("[inbox-route] action=delete_inbox stage=local_store_delete elapsed_ms={} total_ms={}",
+                store_delete_started.elapsed().as_millis(), route_started.elapsed().as_millis());
             Ok(ProcessResult::Response(ApiResult::InboxMessageDeleted {
                 message_id_hex,
             }))
@@ -5167,6 +5201,8 @@ async fn process_request(
             locations,
             force_refresh,
         } => {
+            let read_started = Instant::now();
+            let location_count = locations.len();
             let session = authenticate_token(&context.identities, &session_token).await?;
             session
                 .require_capability(AppCapability::ReadPublicProfiles)
@@ -5182,6 +5218,12 @@ async fn process_request(
                 .read_public(parsed, locations, force_refresh)
                 .await
                 .map_err(app_service_error)?;
+            if read_started.elapsed().as_millis() >= 2_000 {
+                crate::tprintln!(
+                    "[read-route] action=read_public_store path=veilid_dht force_refresh={} locations={} elapsed_ms={} (network_hops_not_exposed)",
+                    force_refresh, location_count, read_started.elapsed().as_millis()
+                );
+            }
             Ok(ProcessResult::Response(ApiResult::PublicStoreRead { record_key, values }))
         }
         ApiRequest::PutPrivateValue { session_token, key, value_base64, retention, ttl_seconds } => {
@@ -5342,6 +5384,7 @@ async fn process_request(
             Ok(ProcessResult::Response(ApiResult::BlobDeleted { blob_id }))
         }
         ApiRequest::ReadBlobRange { session_token, root_record_key, offset, length, force_refresh } => {
+            let read_started = Instant::now();
             let session = authenticate_token(&context.identities, &session_token).await?;
             session.require_capability(AppCapability::ReadPublicProfiles).map_err(identity_error)?;
             let parsed: RecordKey = root_record_key.parse()
@@ -5351,6 +5394,12 @@ async fn process_request(
             ))?;
             let (blob, data) = blobs.read_public_range(parsed, offset, length, force_refresh)
                 .await.map_err(blob_store_error)?;
+            if read_started.elapsed().as_millis() >= 2_000 {
+                crate::tprintln!(
+                    "[read-route] action=read_blob_range path=veilid_blob force_refresh={} length={} elapsed_ms={} (network_hops_not_exposed)",
+                    force_refresh, length, read_started.elapsed().as_millis()
+                );
+            }
             Ok(ProcessResult::Response(ApiResult::BlobRangeRead {
                 blob, offset, data_base64: BASE64.encode(data),
             }))
@@ -5922,13 +5971,21 @@ async fn try_direct_send(
     application_id: String,
     payload: Vec<u8>,
 ) -> Result<[u8; 16], String> {
+    let lock_started = std::time::Instant::now();
     let already_established = handshake
         .lock()
         .await
         .is_persistent_established(&recipient);
+    if lock_started.elapsed().as_millis() > 200 {
+        crate::tprintln!("[handshake-lock] stage=initial_status elapsed_ms={} recipient={}", lock_started.elapsed().as_millis(), recipient);
+    }
     if !already_established {
         {
+            let wait_started = std::time::Instant::now();
             let mut manager = handshake.lock().await;
+            if wait_started.elapsed().as_millis() > 200 {
+                crate::tprintln!("[handshake-lock] stage=initiate_wait elapsed_ms={} recipient={}", wait_started.elapsed().as_millis(), recipient);
+            }
             manager
                 .initiate_persistent_handshake(recipient.clone())
                 .await
@@ -5948,11 +6005,18 @@ async fn try_direct_send(
         }
     }
 
-    let manager = handshake.lock().await;
-    manager
-        .send_application_message(&recipient, &application_id, payload)
-        .await
-        .map_err(|error| error.to_string())
+    let wait_started = std::time::Instant::now();
+    let prepared = {
+        let manager = handshake.lock().await;
+        if wait_started.elapsed().as_millis() > 200 {
+            crate::tprintln!("[handshake-lock] stage=send_prepare_wait elapsed_ms={} recipient={}", wait_started.elapsed().as_millis(), recipient);
+        }
+        manager
+            .prepare_application_message(&recipient, &application_id, payload)
+            .await
+            .map_err(|error| error.to_string())?
+    }; // Mutex released before network transmission.
+    prepared.send().await.map_err(|error| error.to_string())
 }
 
 async fn write_application_event<W: AsyncWrite + Unpin>(

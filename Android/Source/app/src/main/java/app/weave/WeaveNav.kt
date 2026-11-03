@@ -45,6 +45,7 @@ sealed interface Destination {
     data class QuickEdit(val pageIndex: Int) : Destination
     data object Editor : Destination
     data object Settings : Destination
+    data object EventMonitor : Destination
     /** Hidden full VeilKnit diagnostics/management surface. */
     data object VeilKnit : Destination
     /** Normal Settings shortcut directly to VeilKnit's encrypted account-backup page. */
@@ -64,6 +65,7 @@ private fun Destination.encode(): String = when (this) {
     Destination.Activity -> "activity"
     Destination.Editor -> "editor"
     Destination.Settings -> "settings"
+    Destination.EventMonitor -> "event-monitor"
     Destination.VeilKnit -> "veilknit"
     Destination.VeilKnitBackup -> "veilknit-backup"
     Destination.GroupModeration -> "group-moderation"
@@ -82,6 +84,7 @@ private fun decodeDestination(raw: String): Destination = when {
     raw == "activity" -> Destination.Activity
     raw == "editor" -> Destination.Editor
     raw == "settings" -> Destination.Settings
+    raw == "event-monitor" -> Destination.EventMonitor
     raw == "veilknit" -> Destination.VeilKnit
     raw == "veilknit-backup" -> Destination.VeilKnitBackup
     raw == "group-moderation" -> Destination.GroupModeration

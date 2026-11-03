@@ -354,6 +354,9 @@ class GroupStore(context: Context) : PrivateVault.Participant {
             .filter { it.visibility != GroupVisibility.MembersOnly }
             .distinctBy { it.groupId to it.branchId }
             .toMutableList()
+        // Do not re-encrypt and rewrite the entire group state for an unchanged directory.
+        val prior = directoryByAdvertiser[advertiserMainDht].orEmpty()
+        if (prior.size == clean.size && prior.zip(clean).all { (a, b) -> a.toJson().toString() == b.toJson().toString() }) return
         directoryByAdvertiser[advertiserMainDht] = clean
         clean.forEach { entry ->
             rememberBranchInMemory(

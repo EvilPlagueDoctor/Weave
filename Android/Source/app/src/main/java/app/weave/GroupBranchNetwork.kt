@@ -57,6 +57,7 @@ class GroupBranchNetwork(
             pulseRoot = owned.pulseRecordKey,
             generation = (previous?.generation ?: 0L) + 1L,
             featured = previous?.featured ?: publicGroup.featured,
+            autoShowNewSubmissions = previous?.autoShowNewSubmissions ?: (publicGroup.policy.posting == GroupPostingPolicy.Everyone),
             pinnedPostIds = previous?.pinnedPostIds.orEmpty(),
             moderators = previous?.moderators.orEmpty(),
             bannedMainDhts = previous?.bannedMainDhts.orEmpty(),
@@ -115,6 +116,7 @@ class GroupBranchNetwork(
             pulseRoot = owned.pulseRecordKey,
             generation = 1,
             featured = creatorHeader.featured,
+            autoShowNewSubmissions = group.policy.posting == GroupPostingPolicy.Everyone,
             pinnedPostIds = creatorHeader.pinnedPostIds,
             knownBranches = listOf(pointerToCreator),
         )
@@ -383,6 +385,19 @@ class GroupBranchNetwork(
             logger("groups: migrated branch ${shortBranch(header.branchId)} to paged Pulse store ${shortBranch(owned.pulseRecordKey)}")
         }
         store.upsertPulse(pulse, header.branchId)
+    }
+
+    /** Only the selected branch owner can change this policy; the header is persisted in DHT. */
+    fun setAutoShowNewSubmissions(header: GroupBranchHeader, enabled: Boolean): GroupBranchHeader {
+        require(header.ownerMainDht == client.identity().optString("main_dht")) {
+            "Only the branch owner can set automatic submission visibility"
+        }
+        if (header.autoShowNewSubmissions == enabled) return header
+        val updated = header.copy(generation = header.generation + 1, autoShowNewSubmissions = enabled)
+        writeHeader(resolveOwned(header).storeId, updated)
+        store.rememberBranchHeader(updated)
+        logger("[groups-v2] BRANCH_AUTO_SHOW branch=${header.branchId.take(12)} enabled=$enabled")
+        return updated
     }
 
     fun setFeatured(
@@ -993,7 +1008,7 @@ class GroupBranchNetwork(
         const val INDEX_SUBKEYS = 64
         const val MAX_INDEX_BUCKET_ENTRIES = 128
 
-        const val OPEN_INTAKE_TTL_SECONDS = 60L * 60L
+        const val OPEN_INTAKE_TTL_SECONDS = 7L * 24L * 60L * 60L
         const val MAX_V2_AUTHORITY_FANOUT = 24
         const val PUBLIC_WITNESS_HOSTS = 3
         const val MAX_V2_WITNESS_PAYLOAD_BYTES = 700

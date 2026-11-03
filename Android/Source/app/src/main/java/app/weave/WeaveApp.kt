@@ -50,6 +50,7 @@ fun WeaveApp() {
     val controller = remember { SocialNetworkController(context) }
     val onboarding = remember { OnboardingState(context) }
     val language = remember { AppLanguageState(context) }
+    val profileTextSize = remember { ProfileTextSizeSettings(context.applicationContext) }
     val commentStore: CommentStore = controller.comments
     val followStore = remember { FollowStore(context) }
     val remoteCache = remember { RemoteProfileCache() }
@@ -104,6 +105,7 @@ fun WeaveApp() {
         LocalAppLanguage provides language.current,
         LocalResources provides localizedResources,
         LocalContentFilter provides contentFilter,
+        LocalProfileTextSizeMultiplier provides profileTextSize.multiplier,
     ) {
     MaterialTheme(colorScheme = DesignerColorScheme) {
         Surface(color = MaterialTheme.colorScheme.background) {
@@ -117,7 +119,9 @@ fun WeaveApp() {
                     embeddedDaemonStartup = true,
                 )
 
-                !hasKnownIdentity || (!ui.connected && !setupDone) -> ConnectionGate(
+                // Never display a previous account's content during any reconnect or
+                // new-account startup, even when the old editor was fully set up.
+                !hasKnownIdentity || !ui.connected -> ConnectionGate(
                     status = ui.status,
                     error = failure,
                     onRetry = { controller.restart() }
@@ -170,6 +174,7 @@ fun WeaveApp() {
                     media = media,
                     mediaLoader = mediaLoader,
                     language = language,
+                    profileTextSize = profileTextSize,
                     widgetsEnabled = widgetsEnabled,
                     onWidgetsEnabledChange = { widgetsEnabled = it },
                     connectionAvailable = ui.connected,
@@ -192,6 +197,7 @@ private fun WeaveShell(
     media: LocalMediaStore,
     mediaLoader: MediaLoader,
     language: AppLanguageState,
+    profileTextSize: ProfileTextSizeSettings,
     widgetsEnabled: Boolean,
     onWidgetsEnabledChange: (Boolean) -> Unit,
     connectionAvailable: Boolean,
@@ -267,6 +273,7 @@ private fun WeaveShell(
             Destination.Activity -> "Activity"
             Destination.Editor -> "Editor"
             Destination.Settings -> "Settings"
+            Destination.EventMonitor -> "EventMonitor"
             Destination.VeilKnit -> "VeilKnit"
             Destination.VeilKnitBackup -> "VeilKnitBackup"
             Destination.GroupModeration -> "GroupModeration"
@@ -508,6 +515,9 @@ private fun WeaveShell(
                         onSetFeatured = { slot ->
                             controller.setGroupFeatured(destination.groupId, slot)
                         },
+                        onSetAutoShowNewSubmissions = { enabled ->
+                            controller.setGroupAutoShowNewSubmissions(destination.groupId, enabled)
+                        },
                         onAddModerator = { grant ->
                             controller.grantGroupModerator(destination.groupId, grant)
                         },
@@ -593,15 +603,28 @@ private fun WeaveShell(
                 Destination.VeilKnit,
                 Destination.VeilKnitBackup -> Unit // handled as full-bleed destinations above
 
+                Destination.EventMonitor -> EventMonitorScreen(
+                    controller = controller,
+                    ownMainDht = ui.mainDht,
+                    onOpenGroup = { nav.push(Destination.Group(it)) },
+                    onOpenPost = { groupId, conversationId ->
+                        nav.push(Destination.GroupPost(groupId, conversationId))
+                    },
+                    onOpenProfile = { openProfile(it, listOf(it)) },
+                    onBack = { nav.pop() },
+                )
+
                 Destination.Settings -> SettingsScreen(
                     controller = controller,
                     ownKey = ui.mainDht,
                     media = media,
                     language = language,
+                    profileTextSize = profileTextSize,
                     widgetsEnabled = widgetsEnabled,
                     onWidgetsEnabledChange = onWidgetsEnabledChange,
                     activityCount = profileModerationCount,
                     onActivity = { nav.push(Destination.Activity) },
+                    onEventMonitor = { nav.push(Destination.EventMonitor) },
                     onClaimGroupLink = { link, onResult ->
                         controller.claimGroupLink(link, onResult)
                     },

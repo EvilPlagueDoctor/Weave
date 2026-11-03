@@ -286,6 +286,20 @@ class EditorState(private val context: Context) : PrivateVault.Participant {
         lastAttachedProfileId = attachedProfileId
         profileLoadedForCurrentAccount = false
         savedProfilePresent = null
+        // Never let a previous account's decrypted document survive into the next
+        // account's editor, including when this account's vault read fails.
+        doc = localizedDefaultProfile(context)
+        savedSnapshot = doc.deepCopy()
+        undo.clear(); redo.clear()
+        pageIndex = 0
+        selectedId = doc.pages.first().root.id
+        focusedBoxId = null
+        inlineTextEditId = null
+        inlineTextDraft = ""
+        currentFileName = null
+        pendingPersist = false
+        widgetProgramCache.clear()
+        widgetProgramLoads.clear()
         legacyProfileDir.listFiles { f -> f.isFile && f.extension.equals("txt", true) }?.forEach { file ->
             vault.migrateLegacyNamedBlob("profiles", file.name, file, "text/plain; charset=utf-8")
         }
@@ -1692,7 +1706,7 @@ private fun ProfileCanvas(
             BasicTextField(
                 value = state.inlineTextDraft,
                 onValueChange = state::updateInlineText,
-                textStyle = authoredPageTextStyle(editElement),
+                textStyle = authoredPageTextStyle(editElement, LocalDensity.current),
                 modifier = Modifier
                     .offset(x = maxWidth * xFrac, y = maxHeight * yFrac)
                     .size(
@@ -1731,7 +1745,7 @@ private fun DrawScope.drawTextWrapped(
     if (text.isEmpty() || r.width <= 0f) return
     val layout = textMeasurer.measure(
         text = text,
-        style = authoredPageTextStyle(e, color, align),
+        style = authoredPageTextStyle(e, this, color, align),
         constraints = Constraints(
             minWidth = max(1, r.width.roundToInt()),
             maxWidth = max(1, r.width.roundToInt()),

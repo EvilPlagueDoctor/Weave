@@ -101,8 +101,34 @@ pub struct MailResponseRequest {
     pub published_conversation_dht: Option<RecordKey>,
 }
 
+// Capture enqueue time at the sender, not when the actor finally receives it.
+// The wrapper preserves all callers' existing .send/.try_send APIs.
+struct TimedMailboxCommand {
+    command: MailboxCommand,
+    enqueued_at: std::time::Instant,
+}
+
+#[derive(Clone)]
+struct MailboxCommandSender(mpsc::Sender<TimedMailboxCommand>);
+
+impl MailboxCommandSender {
+    async fn send(&self, command: MailboxCommand) -> Result<(), mpsc::error::SendError<TimedMailboxCommand>> {
+        self.0.send(TimedMailboxCommand {
+            command,
+            enqueued_at: std::time::Instant::now(),
+        }).await
+    }
+
+    fn try_send(&self, command: MailboxCommand) -> Result<(), mpsc::error::TrySendError<TimedMailboxCommand>> {
+        self.0.try_send(TimedMailboxCommand {
+            command,
+            enqueued_at: std::time::Instant::now(),
+        })
+    }
+}
+
 pub struct MailboxManager {
-    tx: mpsc::Sender<MailboxCommand>,
+    tx: MailboxCommandSender,
     // Out-of-band stop signal.  Unlike MailboxCommand::Shutdown this can be
     // observed while the single mailbox actor is still awaiting a slow DHT
     // operation from an earlier command.
@@ -116,7 +142,7 @@ pub struct MailboxManager {
 #[derive(Clone)]
 pub struct MailboxAppHandle {
     app_id: AppId,
-    tx: mpsc::Sender<MailboxCommand>,
+    tx: MailboxCommandSender,
 }
 
 pub struct MailboxInit {
@@ -133,7 +159,8 @@ impl MailboxManager {
     pub async fn spawn(init: MailboxInit) -> Result<Arc<Self>, MailboxError> {
         let runtime = MailboxRuntime::initialize(init).await?;
         let snapshot = Arc::new(RwLock::new(runtime.public_snapshot().await?));
-        let (tx, rx) = mpsc::channel(512);
+        let (inner_tx, rx) = mpsc::channel(512);
+        let tx = MailboxCommandSender(inner_tx);
         let (shutdown_signal, shutdown_rx) = watch::channel(false);
         let (events, _) = broadcast::channel(256);
         let manager = Arc::new(Self {

@@ -66,6 +66,8 @@ const HANDSHAKE_SIGNATURE_BYTES: usize = 32;
 const MAX_INBOUND_HANDSHAKE_JOBS: usize = 128;
 const MAX_ROUTE_IMPORT_TRY_AGAIN: u8 = 6;
 const MAX_HANDSHAKE_RETRIES: u8 = 3;
+/// Avoid repeatedly dialling a peer after the complete outbound retry sequence fails.
+const PERSISTENT_HANDSHAKE_FAILURE_COOLDOWN_SECS: u64 = 5 * 60;
 const HANDSHAKE_IO_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Message type 4 is a deliberately information-free protocol reset. It does
@@ -406,6 +408,23 @@ pub struct GossipApplicationMessage {
 pub type EstablishedPeerHandler =
     Arc<dyn Fn(RecordKey) -> BoxFuture<'static, ()> + Send + Sync>;
 
+/// Fully encrypted direct message, prepared under the handshake state lock.
+/// The actual Veilid send runs AFTER releasing the shared lock.
+pub struct PreparedDirectSend {
+    veilid: VeilidAPI,
+    route: Vec<u8>,
+    bytes: Vec<u8>,
+    message_id: [u8; 16],
+}
+
+impl PreparedDirectSend {
+    pub async fn send(self) -> Result<[u8; 16], Box<dyn std::error::Error + Send + Sync>> {
+        send_raw_private_route_message(&self.veilid, &self.route, self.bytes).await?;
+        Ok(self.message_id)
+    }
+}
+
+
 pub struct HandshakeManager {
     pub sessions: HashMap<String, HandshakeState>,
     pub veilid: VeilidAPI,
@@ -452,6 +471,8 @@ pub struct HandshakeManager {
     quarantined_until: HashMap<String, u64>,
     ignored_until: HashMap<String, u64>,
     pending_restarts: HashMap<String, PendingHandshakeRestart>,
+    /// Ordinary outbound failures only; does not block inbound connections.
+    persistent_handshake_failed_at: HashMap<String, u64>,
 
     /// Cryptographically wrong challenge answers are tracked separately from
     /// timeouts and malformed/lost packets. Ordinary network failure should not
@@ -717,6 +738,7 @@ impl HandshakeManager {
             quarantined_until: HashMap::new(),
             ignored_until: HashMap::new(),
             pending_restarts: HashMap::new(),
+            persistent_handshake_failed_at: HashMap::new(),
             challenge_failures: HashMap::new(),
             last_reputation_diagnostic: HashMap::new(),
         }
@@ -960,8 +982,16 @@ impl HandshakeManager {
             loop {
                 interval.tick().await;
 
+                let wait_started = Instant::now();
                 let mut handshake = manager.lock().await;
+                if wait_started.elapsed() > Duration::from_millis(200) {
+                    crate::tprintln!("[handshake-lock] stage=tick_lock_wait elapsed_ms={}", wait_started.elapsed().as_millis());
+                }
+                let tick_started = Instant::now();
                 handshake.tick().await;
+                if tick_started.elapsed() > Duration::from_millis(500) {
+                    crate::tprintln!("[handshake-lock] stage=tick_held elapsed_ms={}", tick_started.elapsed().as_millis());
+                }
             }
         })
     }
@@ -1408,17 +1438,37 @@ impl HandshakeManager {
         &mut self,
         target_dht: String,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let already_persistent = self.sessions.get(&target_dht).map_or(false, |state| {
-            state.status == HandshakeStatus::Established && state.maintain_connection
-        });
-        if already_persistent {
-            return Ok(());
+        let now = current_timestamp();
+        if let Some(state) = self.sessions.get_mut(&target_dht) {
+            match &state.status {
+                HandshakeStatus::Established => {
+                    // An established one-off session is already authenticated:
+                    // maintain it rather than starting a competing handshake.
+                    state.maintain_connection = true;
+                    self.persistent_handshake_failed_at.remove(&target_dht);
+                    crate::tprintln!("[handshake-policy] peer={} decision=reuse_established", target_dht);
+                    return Ok(());
+                }
+                HandshakeStatus::InitSent | HandshakeStatus::ChallengeReceived => {
+                    state.maintain_connection = true;
+                    crate::tprintln!("[handshake-policy] peer={} decision=reuse_inflight attempts={}", target_dht, state.retries.saturating_add(1));
+                    return Ok(());
+                }
+                HandshakeStatus::None | HandshakeStatus::Failed => {}
+            }
         }
-        if self.sessions.get(&target_dht).map_or(false, |state| {
-            state.status == HandshakeStatus::Established
-        }) {
+        if let Some(failed_at) = self.persistent_handshake_failed_at.get(&target_dht).copied() {
+            let remaining = failed_at.saturating_add(PERSISTENT_HANDSHAKE_FAILURE_COOLDOWN_SECS).saturating_sub(now);
+            if remaining > 0 {
+                crate::tprintln!("[handshake-policy] peer={} decision=mailbox_cooldown remaining_secs={}", target_dht, remaining);
+                return Err(format!("Recent ordinary handshake failure, cooldown {remaining}s").into());
+            }
+            self.persistent_handshake_failed_at.remove(&target_dht);
+        }
+        if self.sessions.get(&target_dht).is_some_and(|state| state.status == HandshakeStatus::Failed) {
             self.sessions.remove(&target_dht);
         }
+        crate::tprintln!("[handshake-policy] peer={} decision=start", target_dht);
         let mode = self.default_encryption_mode;
         self.initiate_handshake_internal(target_dht, mode, false, true).await
     }
@@ -1933,12 +1983,14 @@ impl HandshakeManager {
     /// Send an authenticated, encrypted application payload over an already
     /// established peer session. Callers can fall back to the mailbox when the
     /// peer is offline or a secure session is not available.
-    pub async fn send_application_message(
+    /// Prepare and encrypt under the state lock. Call `PreparedDirectSend::send`
+    /// after dropping it to avoid blocking other handshakes on network I/O.
+    pub async fn prepare_application_message(
         &self,
         peer_dht: &str,
         application_id: &str,
         payload: Vec<u8>,
-    ) -> Result<[u8; 16], Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<PreparedDirectSend, Box<dyn std::error::Error + Send + Sync>> {
         if application_id.trim().is_empty() || application_id.len() > 256 {
             return Err("Application id length is invalid".into());
         }
@@ -1983,8 +2035,26 @@ impl HandshakeManager {
         if bytes.len() > MAX_DIRECT_APPLICATION_MESSAGE_BYTES {
             return Err("Encoded direct application message exceeds protocol limit".into());
         }
-        send_raw_private_route_message(&self.veilid, &route, bytes).await?;
-        Ok(message_id)
+        Ok(PreparedDirectSend {
+            veilid: self.veilid.clone(),
+            route,
+            bytes,
+            message_id,
+        })
+    }
+
+    /// Compatibility path for streaming clients that manage the handshake
+    /// manager themselves. The local API uses two-phase send to release lock.
+    pub async fn send_application_message(
+        &self,
+        peer_dht: &str,
+        application_id: &str,
+        payload: Vec<u8>,
+    ) -> Result<[u8; 16], Box<dyn std::error::Error + Send + Sync>> {
+        self.prepare_application_message(peer_dht, application_id, payload)
+            .await?
+            .send()
+            .await
     }
 
     async fn process_direct_application(
@@ -2328,6 +2398,7 @@ impl HandshakeManager {
         let duration_ms = now.saturating_sub(state.started_at).saturating_mul(1_000);
         // End the mutable session borrow before calling back through `self`.
         let _ = state;
+        self.persistent_handshake_failed_at.remove(&established_peer);
         self.emit_handshake_succeeded(&established_peer, duration_ms);
         self.notify_established_peer(&established_peer);
 
@@ -2386,6 +2457,7 @@ impl HandshakeManager {
             .saturating_sub(state.started_at)
             .saturating_mul(1_000);
         let _ = state;
+        self.persistent_handshake_failed_at.remove(&established_peer);
         self.emit_handshake_succeeded(&established_peer, duration_ms);
         self.notify_established_peer(&established_peer);
 
@@ -2502,7 +2574,7 @@ impl HandshakeManager {
                     peer_dht.clone(),
                     reason,
                     now.saturating_sub(state.started_at).saturating_mul(1_000),
-                    false,
+                    state.status != HandshakeStatus::Failed,
                 ));
                 crate::tprintln!("[handshake] Removing stale/failed session with {}", peer_dht);
                 to_remove.push(peer_dht.clone());
@@ -2612,9 +2684,18 @@ impl HandshakeManager {
             }
         }
 
+        // Cooldown applies only to outbound maintained sessions whose retries
+        // have actually failed. Do not hold off inbound initiations.
+        for (peer, _, _, ordinary_unavailable) in &failures {
+            if *ordinary_unavailable && self.sessions.get(peer).is_some_and(|s| s.is_initiator && s.maintain_connection) {
+                self.persistent_handshake_failed_at.insert(peer.clone(), now);
+                crate::tprintln!("[handshake-policy] peer={} decision=cooldown_started seconds={}", peer, PERSISTENT_HANDSHAKE_FAILURE_COOLDOWN_SECS);
+            }
+        }
         for peer in to_remove {
             self.sessions.remove(&peer);
         }
+        self.persistent_handshake_failed_at.retain(|_, failed_at| failed_at.saturating_add(PERSISTENT_HANDSHAKE_FAILURE_COOLDOWN_SECS) > now);
 
         for (peer, reason, duration_ms, ordinary_unavailable) in failures {
             self.emit_handshake_failed(&peer, reason.clone(), duration_ms);

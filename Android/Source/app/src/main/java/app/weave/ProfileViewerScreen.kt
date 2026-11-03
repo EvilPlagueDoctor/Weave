@@ -24,6 +24,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.style.TextAlign
@@ -155,6 +156,9 @@ fun PageCanvas(
     val selectableText = remember(page) { page.selectableTextPlacements() }
     val selectableTextIds = remember(selectableText) { selectableText.map { it.element.id }.toSet() }
     val textMeasurer = rememberTextMeasurer()
+    val authoredTextDensity = LocalDensity.current
+    // Local accessibility setting applies only to reading, never to profile authoring.
+    val viewerTextScale = LocalProfileTextSizeMultiplier.current
 
     // Attach the legacy widget/image hit-test to the canvas rather than the parent.
     // A parent detectTapGestures can consume the long press before a text child can
@@ -222,7 +226,7 @@ fun PageCanvas(
                 Text(
                     text = element.text,
                     modifier = Modifier.fillMaxWidth(),
-                    style = authoredPageTextStyle(element),
+                    style = authoredPageTextStyle(element, authoredTextDensity, viewerScale = viewerTextScale),
                     overflow = TextOverflow.Clip,
                 )
             }

@@ -24,6 +24,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import app.weave.backbone.CommentPolicy
@@ -754,10 +756,12 @@ fun SettingsScreen(
     ownKey: String,
     media: LocalMediaStore,
     language: AppLanguageState,
+    profileTextSize: ProfileTextSizeSettings,
     widgetsEnabled: Boolean,
     onWidgetsEnabledChange: (Boolean) -> Unit,
     activityCount: Int,
     onActivity: () -> Unit,
+    onEventMonitor: () -> Unit,
     onClaimGroupLink: (String, (String) -> Unit) -> Unit,
     onSetupAccountBackup: () -> Unit,
     onBack: () -> Unit,
@@ -765,6 +769,14 @@ fun SettingsScreen(
     val ui by controller.ui.collectAsState()
     val scroll = rememberScrollState()
     val context = LocalContext.current
+    // Read the installed APK metadata, not a hardcoded label, so Settings reveals
+    // exactly which signed test build is running on this device.
+    val installedBuildVersion = remember(context) {
+        runCatching {
+            val packageInfo = context.packageManager.getPackageInfo(context.packageName, 0)
+            "${packageInfo.versionName ?: "unknown"} (code ${packageInfo.longVersionCode})"
+        }.getOrElse { "unknown" }
+    }
     val clipboard = remember(context) {
         context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
     }
@@ -789,6 +801,13 @@ fun SettingsScreen(
             }
         }
         Column(Modifier.fillMaxSize().verticalScroll(scroll).padding(16.dp)) {
+            Text(tr("Build version"), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+            Text(
+                "Weave $installedBuildVersion",
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+            HorizontalDivider(Modifier.padding(vertical = 16.dp))
             Text(tr("Activity"), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
             Text(
                 tr("Review profile comments and profile activity that needs your attention."),
@@ -806,6 +825,17 @@ fun SettingsScreen(
             }
 
             HorizontalDivider(Modifier.padding(vertical = 16.dp))
+            Text("Event monitor", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+            Text(
+                "Inspect outgoing and incoming group events, duplicate sightings, transport evidence and RPC timings. Event bodies are fetched only when you select one.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            OutlinedButton(onClick = onEventMonitor, modifier = Modifier.padding(top = 8.dp)) {
+                Text("Open event monitor")
+            }
+
+            HorizontalDivider(Modifier.padding(vertical = 16.dp))
             Text(tr("Language"), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
             Box(Modifier.padding(top = 8.dp)) {
                 OutlinedButton(onClick = { showLanguageMenu = true }) { Text("🌐  ${language.current.label}") }
@@ -819,6 +849,40 @@ fun SettingsScreen(
                     }
                 }
             }
+
+            HorizontalDivider(Modifier.padding(vertical = 16.dp))
+            Text(tr("Accessibility"), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+            Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(tr("Profile text size"), style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                Text(
+                    "${(profileTextSize.multiplier * 100f).roundToInt()}%",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+            Text(
+                tr("100% is the original compact profile text size. This setting only changes how you read profiles on this device; it does not edit anyone's profile."),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+            Slider(
+                value = profileTextSize.multiplier,
+                onValueChange = profileTextSize::updateMultiplier,
+                valueRange = PROFILE_TEXT_DEFAULT_MULTIPLIER..PROFILE_TEXT_MAX_MULTIPLIER,
+                steps = 7, // 100%, 125%, ..., 300%
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text(
+                tr("Example profile text"),
+                fontSize = (16f * profileTextSize.multiplier).sp,
+                lineHeight = (19f * profileTextSize.multiplier).sp,
+                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+            )
+            TextButton(
+                onClick = { profileTextSize.updateMultiplier(PROFILE_TEXT_DEFAULT_MULTIPLIER) },
+                enabled = profileTextSize.multiplier != PROFILE_TEXT_DEFAULT_MULTIPLIER,
+            ) { Text(tr("Reset to default")) }
 
             HorizontalDivider(Modifier.padding(vertical = 16.dp))
             Text(tr("Widgets"), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
