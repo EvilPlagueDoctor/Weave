@@ -15,11 +15,13 @@ impl MailboxRuntime {
         Ok(())
     }
 
-    async fn submit_outgoing_message(
+    /// Prepare an outgoing message without immediately publishing a COW generation.
+    /// The mailbox actor batches prepared messages, persists their local recovery
+    /// state, and commits one generation before acknowledging the send.
+    async fn prepare_outgoing_message(
         &mut self,
         request: OutgoingMessageRequest,
-        events: &broadcast::Sender<MailboxEvent>,
-    ) -> Result<[u8; 32], MailboxError> {
+    ) -> Result<([u8; 32], Option<MailSourcePointer>), MailboxError> {
         if request.plaintext.len() > self.config.max_plaintext_size {
             return Err(MailboxError::PlaintextTooLarge {
                 actual: request.plaintext.len(),
@@ -189,20 +191,16 @@ impl MailboxRuntime {
             self_seeded_pointer = Some(pointer);
         }
 
-        // Commit both MailSend and the self-seeded mailbox pointer before
-        // returning, so the first copy is genuinely online immediately.
-        self.flush_pending_writes(events).await?;
-        if let Some(pointer) = self_seeded_pointer {
-            let _ = events.send(MailboxEvent::OutgoingSeeded(pointer));
-        }
-        Ok(message_id)
+        // Do not acknowledge as queued until the actor has published the
+        // combined MailSend + self-seeded mailbox-pointer generation.
+        Ok((message_id, self_seeded_pointer))
     }
 
-    async fn publish_service_request(
+    async fn prepare_service_request(
         &mut self,
         request: ServiceRequestPublishRequest,
         events: &broadcast::Sender<MailboxEvent>,
-    ) -> Result<PublishedServiceRequest, MailboxError> {
+    ) -> Result<(PublishedServiceRequest, Option<MailSourcePointer>), MailboxError> {
         if request.public_payload.len() > self.config.max_service_payload_size {
             return Err(MailboxError::MessageTooLarge {
                 actual: request.public_payload.len(),
@@ -216,7 +214,7 @@ impl MailboxRuntime {
         let ttl_secs = request
             .ttl_secs
             .unwrap_or(self.config.default_service_request_ttl_secs)
-            .clamp(60, self.config.max_service_request_ttl_secs.max(60));
+            .clamp(60, service_request_ttl_cap_secs(&request.service_id, self.config.max_service_request_ttl_secs).max(60));
         let expires_at = now.saturating_add(ttl_secs);
 
         let route = self
@@ -348,14 +346,7 @@ impl MailboxRuntime {
             self_seeded_pointer = Some(pointer);
         }
 
-        self.flush_pending_writes(events).await?;
-        if let Some(pointer) = self_seeded_pointer {
-            let _ = events.send(MailboxEvent::OutgoingSeeded(pointer));
-        }
-        Ok(PublishedServiceRequest {
-            request_id,
-            expires_at,
-        })
+        Ok((PublishedServiceRequest { request_id, expires_at }, self_seeded_pointer))
     }
 
     fn release_all_service_reply_routes(&mut self) {
@@ -650,6 +641,12 @@ impl MailboxRuntime {
     ) -> Result<(), MailboxError> {
         let mut advertisement_changed = false;
         let flush_started = std::time::Instant::now();
+        let pending_before = self.pending_page_sets();
+        if pending_before > 0 {
+            crate::tprintln!("[mailbox-commit] stage=begin pending_sets={} overflow={} custodian={} outbox={} response={}",
+                pending_before, self.overflow_stores.len(), self.mailbox_store.as_ref().map_or(0, CowPagedStore::pending_changes),
+                self.outbox_store.as_ref().map_or(0, CowPagedStore::pending_changes), self.response_store.pending_changes());
+        }
         if let Some(context) = trace_context {
             crate::shutdown_debug!(
                 "mailbox flush[{context}]: START pending_total={} overflow_stores={} mailbox_pending={} outbox_pending={} response_pending={}",
@@ -691,6 +688,9 @@ impl MailboxRuntime {
                     )
                     .await?;
             }
+            if pending > 0 {
+                crate::tprintln!("[mailbox-commit] store={} stage=complete elapsed_ms={} changed_pages={}", store.name, started.elapsed().as_millis(), pending);
+            }
             if let Some(context) = trace_context {
                 crate::shutdown_debug!("mailbox flush[{context}]: overflow store={} END elapsed={}ms", store.name, started.elapsed().as_millis());
             }
@@ -723,6 +723,7 @@ impl MailboxRuntime {
                     .await?
             };
             advertisement_changed |= changed;
+            if changed { crate::tprintln!("[mailbox-commit] store=custodian stage=complete elapsed_ms={}", started.elapsed().as_millis()); }
             if let Some(context) = trace_context {
                 crate::shutdown_debug!("mailbox flush[{context}]: mailbox store END elapsed={}ms changed={}", started.elapsed().as_millis(), advertisement_changed);
             }
@@ -755,6 +756,7 @@ impl MailboxRuntime {
                     .await?
             };
             advertisement_changed |= changed;
+            if changed { crate::tprintln!("[mailbox-commit] store=outbox stage=complete elapsed_ms={}", started.elapsed().as_millis()); }
             if let Some(context) = trace_context {
                 crate::shutdown_debug!("mailbox flush[{context}]: outbox store END elapsed={}ms changed={}", started.elapsed().as_millis(), changed);
             }
@@ -786,6 +788,7 @@ impl MailboxRuntime {
                 .await?
         };
         advertisement_changed |= response_changed;
+        if response_changed { crate::tprintln!("[mailbox-commit] store=response stage=complete elapsed_ms={}", response_started.elapsed().as_millis()); }
         if let Some(context) = trace_context {
             crate::shutdown_debug!("mailbox flush[{context}]: response store END elapsed={}ms changed={}", response_started.elapsed().as_millis(), response_changed);
         }
@@ -797,15 +800,18 @@ impl MailboxRuntime {
         }
         let persist_started = std::time::Instant::now();
         self.persist().await?;
+        if pending_before > 0 { crate::tprintln!("[mailbox-commit] stage=persist_done elapsed_ms={}", persist_started.elapsed().as_millis()); }
         if let Some(context) = trace_context {
             crate::shutdown_debug!("mailbox flush[{context}]: encrypted local persistence END elapsed={}ms", persist_started.elapsed().as_millis());
         }
         if advertisement_changed {
+            if pending_before > 0 { crate::tprintln!("[mailbox-commit] stage=advertisement_start"); }
             if let Some(context) = trace_context {
                 crate::shutdown_debug!("mailbox flush[{context}]: advertisement publish START");
             }
             let advertisement_started = std::time::Instant::now();
             self.publish_advertisement(Some(events)).await?;
+            if pending_before > 0 { crate::tprintln!("[mailbox-commit] stage=advertisement_done elapsed_ms={}", advertisement_started.elapsed().as_millis()); }
             if let Some(context) = trace_context {
                 crate::shutdown_debug!("mailbox flush[{context}]: advertisement publish END elapsed={}ms", advertisement_started.elapsed().as_millis());
             }

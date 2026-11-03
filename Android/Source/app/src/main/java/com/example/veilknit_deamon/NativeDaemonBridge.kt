@@ -57,6 +57,9 @@ object NativeDaemonBridge {
     private external fun nativeEmbeddedSubscriptionActive(subscriptionId: Long): Boolean
 
     @JvmStatic
+    private external fun nativeEmbeddedUsername(): String
+
+    @JvmStatic
     private external fun nativeEmbeddedProfileId(): String
 
     @JvmStatic
@@ -120,6 +123,11 @@ object NativeDaemonBridge {
         isLibraryLoaded && subscriptionId > 0L && runCatching {
             nativeEmbeddedSubscriptionActive(subscriptionId)
         }.getOrDefault(false)
+
+    /** Rust-authenticated identity, not the username supplied to the Android start request. */
+    fun embeddedUsername(): String = if (!isLibraryLoaded) "" else runCatching {
+        nativeEmbeddedUsername().trim()
+    }.getOrDefault("")
 
     fun embeddedProfileId(): String = if (!isLibraryLoaded) "" else runCatching {
         nativeEmbeddedProfileId().trim()

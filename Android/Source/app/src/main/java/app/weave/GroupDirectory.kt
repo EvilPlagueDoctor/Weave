@@ -29,7 +29,7 @@ class GroupDirectoryNetwork(private val client: DaemonClient) {
     }
 
     fun read(profileRootRecordKey: String, expectedAdvertiserMainDht: String): List<GroupDirectoryEntry> =
-        runCatching {
+        run {
             val values = client.readPublicStore(
                 profileRootRecordKey,
                 listOf(GROUP_DIRECTORY_SUBKEY),
@@ -37,8 +37,8 @@ class GroupDirectoryNetwork(private val client: DaemonClient) {
             ).optJSONArray("values")
             val bytes = CommentChain.decodeValue(values?.optJSONObject(0)) ?: return emptyList()
             val root = JSONObject(bytes.decodeToString())
-            if (root.optInt("v") != 2) return emptyList()
-            if (root.optString("advertiser") != expectedAdvertiserMainDht) return emptyList()
+            require(root.optInt("v") == 2) { "unrecognized group directory version" }
+            require(root.optString("advertiser") == expectedAdvertiserMainDht) { "group directory advertiser mismatch" }
             val entries = root.optJSONArray("entries") ?: return emptyList()
             buildList {
                 for (i in 0 until entries.length()) {
@@ -48,7 +48,7 @@ class GroupDirectoryNetwork(private val client: DaemonClient) {
                     add(entry)
                 }
             }
-        }.getOrElse { emptyList() }
+        }
 
     companion object {
         const val MAX_DIRECTORY_ENTRIES = 128

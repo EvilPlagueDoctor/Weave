@@ -53,8 +53,17 @@ class DaemonForegroundService : Service() {
                 val username = intent.getStringExtra(EXTRA_USERNAME).orEmpty()
                 val password = intent.getStringExtra(EXTRA_PASSWORD).orEmpty()
                 val signup = intent.getBooleanExtra(EXTRA_SIGNUP, false)
-                DaemonApiRuntime.setUsername(username)
-                startNativeDaemon(username, password, signup)
+                // A new login must NEVER inherit an already-running Rust session.
+                // Do not change DaemonApiRuntime's expected username until nativeStart
+                // has accepted this particular request.
+                if (startedNative.get() || NativeDaemonBridge.isRunning()) {
+                    DaemonStateStore.blockAccountStart(
+                        "A previous VeilKnit session is still running or shutting down. " +
+                            "Use Stop Safely, wait for it to finish, then create or sign in to the new account."
+                    )
+                } else {
+                    startNativeDaemon(username, password, signup)
+                }
             }
 
             ACTION_COMMAND -> {
@@ -116,7 +125,14 @@ class DaemonForegroundService : Service() {
     }
 
     private fun startNativeDaemon(username: String, password: String, signup: Boolean) {
-        if (!startedNative.compareAndSet(false, true)) return
+        if (!startedNative.compareAndSet(false, true)) {
+            DaemonStateStore.blockAccountStart("A daemon start is already in progress. Stop it fully before trying another account.")
+            return
+        }
+        if (NativeDaemonBridge.isRunning()) {
+            DaemonStateStore.blockAccountStart("The previous Rust daemon is still active. Stop Safely before switching accounts.")
+            return
+        }
 
         if (username.isBlank() || password.isEmpty()) {
             DaemonStateStore.setError("Username and password are required.")
@@ -139,13 +155,16 @@ class DaemonForegroundService : Service() {
 	    )
             if (!started) {
                 val detail = NativeDaemonBridge.loadError
-                    ?: "The Rust daemon refused to start. Check the native build output."
-                DaemonStateStore.setError(detail)
+                    ?: "The Rust daemon refused to start. It may still be shutting down from another account."
+                DaemonStateStore.blockAccountStart(detail)
                 updateNotification("Native daemon failed to start")
                 delay(2_000)
                 setNotificationPersistenceEnabled(false)
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
+            } else {
+                // Set only after the native bridge accepted *this* login/signup.
+                DaemonApiRuntime.setUsername(username)
             }
         }
     }
@@ -171,7 +190,14 @@ class DaemonForegroundService : Service() {
             }
             DaemonStateStore.markNativeRunning(running)
 
-            val state = DaemonStateStore.state.value
+            var state = DaemonStateStore.state.value
+            if (state.ready && !DaemonApiRuntime.authenticatedAccountMatches()) {
+                DaemonStateStore.blockAccountStart(
+                    "The running Rust daemon belongs to a different account than the requested login. " +
+                        "Stop Safely before changing accounts."
+                )
+                state = DaemonStateStore.state.value
+            }
             if (!gracefulStopRequested.get() && state.ready) {
                 appRequestPollTicks += 1
                 if (appRequestPollTicks >= 12) { // roughly every 3 seconds at the 250 ms bridge poll rate

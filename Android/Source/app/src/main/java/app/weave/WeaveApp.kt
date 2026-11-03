@@ -1,6 +1,15 @@
 package app.weave
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -41,6 +50,7 @@ fun WeaveApp() {
     val controller = remember { SocialNetworkController(context) }
     val onboarding = remember { OnboardingState(context) }
     val language = remember { AppLanguageState(context) }
+    val profileTextSize = remember { ProfileTextSizeSettings(context.applicationContext) }
     val commentStore: CommentStore = controller.comments
     val followStore = remember { FollowStore(context) }
     val remoteCache = remember { RemoteProfileCache() }
@@ -95,6 +105,7 @@ fun WeaveApp() {
         LocalAppLanguage provides language.current,
         LocalResources provides localizedResources,
         LocalContentFilter provides contentFilter,
+        LocalProfileTextSizeMultiplier provides profileTextSize.multiplier,
     ) {
     MaterialTheme(colorScheme = DesignerColorScheme) {
         Surface(color = MaterialTheme.colorScheme.background) {
@@ -108,7 +119,9 @@ fun WeaveApp() {
                     embeddedDaemonStartup = true,
                 )
 
-                !hasKnownIdentity || (!ui.connected && !setupDone) -> ConnectionGate(
+                // Never display a previous account's content during any reconnect or
+                // new-account startup, even when the old editor was fully set up.
+                !hasKnownIdentity || !ui.connected -> ConnectionGate(
                     status = ui.status,
                     error = failure,
                     onRetry = { controller.restart() }
@@ -161,6 +174,7 @@ fun WeaveApp() {
                     media = media,
                     mediaLoader = mediaLoader,
                     language = language,
+                    profileTextSize = profileTextSize,
                     widgetsEnabled = widgetsEnabled,
                     onWidgetsEnabledChange = { widgetsEnabled = it },
                     connectionAvailable = ui.connected,
@@ -183,6 +197,7 @@ private fun WeaveShell(
     media: LocalMediaStore,
     mediaLoader: MediaLoader,
     language: AppLanguageState,
+    profileTextSize: ProfileTextSizeSettings,
     widgetsEnabled: Boolean,
     onWidgetsEnabledChange: (Boolean) -> Unit,
     connectionAvailable: Boolean,
@@ -202,6 +217,11 @@ private fun WeaveShell(
     val ui by controller.ui.collectAsState()
     val context = LocalContext.current
     var pendingExternalUrl by remember { mutableStateOf<String?>(null) }
+    var profileSwipeDirection by remember { mutableIntStateOf(0) }
+    fun openProfile(mainDht: String, visibleKeys: List<String>) {
+        profileSwipeDirection = 0
+        nav.push(Destination.Profile(mainDht, profileSwipeKeys(mainDht, visibleKeys)))
+    }
     val groupPostSubmissionUi = remember { mutableMapOf<String, GroupPostSubmissionUiState>() }
 
     LaunchedEffect(ui.mainDht) {
@@ -228,7 +248,7 @@ private fun WeaveShell(
             is DetectedLink.Media -> nav.push(
                 Destination.LinkedMedia(link.mediaType, link.recordKey, link.sha256)
             )
-            is DetectedLink.Profile -> nav.push(Destination.Profile(link.mainDht))
+            is DetectedLink.Profile -> openProfile(link.mainDht, listOf(link.mainDht))
             is DetectedLink.External -> pendingExternalUrl = link.raw
             is DetectedLink.Dht -> toast(
                 context,
@@ -253,6 +273,7 @@ private fun WeaveShell(
             Destination.Activity -> "Activity"
             Destination.Editor -> "Editor"
             Destination.Settings -> "Settings"
+            Destination.EventMonitor -> "EventMonitor"
             Destination.VeilKnit -> "VeilKnit"
             Destination.VeilKnitBackup -> "VeilKnitBackup"
             Destination.GroupModeration -> "GroupModeration"
@@ -358,7 +379,7 @@ private fun WeaveShell(
                     HomeScreen(
                         controller = controller,
                         followStore = followStore,
-                        onOpen = { nav.push(Destination.Profile(it)) },
+                        onOpen = ::openProfile,
                     )
                 }
 
@@ -388,7 +409,7 @@ private fun WeaveShell(
                 } else {
                     SearchScreen(
                         controller = controller,
-                        onOpen = { nav.push(Destination.Profile(it)) },
+                        onOpen = ::openProfile,
                     )
                 }
 
@@ -494,6 +515,9 @@ private fun WeaveShell(
                         onSetFeatured = { slot ->
                             controller.setGroupFeatured(destination.groupId, slot)
                         },
+                        onSetAutoShowNewSubmissions = { enabled ->
+                            controller.setGroupAutoShowNewSubmissions(destination.groupId, enabled)
+                        },
                         onAddModerator = { grant ->
                             controller.grantGroupModerator(destination.groupId, grant)
                         },
@@ -526,16 +550,15 @@ private fun WeaveShell(
                     onRefresh = {
                         controller.refreshGroupPost(destination.groupId, destination.conversationId)
                     },
-                    onPostComment = { body ->
+                    onPostComment = { body, done ->
                         controller.postGroupComment(
                             groupId = destination.groupId,
                             conversationId = destination.conversationId,
                             body = body,
                             authorName = state.doc.profileName,
-                        ) { ok ->
-                            if (ok) {
-                                controller.refreshGroupPost(destination.groupId, destination.conversationId)
-                            }
+                        ) { ok, messageId ->
+                            if (ok) controller.refreshGroupPost(destination.groupId, destination.conversationId)
+                            done(ok, messageId)
                         }
                     },
                     onPinComment = { postId, pinned ->
@@ -580,15 +603,28 @@ private fun WeaveShell(
                 Destination.VeilKnit,
                 Destination.VeilKnitBackup -> Unit // handled as full-bleed destinations above
 
+                Destination.EventMonitor -> EventMonitorScreen(
+                    controller = controller,
+                    ownMainDht = ui.mainDht,
+                    onOpenGroup = { nav.push(Destination.Group(it)) },
+                    onOpenPost = { groupId, conversationId ->
+                        nav.push(Destination.GroupPost(groupId, conversationId))
+                    },
+                    onOpenProfile = { openProfile(it, listOf(it)) },
+                    onBack = { nav.pop() },
+                )
+
                 Destination.Settings -> SettingsScreen(
                     controller = controller,
                     ownKey = ui.mainDht,
                     media = media,
                     language = language,
+                    profileTextSize = profileTextSize,
                     widgetsEnabled = widgetsEnabled,
                     onWidgetsEnabledChange = onWidgetsEnabledChange,
                     activityCount = profileModerationCount,
                     onActivity = { nav.push(Destination.Activity) },
+                    onEventMonitor = { nav.push(Destination.EventMonitor) },
                     onClaimGroupLink = { link, onResult ->
                         controller.claimGroupLink(link, onResult)
                     },
@@ -609,7 +645,12 @@ private fun WeaveShell(
                     ownName = state.doc.profileName,
                     groupStore = groupStore,
                     onOpenGroup = { nav.push(Destination.Group(it)) },
-                    onNavigate = { nav.replaceTop(Destination.Profile(it)) },
+                    swipeQueue = destination.swipeQueue,
+                    swipeDirection = profileSwipeDirection,
+                    onNavigate = { key, direction ->
+                        profileSwipeDirection = direction
+                        nav.replaceTop(Destination.Profile(key, destination.swipeQueue))
+                    },
                     onOpenLink = ::openDetectedLink,
                     onBack = { nav.pop() },
                 )
@@ -742,7 +783,63 @@ private fun ProfileDestination(
     ownName: String,
     groupStore: GroupStore,
     onOpenGroup: (String) -> Unit,
-    onNavigate: (String) -> Unit,
+    swipeQueue: List<String>,
+    swipeDirection: Int,
+    onNavigate: (String, Int) -> Unit,
+    onOpenLink: (DetectedLink) -> Unit,
+    onBack: () -> Unit,
+) {
+    AnimatedContent(
+        targetState = mainDht,
+        modifier = Modifier.fillMaxSize(),
+        transitionSpec = {
+            val direction = swipeDirection
+            if (direction == 0) {
+                fadeIn(tween(160)) togetherWith fadeOut(tween(160))
+            } else {
+                (slideInHorizontally(tween(260)) { width -> width * direction } + fadeIn(tween(200))) togetherWith
+                    (slideOutHorizontally(tween(260)) { width -> -width * direction } + fadeOut(tween(180)))
+            }
+        },
+        label = "Profile swipe",
+    ) { visibleMainDht ->
+        ProfileDestinationContent(
+            mainDht = visibleMainDht,
+            controller = controller,
+            commentStore = commentStore,
+            followStore = followStore,
+            remoteCache = remoteCache,
+            mediaLoader = mediaLoader,
+            media = media,
+            state = state,
+            ownKey = ownKey,
+            ownName = ownName,
+            groupStore = groupStore,
+            onOpenGroup = onOpenGroup,
+            swipeQueue = swipeQueue,
+            onNavigate = onNavigate,
+            onOpenLink = onOpenLink,
+            onBack = onBack,
+        )
+    }
+}
+
+@Composable
+private fun ProfileDestinationContent(
+    mainDht: String,
+    controller: SocialNetworkController,
+    commentStore: CommentStore,
+    followStore: FollowStore,
+    remoteCache: RemoteProfileCache,
+    mediaLoader: MediaLoader,
+    media: LocalMediaStore,
+    state: EditorState,
+    ownKey: String,
+    ownName: String,
+    groupStore: GroupStore,
+    onOpenGroup: (String) -> Unit,
+    swipeQueue: List<String>,
+    onNavigate: (String, Int) -> Unit,
     onOpenLink: (DetectedLink) -> Unit,
     onBack: () -> Unit,
 ) {
@@ -760,19 +857,37 @@ private fun ProfileDestination(
         controller.refreshUserGroups(mainDht)
     }
 
-    // The swipe queue is whatever list the user opened from, in its current order.
-    val queue = remember(ui.recent) { ui.recent.map { it.hint.mainDht } }
+    // Use the source screen's frozen ordering, not ui.recent: Search and Following can
+    // show a completely different set. Gossip changing discovery mid-swipe must not shrink it.
+    val queue = remember(swipeQueue, mainDht) { profileSwipeKeys(mainDht, swipeQueue) }
     val position = queue.indexOf(mainDht)
-    val hintName = ui.recent.firstOrNull { it.hint.mainDht == mainDht }?.hint?.name.orEmpty()
+    val previous = profileSwipeNeighbor(queue, mainDht, -1)
+    val next = profileSwipeNeighbor(queue, mainDht, 1)
+    val onPrevious = previous?.let { key -> { onNavigate(key, -1) } }
+    val onNext = next?.let { key -> { onNavigate(key, 1) } }
+    val hintName = ui.searchResults.firstOrNull { it.hint.mainDht == mainDht }?.hint?.name
+        ?: ui.recent.firstOrNull { it.hint.mainDht == mainDht }?.hint?.name.orEmpty()
+
+    // Warm only the adjacent documents (not all 28/100 profiles). Give the currently
+    // opened profile first chance at the daemon rather than competing for DHT requests.
+    LaunchedEffect(mainDht, queue) {
+        delay(350)
+        next?.let(controller::prefetchProfileAvailable)
+        if (previous != next) {
+            delay(250)
+            previous?.let(controller::prefetchProfileAvailable)
+        }
+    }
 
     // The blob may still be in flight when this destination opens, so poll rather than
     // resolving once during composition.
     // Seeded from the cache so returning to a tab shows the profile immediately. Starting at
     // null meant the spinner reappeared on every visit even though nothing had to be fetched.
     val cached = remember(mainDht) { remoteCache.get(mainDht) }
+    var retryVersion by remember(mainDht) { mutableIntStateOf(0) }
     val loaded by produceState<Result<RemoteProfile>?>(
         initialValue = cached?.let { Result.success(it) },
-        mainDht,
+        mainDht, retryVersion,
     ) {
         remoteCache.get(mainDht)?.let { value = Result.success(it); return@produceState }
         controller.ensureProfileAvailable(mainDht)
@@ -850,30 +965,63 @@ private fun ProfileDestination(
             onOpenLink = onOpenLink,
             isFollowing = following,
             onToggleFollow = { following = followStore.toggle(mainDht) },
-            onPrevProfile = if (position > 0) ({ onNavigate(queue[position - 1]) }) else null,
-            onNextProfile = if (position >= 0 && position < queue.lastIndex) ({ onNavigate(queue[position + 1]) }) else null,
+            swipeIndex = position + 1,
+            swipeCount = queue.size,
+            onPrevProfile = onPrevious,
+            onNextProfile = onNext,
             onBack = onBack,
             widgetLoader = remoteWidgetLoader,
         )
 
-        else -> Column(
-            Modifier.fillMaxSize().padding(32.dp),
-            verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            if (failure == null) {
-                CircularProgressIndicator()
-                Text(tr("Fetching this profile…"), style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 16.dp))
-            } else {
-                Text(tr("Couldn't open this profile"), style = MaterialTheme.typography.titleSmall)
-                Text(
-                    failure,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(top = 8.dp)
-                )
+        else -> Column(Modifier.fillMaxSize()) {
+            ProfileSwipeBar(position + 1, queue.size, onPrevious, onNext)
+            Box(
+                Modifier.fillMaxSize().pointerInput(mainDht, previous, next) {
+                    var travelled = 0f
+                    detectHorizontalDragGestures(
+                        onDragStart = { travelled = 0f },
+                        onDragEnd = {
+                            val threshold = 90f * density
+                            if (travelled <= -threshold) onNext?.invoke()
+                            else if (travelled >= threshold) onPrevious?.invoke()
+                        },
+                    ) { _, amount -> travelled += amount }
+                },
+                contentAlignment = Alignment.Center,
+            ) {
+                Column(
+                    Modifier.fillMaxWidth().padding(32.dp),
+                    verticalArrangement = Arrangement.Center,
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    if (failure == null) {
+                        CircularProgressIndicator()
+                        Text(
+                            tr("Fetching this profile…"),
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(top = 16.dp),
+                        )
+                        Text(
+                            "${position + 1} / ${queue.size}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 6.dp),
+                        )
+                    } else {
+                        Text(tr("Couldn't open this profile"), style = MaterialTheme.typography.titleSmall)
+                        Text(
+                            failure,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 8.dp),
+                        )
+                        TextButton(onClick = { retryVersion++ }) { Text(tr("Retry")) }
+                    }
+                    TextButton(onClick = onBack, modifier = Modifier.padding(top = 16.dp)) {
+                        Text(tr("Back"))
+                    }
+                }
             }
-            TextButton(onClick = onBack, modifier = Modifier.padding(top = 16.dp)) { Text(tr("Back")) }
         }
     }
 }

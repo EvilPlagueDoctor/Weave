@@ -504,6 +504,23 @@ pub extern "system" fn Java_com_example_veilknit_1deamon_NativeDaemonBridge_nati
     }
 }
 
+/// In-process account binding: return the username held by the authenticated
+/// Rust LocalApiContext. The Android host compares it to the requested account
+/// before accepting any ready/connected state.
+#[no_mangle]
+pub extern "system" fn Java_com_example_veilknit_1deamon_NativeDaemonBridge_nativeEmbeddedUsername(
+    mut unowned_env: EnvUnowned<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    let username = crate::named_pipe_api::embedded_username();
+    unowned_env
+        .with_env(|env| -> jni::errors::Result<jstring> {
+            let value = JString::from_str(env, username)?;
+            Ok(value.into_raw())
+        })
+        .resolve::<LogErrorAndDefault>()
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_example_veilknit_1deamon_NativeDaemonBridge_nativeEmbeddedProfileId(
     mut unowned_env: EnvUnowned<'_>,

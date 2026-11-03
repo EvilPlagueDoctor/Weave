@@ -831,7 +831,10 @@ impl MailboxRuntime {
                 read: true,
             }
         };
-        self.persist().await?;
+        // This modifies only the encrypted local inbox read flag. Exporting the
+        // entire DHT snapshot here can take network time and needlessly block
+        // the mailbox actor (including other inbox reads and outgoing sends).
+        self.persist_local_only()?;
         Ok(result)
     }
 
@@ -840,7 +843,9 @@ impl MailboxRuntime {
             .inbox_messages
             .remove(&message_id)
             .ok_or(MailboxError::MessageNotFound)?;
-        self.persist().await
+        // Inbox deletion changes no Veilid record/package state; keep the
+        // encrypted local write, not an unrelated DHT snapshot export.
+        self.persist_local_only()
     }
 
     async fn advertisement(&self) -> Result<MailboxAdvertisement, MailboxError> {
@@ -989,8 +994,156 @@ async fn wait_for_mailbox_shutdown_signal(shutdown_rx: &mut watch::Receiver<bool
     }
 }
 
+// Mixed batching keeps submit ordering across ordinary messages and public
+// witness requests. Other mailbox commands remain strict ordering barriers:
+// especially deletes, shutdown, walk observations and inbox reads.
+enum PreparedMailboxSubmission {
+    Message {
+        message_id: [u8; 32],
+        pointer: Option<MailSourcePointer>,
+        reply: oneshot::Sender<Result<[u8; 32], MailboxError>>,
+    },
+    Service {
+        published: PublishedServiceRequest,
+        pointer: Option<MailSourcePointer>,
+        reply: oneshot::Sender<Result<PublishedServiceRequest, MailboxError>>,
+    },
+}
+
+fn batchable_outgoing(command: &MailboxCommand) -> bool {
+    matches!(command, MailboxCommand::SubmitOutgoingMessage { .. } | MailboxCommand::PublishServiceRequest { .. })
+}
+
+async fn publish_outgoing_batch(
+    first: TimedMailboxCommand,
+    rx: &mut mpsc::Receiver<TimedMailboxCommand>,
+    deferred: &mut VecDeque<TimedMailboxCommand>,
+    runtime: &mut MailboxRuntime,
+    events: &broadcast::Sender<MailboxEvent>,
+) {
+    const WINDOW: Duration = Duration::from_millis(150);
+    const MAX: usize = 12;
+    const MAX_SCANNED: usize = 24;
+    let started = std::time::Instant::now();
+    let mut batch = vec![first];
+    // Let the short coalescing window gather traffic, but do not reorder any
+    // mutations or read-flag operations across the commit boundary.
+    time::sleep(WINDOW).await;
+    let mut scanned = 0;
+    while batch.len() < MAX && scanned < MAX_SCANNED {
+        scanned += 1;
+        match rx.try_recv() {
+            Ok(next) if batchable_outgoing(&next.command) => batch.push(next),
+            Ok(next) => {
+                deferred.push_back(next);
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    crate::tprintln!(
+        "[mailbox-scheduler] stage=batch_collected count={} queue_remaining={} deferred={} collect_ms={} scanned={}",
+        batch.len(), rx.len(), deferred.len(), started.elapsed().as_millis(), scanned,
+    );
+    let mut staged = Vec::<PreparedMailboxSubmission>::new();
+    for item in batch {
+        let age_ms = item.enqueued_at.elapsed().as_millis();
+        let kind = mailbox_command_name(&item.command);
+        crate::tprintln!("[mailbox-queue] stage=prepare_start command={} queue_wait_ms={} buffered={} pending_sets={}",
+            kind, age_ms, rx.len(), runtime.pending_page_sets());
+        match item.command {
+            MailboxCommand::SubmitOutgoingMessage { request, reply } => {
+                if reply.is_closed() {
+                    crate::tprintln!("[mailbox-scheduler] stage=skip_stale kind=message queue_wait_ms={}", age_ms);
+                    continue;
+                }
+                let prepare_started = std::time::Instant::now();
+                match runtime.prepare_outgoing_message(request).await {
+                    Ok((message_id, pointer)) => {
+                        crate::tprintln!("[mailbox-scheduler] stage=prepared kind=message id_prefix={} elapsed_ms={}",
+                            hex::encode(&message_id[..4]), prepare_started.elapsed().as_millis());
+                        staged.push(PreparedMailboxSubmission::Message { message_id, pointer, reply });
+                    }
+                    Err(error) => {
+                        crate::teprintln!("[mailbox-scheduler] stage=prepare_failed kind=message elapsed_ms={} error={}", prepare_started.elapsed().as_millis(), error);
+                        let _ = reply.send(Err(error));
+                    }
+                }
+            }
+            MailboxCommand::PublishServiceRequest { request, reply } => {
+                if reply.is_closed() {
+                    crate::tprintln!("[mailbox-scheduler] stage=skip_stale kind=service queue_wait_ms={}", age_ms);
+                    continue;
+                }
+                let prepare_started = std::time::Instant::now();
+                match runtime.prepare_service_request(request, events).await {
+                    Ok((published, pointer)) => {
+                        crate::tprintln!("[mailbox-scheduler] stage=prepared kind=service elapsed_ms={}", prepare_started.elapsed().as_millis());
+                        staged.push(PreparedMailboxSubmission::Service { published, pointer, reply });
+                    }
+                    Err(error) => {
+                        crate::teprintln!("[mailbox-scheduler] stage=prepare_failed kind=service elapsed_ms={} error={}", prepare_started.elapsed().as_millis(), error);
+                        let _ = reply.send(Err(error));
+                    }
+                }
+            }
+            _ => unreachable!("only outgoing commands are batched"),
+        }
+    }
+    if staged.is_empty() { return; }
+    // Commit once for both kinds, preserving the existing COW transaction
+    // journal, index readback, and generation validation in the single actor.
+    let commit_started = std::time::Instant::now();
+    // End the shared borrow from local persistence before the async DHT
+    // flush.  The outer mailbox actor is spawned on Tokio's Send executor.
+    let local_persist_result = runtime.persist_local_only();
+    let result = match local_persist_result {
+        Ok(()) => runtime.flush_pending_writes(events).await,
+        Err(error) => Err(error),
+    };
+    crate::tprintln!("[mailbox-scheduler] stage=batch_commit count={} elapsed_ms={} total_ms={} outcome={} queue_remaining={}",
+        staged.len(), commit_started.elapsed().as_millis(), started.elapsed().as_millis(),
+        if result.is_ok() { "published" } else { "error" }, rx.len());
+    match result {
+        Ok(()) => {
+            for item in staged {
+                match item {
+                    PreparedMailboxSubmission::Message { message_id, pointer, reply } => {
+                        if let Some(pointer) = pointer { let _ = events.send(MailboxEvent::OutgoingSeeded(pointer)); }
+                        if reply.is_closed() {
+                            crate::tprintln!("[mailbox-scheduler] stage=published_after_caller_timeout kind=message id_prefix={}", hex::encode(&message_id[..4]));
+                        }
+                        let _ = reply.send(Ok(message_id));
+                    }
+                    PreparedMailboxSubmission::Service { published, pointer, reply } => {
+                        if let Some(pointer) = pointer { let _ = events.send(MailboxEvent::OutgoingSeeded(pointer)); }
+                        if reply.is_closed() {
+                            crate::tprintln!("[mailbox-scheduler] stage=published_after_caller_timeout kind=service");
+                        }
+                        let _ = reply.send(Ok(published));
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            let text = error.to_string();
+            crate::teprintln!("[mailbox-scheduler] stage=batch_commit_error count={} error={}", staged.len(), text);
+            for item in staged {
+                match item {
+                    PreparedMailboxSubmission::Message { reply, .. } => {
+                        let _ = reply.send(Err(MailboxError::Dht(format!("outgoing publish failed: {text}"))));
+                    }
+                    PreparedMailboxSubmission::Service { reply, .. } => {
+                        let _ = reply.send(Err(MailboxError::Dht(format!("service publish failed: {text}"))));
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn mailbox_actor(
-    mut rx: mpsc::Receiver<MailboxCommand>,
+    mut rx: mpsc::Receiver<TimedMailboxCommand>,
     shutdown_rx: watch::Receiver<bool>,
     mut runtime: MailboxRuntime,
     events: broadcast::Sender<MailboxEvent>,
@@ -1000,15 +1153,29 @@ async fn mailbox_actor(
         runtime.config.normal_batch_interval_secs.max(1),
     ));
     batch_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut deferred_commands = VecDeque::<TimedMailboxCommand>::new();
     let mut maintenance_interval = time::interval(Duration::from_secs(
         runtime.config.maintenance_interval_secs.max(60),
     ));
     maintenance_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // Discovery is best-effort. When users are waiting to send messages, do
+    // not let background DHT walks and periodic jobs monopolize the actor.
+    const HIGH_PRESSURE_COMMANDS: usize = 16;
+    let mut dropped_walk_observations = 0usize;
+    let mut last_snapshot_refresh = std::time::Instant::now();
+    let mut last_periodic_flush = std::time::Instant::now();
+    let mut last_maintenance = std::time::Instant::now();
 
     loop {
+        let queue_pressure = rx.len() + deferred_commands.len();
         tokio::select! {
             _ = batch_interval.tick() => {
+                if queue_pressure >= HIGH_PRESSURE_COMMANDS && last_periodic_flush.elapsed() < Duration::from_secs(300) {
+                    crate::tprintln!("[mailbox-scheduler] stage=defer_periodic_flush queue_depth={}", queue_pressure);
+                    continue;
+                }
                 let batch_started = std::time::Instant::now();
+                last_periodic_flush = batch_started;
                 crate::shutdown_debug!("mailbox actor: BATCH TICK START pending={} queued_commands={}", runtime.pending_page_sets(), rx.len());
                 let mut stop = shutdown_rx.clone();
                 let interrupted = tokio::select! {
@@ -1030,7 +1197,12 @@ async fn mailbox_actor(
                 }
             }
             _ = maintenance_interval.tick() => {
+                if queue_pressure >= HIGH_PRESSURE_COMMANDS && last_maintenance.elapsed() < Duration::from_secs(600) {
+                    crate::tprintln!("[mailbox-scheduler] stage=defer_maintenance queue_depth={}", queue_pressure);
+                    continue;
+                }
                 let maintenance_started = std::time::Instant::now();
+                last_maintenance = maintenance_started;
                 crate::shutdown_debug!("mailbox actor: MAINTENANCE START pending={} queued_commands={}", runtime.pending_page_sets(), rx.len());
                 let mut stop = shutdown_rx.clone();
                 let interrupted = tokio::select! {
@@ -1051,15 +1223,28 @@ async fn mailbox_actor(
                     crate::shutdown_debug!("mailbox actor: MAINTENANCE END elapsed={}ms pending={} queued_commands={}", maintenance_started.elapsed().as_millis(), runtime.pending_page_sets(), rx.len());
                 }
             }
-            command = rx.recv() => {
-                let Some(command) = command else {
+            command = async {
+                if let Some(command) = deferred_commands.pop_front() {
+                    Some(command)
+                } else {
+                    rx.recv().await
+                }
+            } => {
+                let Some(timed_command) = command else {
                     crate::shutdown_debug!("mailbox actor: command channel closed; final flush starting pending={}", runtime.pending_page_sets());
                     let _ = runtime.flush_for_shutdown(&events, "channel-close").await;
                     runtime.release_all_service_reply_routes();
                     crate::shutdown_debug!("mailbox actor: command channel closed; actor exiting");
                     return;
                 };
+                let queued_at = timed_command.enqueued_at;
+                let command = timed_command.command;
                 let command_name = mailbox_command_name(&command);
+                let queue_wait_ms = queued_at.elapsed().as_millis();
+                if queue_wait_ms >= 200 || matches!(&command, MailboxCommand::ReadInbox { .. } | MailboxCommand::DeleteInbox { .. }) {
+                    crate::tprintln!("[mailbox-queue] stage=dequeued command={} wait_ms={} rx_remaining={} deferred={} pending_sets={}",
+                        command_name, queue_wait_ms, rx.len(), deferred_commands.len(), runtime.pending_page_sets());
+                }
                 let command_started = std::time::Instant::now();
                 crate::shutdown_debug!("mailbox actor: COMMAND START name={} queued_behind={} pending={}", command_name, rx.len(), runtime.pending_page_sets());
 
@@ -1077,6 +1262,18 @@ async fn mailbox_actor(
 
                 match command {
                     MailboxCommand::WalkNodeObserved(event) => {
+                        // A saturated queue is a poor time for slow background
+                        // discovery. Later walks rediscover these records.
+                        // Never drop application-created submissions or inbox
+                        // mutation commands. A bounded counter avoids log spam.
+                        if rx.len() + deferred_commands.len() >= HIGH_PRESSURE_COMMANDS {
+                            dropped_walk_observations += 1;
+                            if dropped_walk_observations == 1 || dropped_walk_observations % 32 == 0 {
+                                crate::tprintln!("[mailbox-scheduler] stage=skip_walk_observation queue_depth={} total_skipped={}",
+                                    rx.len() + deferred_commands.len(), dropped_walk_observations);
+                            }
+                            continue;
+                        }
                         let mut stop = shutdown_rx.clone();
                         let result = tokio::select! {
                             biased;
@@ -1097,12 +1294,16 @@ async fn mailbox_actor(
                         runtime.last_walk_report = Some(report);
                     }
                     MailboxCommand::SubmitOutgoingMessage { request, reply } => {
-                        let result = runtime.submit_outgoing_message(request, &events).await;
-                        let _ = reply.send(result);
+                        publish_outgoing_batch(
+                            TimedMailboxCommand { command: MailboxCommand::SubmitOutgoingMessage { request, reply }, enqueued_at: queued_at },
+                            &mut rx, &mut deferred_commands, &mut runtime, &events,
+                        ).await;
                     }
                     MailboxCommand::PublishServiceRequest { request, reply } => {
-                        let result = runtime.publish_service_request(request, &events).await;
-                        let _ = reply.send(result);
+                        publish_outgoing_batch(
+                            TimedMailboxCommand { command: MailboxCommand::PublishServiceRequest { request, reply }, enqueued_at: queued_at },
+                            &mut rx, &mut deferred_commands, &mut runtime, &events,
+                        ).await;
                     }
                     MailboxCommand::WithdrawServiceRequest { request_id, reply } => {
                         let result = runtime.withdraw_service_request(request_id).await;
@@ -1159,10 +1360,17 @@ async fn mailbox_actor(
                         let _ = reply.send(runtime.status().await);
                     }
                     MailboxCommand::ListInbox { reply } => {
-                        let _ = reply.send(Ok(runtime.inbox_summaries()));
+                        if !reply.is_closed() {
+                            let _ = reply.send(Ok(runtime.inbox_summaries()));
+                        }
                     }
                     MailboxCommand::ReadInbox { message_id, reply } => {
-                        let _ = reply.send(runtime.read_inbox_message(message_id).await);
+                        // The API caller may already have timed out while a
+                        // preceding network commit occupied this actor. Avoid
+                        // marking a message read for a response nobody can see.
+                        if !reply.is_closed() {
+                            let _ = reply.send(runtime.read_inbox_message(message_id).await);
+                        }
                     }
                     MailboxCommand::DeleteInbox { message_id, reply } => {
                         let _ = reply.send(runtime.delete_inbox_message(message_id).await);
@@ -1215,8 +1423,17 @@ async fn mailbox_actor(
                         let _ = events.send(MailboxEvent::Warning(format!("early mailbox flush failed: {error}")));
                     }
                 }
-                if let Err(error) = runtime.refresh_public_snapshot(&snapshot).await {
-                    let _ = events.send(MailboxEvent::Warning(format!("mailbox snapshot refresh failed: {error}")));
+                // Walk observations are frequent and the public snapshot
+                // includes DHT package-id lookups. A 250ms debounce preserves
+                // responsive status/inbox views without one refresh per hop.
+                if !matches!(command_name, "WalkNodeObserved" | "WalkCompleted")
+                    || last_snapshot_refresh.elapsed() >= Duration::from_millis(250)
+                {
+                    if let Err(error) = runtime.refresh_public_snapshot(&snapshot).await {
+                        let _ = events.send(MailboxEvent::Warning(format!("mailbox snapshot refresh failed: {error}")));
+                    } else {
+                        last_snapshot_refresh = std::time::Instant::now();
+                    }
                 }
             }
         }

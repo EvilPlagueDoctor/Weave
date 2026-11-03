@@ -21,6 +21,7 @@ import java.nio.ByteOrder
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
@@ -45,7 +46,11 @@ class DaemonClient(private val context: Context) {
     private val requestId = AtomicLong(1L)
     private val subscriptionScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val subscriptionJobs = ConcurrentHashMap<Long, Job>()
-    private var sessionToken: String? = null
+    @Volatile private var sessionToken: String? = null
+    private val lostSession = AtomicBoolean(false)
+
+    /** An authenticated RPC reported a missing/expired local app session. Reconnect once. */
+    fun requiresNewSession(): Boolean = lostSession.get()
     private val credentialStore = SecureCredentialStore(context)
     private var connectedIdentity: DaemonIdentity? = null
 
@@ -55,6 +60,7 @@ class DaemonClient(private val context: Context) {
      * selects a different credential slot.
      */
     suspend fun connect(onStatus: (String) -> Unit) {
+        lostSession.set(false)
         sessionToken = null
         connectedIdentity = null
         WeaveDiagnostics.event(context, "DAEMON_CONNECT", "stage=embedded_bridge_begin")
@@ -64,23 +70,44 @@ class DaemonClient(private val context: Context) {
             "DAEMON_CONNECT",
             "stage=identity_ready profile=${short(identity.profileId)} instance=${short(identity.daemonInstanceId)}"
         )
-        ensureCredential(identity.profileId, onStatus)
+        // A network profile ID (often "default") is NOT unique across independent
+        // VeilKnit logins. Binding bootstrap credentials to it alone leaked identity
+        // between accounts on the same device.
+        check(com.example.veilknit_deamon.DaemonApiRuntime.authenticatedAccountMatches()) {
+            "Account identity mismatch: the running Rust account is not the requested login"
+        }
+        val rustUsername = NativeDaemonBridge.embeddedUsername()
+        check(rustUsername.isNotBlank()) { "Authenticated Rust username unavailable" }
+        val credentialScope = "$rustUsername/${identity.profileId}"
+        ensureCredential(credentialScope, onStatus)
         try {
-            authenticate(identity.profileId)
+            authenticate(credentialScope)
         } catch (first: IllegalStateException) {
             // If this profile revoked/rotated the credential while Weave was away, the saved
             // secret is no longer useful. Remove only this profile's slot and perform the normal
             // approval flow once; credentials for other VeilKnit accounts remain untouched.
             if (!first.message.orEmpty().contains("authentication_failed") &&
                 !first.message.orEmpty().contains("Credential generation changed")) throw first
-            clearCredential(identity.profileId)
+            clearCredential(credentialScope)
             onStatus("Refreshing Weave authorization for this VeilKnit account…")
-            ensureCredential(identity.profileId, onStatus)
-            authenticate(identity.profileId)
+            ensureCredential(credentialScope, onStatus)
+            authenticate(credentialScope)
         }
+        check(com.example.veilknit_deamon.DaemonApiRuntime.authenticatedAccountMatches() &&
+            NativeDaemonBridge.embeddedUsername() == rustUsername) {
+            "Account changed during Weave authentication; refusing the stale session"
+        }
+        // The main DHT uniquely identifies the *actual* signed-in network account.
+        // All Kotlin vault participants (editor, onboarding, etc.) must distinguish
+        // accounts whose local network profile ID happens to be "default".
+        val accountMainDht = identity().getString("main_dht").trim()
+        check(accountMainDht.startsWith("VLD0:") && accountMainDht.length > 20) {
+            "Authenticated VeilKnit account has no valid main DHT identity"
+        }
+        val vaultAccountScope = "$accountMainDht/${identity.profileId}"
         connectedIdentity = identity
-        WeaveDiagnostics.event(context, "DAEMON_CONNECT", "stage=authenticated profile=${short(identity.profileId)}")
-        PrivateVault.get(context).attach(this, identity.profileId)
+        WeaveDiagnostics.event(context, "DAEMON_CONNECT", "stage=authenticated profile=${short(identity.profileId)} main=${short(accountMainDht)}")
+        PrivateVault.get(context).attach(this, vaultAccountScope)
     }
 
     fun activeDaemonIdentity(): DaemonIdentity? = connectedIdentity
@@ -106,6 +133,7 @@ class DaemonClient(private val context: Context) {
             "profile=${connectedIdentity?.profileId?.let(::short) ?: "(none)"} reason=${reason.take(180)}"
         )
         PrivateVault.get(context).detach(reason)
+        lostSession.set(false)
         sessionToken = null
         connectedIdentity = null
         subscriptionJobs.keys.toList().forEach(::unsubscribe)
@@ -139,7 +167,9 @@ class DaemonClient(private val context: Context) {
                 val state = daemonState()
                 val profile = state.optString("profile_id").trim()
                 val instance = state.optString("daemon_instance_id").trim()
-                if (state.optBoolean("ready", false) && profile.isNotBlank() && instance.isNotBlank()) {
+                if (state.optBoolean("ready", false) &&
+                    com.example.veilknit_deamon.DaemonApiRuntime.authenticatedAccountMatches() &&
+                    profile.isNotBlank() && instance.isNotBlank()) {
                     return@withContext DaemonIdentity(profile, instance)
                 }
                 if (System.currentTimeMillis() >= deadline) {
@@ -163,6 +193,11 @@ class DaemonClient(private val context: Context) {
     }
 
     private fun rawRequest(action: String, authenticated: Boolean = true, block: JSONObject.() -> Unit = {}): JSONObject {
+        // Once the daemon rejects our app session, do not continue sending doomed RPCs.
+        // The controller's one network worker will reauthenticate the existing account.
+        if (authenticated && lostSession.get()) {
+            throw IllegalStateException("authentication_failed: local app session requires reconnect")
+        }
         val objectId = requestId.getAndIncrement()
         val request = JSONObject()
             .put("protocol_version", PROTOCOL_VERSION)
@@ -181,9 +216,16 @@ class DaemonClient(private val context: Context) {
             val response = JSONObject(responseText)
             if (!response.optBoolean("ok", false)) {
                 val error = response.optJSONObject("error")
-                val failure = IllegalStateException(
-                    "${error?.optString("code", "daemon_error")}: ${error?.optString("message", "unknown daemon error")}"
-                )
+                val errorCode = error?.optString("code", "daemon_error").orEmpty()
+                val errorMessage = error?.optString("message", "unknown daemon error").orEmpty()
+                if (authenticated && errorCode == "authentication_failed" &&
+                    (errorMessage.contains("session", ignoreCase = true) ||
+                        errorMessage.contains("token", ignoreCase = true)) &&
+                    lostSession.compareAndSet(false, true)
+                ) {
+                    WeaveDiagnostics.event(context, "DAEMON_SESSION_LOST", "action=$action reason=${errorMessage.take(120)}")
+                }
+                val failure = IllegalStateException("$errorCode: $errorMessage")
                 WeaveDiagnostics.rpc(
                     context, action, requestBytes, responseBytes,
                     SystemClock.elapsedRealtime() - started, false, failure
@@ -396,13 +438,31 @@ class DaemonClient(private val context: Context) {
         expiresAtSeconds: Long? = null,
         awaitResponse: Boolean = false,
         preferDirect: Boolean = true,
-    ): JSONObject = rawRequest("send_message") {
-        put("recipient_main_dht", recipientMainDht)
-        put("payload_base64", Base64.encodeToString(payload, Base64.NO_WRAP))
-        conversationIdHex?.let { put("conversation_id_hex", it) }
-        expiresAtSeconds?.let { put("expires_at", it) }
-        put("await_response", awaitResponse)
-        put("prefer_direct", preferDirect)
+    ): JSONObject {
+        val started = SystemClock.elapsedRealtime()
+        return try {
+            val result = rawRequest("send_message") {
+                put("recipient_main_dht", recipientMainDht)
+                put("payload_base64", Base64.encodeToString(payload, Base64.NO_WRAP))
+                conversationIdHex?.let { put("conversation_id_hex", it) }
+                expiresAtSeconds?.let { put("expires_at", it) }
+                put("await_response", awaitResponse)
+                put("prefer_direct", preferDirect)
+            }
+            WeaveDiagnostics.event(
+                context, "ROUTE",
+                "action=send_message path=${result.optString("delivery_path", "unknown")} " +
+                    "elapsed_ms=${SystemClock.elapsedRealtime() - started} payload_bytes=${payload.size} outcome=queued"
+            )
+            result
+        } catch (error: Throwable) {
+            WeaveDiagnostics.event(
+                context, "ROUTE",
+                "action=send_message path=unknown elapsed_ms=${SystemClock.elapsedRealtime() - started} " +
+                    "payload_bytes=${payload.size} outcome=failed error=${error.javaClass.simpleName}"
+            )
+            throw error
+        }
     }
 
     /** Messages that arrived while this app was not subscribed. Summaries only. */
@@ -422,9 +482,24 @@ class DaemonClient(private val context: Context) {
 
     fun getMailboxStatus(): JSONObject = rawRequest("get_mailbox_status")
 
-    fun sendGossip(peerMainDht: String, payload: ByteArray): JSONObject = rawRequest("send_gossip") {
-        put("recipient_main_dht", peerMainDht)
-        put("payload_base64", Base64.encodeToString(payload, Base64.NO_WRAP))
+    fun sendGossip(peerMainDht: String, payload: ByteArray): JSONObject {
+        val started = SystemClock.elapsedRealtime()
+        return try {
+            val result = rawRequest("send_gossip") {
+                put("recipient_main_dht", peerMainDht)
+                put("payload_base64", Base64.encodeToString(payload, Base64.NO_WRAP))
+            }
+            // Gossip is a handshake transport, not proof that the recipient consumed an event.
+            if (SystemClock.elapsedRealtime() - started > 2_000L) {
+                WeaveDiagnostics.event(context, "ROUTE", "action=send_gossip path=gossip_datagram " +
+                    "elapsed_ms=${SystemClock.elapsedRealtime() - started} payload_bytes=${payload.size} outcome=queued")
+            }
+            result
+        } catch (error: Throwable) {
+            WeaveDiagnostics.event(context, "ROUTE", "action=send_gossip path=gossip_datagram " +
+                "elapsed_ms=${SystemClock.elapsedRealtime() - started} outcome=failed error=${error.javaClass.simpleName}")
+            throw error
+        }
     }
     fun recommendNodes(nodes: List<String>) = rawRequest("recommend_nodes") {
         put("nodes", JSONArray(nodes.take(256))); put("context", "weave_gossip"); put("ttl_seconds", 600)

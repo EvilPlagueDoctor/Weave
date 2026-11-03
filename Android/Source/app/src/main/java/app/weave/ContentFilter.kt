@@ -102,6 +102,21 @@ data class FilterDecision(
     val filtered: Boolean get() = category != null && action != FilterAction.Show
 }
 
+/** A scan that did not run must never be interpreted as a safe (zero-score) scan. */
+enum class ImageNotScannedReason {
+    WaitingForInitialization,
+    ModelUnavailable,
+    ClassificationFailed,
+}
+
+sealed interface ImageScanResult {
+    data class Scanned(val scores: ContentScores) : ImageScanResult
+    data class NotScanned(val reason: ImageNotScannedReason) : ImageScanResult
+    data object Disabled : ImageScanResult
+}
+
+enum class ImageModelStatus { NotInitialized, Initializing, Ready, Unavailable }
+
 @Stable
 class ContentFilter(private val context: Context) : PrivateVault.Participant {
     private val vault = PrivateVault.get(context.applicationContext)
@@ -113,7 +128,11 @@ class ContentFilter(private val context: Context) : PrivateVault.Participant {
     private val renderLogCache = BoundedCache<String, String>(384)
     private val revealed = mutableStateMapOf<String, Unit>()
 
-    private val imageSafetyClassifier by lazy { OnnxImageSafetyClassifier(context) }
+    var imageModelStatus by mutableStateOf(ImageModelStatus.NotInitialized)
+        private set
+    private val imageSafetyClassifier by lazy {
+        OnnxImageSafetyClassifier(context) { status -> imageModelStatus = status }
+    }
     private val toxicTextClassifier by lazy { OnnxToxicTextClassifier(context) }
 
     init {
@@ -193,37 +212,54 @@ class ContentFilter(private val context: Context) : PrivateVault.Participant {
         return score
     }
 
-    suspend fun classifyImage(contentId: String, bitmap: Bitmap): ContentScores {
-        imageCache[contentId]?.let {
+    /** Whether image filtering should actually gate image display. */
+    fun imageFilteringEnabled(): Boolean =
+        (preferences.sexual.sensitivity != FilterSensitivity.Off && preferences.sexual.action != FilterAction.Show) ||
+            (preferences.gore.sensitivity != FilterSensitivity.Off && preferences.gore.action != FilterAction.Show)
+
+    suspend fun classifyImage(contentId: String, bitmap: Bitmap): ImageScanResult {
+        if (!imageFilteringEnabled()) {
+            diagnostic("IMAGE_SKIP content=${diagnosticContentId(contentId)} reason=image_filtering_disabled")
+            return ImageScanResult.Disabled
+        }
+        // A content ID may be reused after an image edit; generationId prevents
+        // a previous bitmap's clean verdict from authorizing a different bitmap.
+        val imageKey = "$contentId:${bitmap.width}x${bitmap.height}:${bitmap.generationId}"
+        imageCache[imageKey]?.let {
             diagnostic(
                 "IMAGE_CACHE_HIT content=${diagnosticContentId(contentId)} " +
                     "sexual=${formatScore(it.sexual)} gore=${formatScore(it.gore)}"
             )
-            return it
-        }
-        if (preferences.sexual.sensitivity == FilterSensitivity.Off && preferences.gore.sensitivity == FilterSensitivity.Off) {
-            diagnostic("IMAGE_SKIP content=${diagnosticContentId(contentId)} reason=all_image_filters_off")
-            return ContentScores()
+            return ImageScanResult.Scanned(it)
         }
         diagnostic(
             "IMAGE_CLASSIFY_BEGIN content=${diagnosticContentId(contentId)} " +
-                "size=${bitmap.width}x${bitmap.height} model_ready=$imageSafetyModelReady " +
+                "size=${bitmap.width}x${bitmap.height} model_status=${imageModelStatus.name} " +
                 "sexual=${preferences.sexual.sensitivity.name}/${preferences.sexual.action.name}" +
                 "@${formatScore(preferences.sexual.sensitivity.threshold)} " +
                 "gore=${preferences.gore.sensitivity.name}/${preferences.gore.action.name}" +
                 "@${formatScore(preferences.gore.sensitivity.threshold)}"
         )
-        // One compact local model returns SFW / NSFW / NSFL (gore) probabilities.
-        val score = imageSafetyClassifier.classify(contentId, bitmap)
-        imageCache[contentId] = score
-        val decision = decision(score, contentId)
-        diagnostic(
-            "IMAGE_CLASSIFY_RESULT content=${diagnosticContentId(contentId)} " +
-                "sexual=${formatScore(score.sexual)} gore=${formatScore(score.gore)} " +
-                "decision=${decision.action.name} category=${decision.category?.name ?: "none"} " +
-                "decision_score=${formatScore(decision.score)} revealed=${isRevealed(contentId)}"
-        )
-        return score
+        // Callers wait in the classifier's mutex queue until initialization has completed.
+        // Do not cache NotScanned; only a successful inference can populate the cache.
+        val result = imageSafetyClassifier.classify(contentId, bitmap)
+        when (result) {
+            is ImageScanResult.Scanned -> {
+                imageCache[imageKey] = result.scores
+                val decision = decision(result.scores, contentId)
+                diagnostic(
+                    "IMAGE_CLASSIFY_RESULT content=${diagnosticContentId(contentId)} " +
+                        "sexual=${formatScore(result.scores.sexual)} gore=${formatScore(result.scores.gore)} " +
+                        "decision=${decision.action.name} category=${decision.category?.name ?: "none"} " +
+                        "decision_score=${formatScore(decision.score)} revealed=${isRevealed(contentId)}"
+                )
+            }
+            is ImageScanResult.NotScanned -> diagnostic(
+                "IMAGE_NOT_SCANNED content=${diagnosticContentId(contentId)} reason=${result.reason.name}"
+            )
+            ImageScanResult.Disabled -> Unit
+        }
+        return result
     }
 
     fun logImageRender(contentId: String, decision: FilterDecision, compact: Boolean) {
@@ -300,54 +336,67 @@ private class BoundedCache<K, V>(private val maxEntries: Int) {
     @Synchronized fun clear() { map.clear() }
 }
 
-private class OnnxImageSafetyClassifier(private val context: Context) {
+private class OnnxImageSafetyClassifier(
+    private val context: Context,
+    private val onModelStatus: (ImageModelStatus) -> Unit,
+) {
+    // This mutex covers model initialization AND inference. Scans arriving while the
+    // session loads remain queued (suspended), never receive zero scores as a fallback.
     private val mutex = Mutex()
     private var attempted = false
     private var session: OrtSession? = null
-    private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
+    private var env: OrtEnvironment? = null
 
-    suspend fun classify(contentId: String, bitmap: Bitmap): ContentScores = withContext(Dispatchers.Default) {
-        val active = ensureSession() ?: run {
-            diagnostic("IMAGE_MODEL_UNAVAILABLE content=${contentId.take(96)} result=zeros")
-            return@withContext ContentScores()
-        }
+    suspend fun classify(contentId: String, bitmap: Bitmap): ImageScanResult = withContext(Dispatchers.Default) {
         mutex.withLock {
-            runCatching { classifyLocked(active, bitmap) }
-                .onFailure {
-                    diagnostic(
-                        "IMAGE_CLASSIFY_FAILED content=${contentId.take(96)} " +
-                            "exception=${it::class.java.simpleName}:${it.message.orEmpty().replace('\n', ' ').take(180)}"
-                    )
-                }
-                .getOrDefault(ContentScores())
+            val active = ensureSession() ?: return@withLock ImageScanResult.NotScanned(ImageNotScannedReason.ModelUnavailable)
+            try {
+                ImageScanResult.Scanned(classifyLocked(active, bitmap))
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (failure: Throwable) {
+                diagnostic(
+                    "IMAGE_CLASSIFY_FAILED content=${contentId.take(96)} " +
+                        "exception=${failure::class.java.simpleName}:${failure.message.orEmpty().replace('\n', ' ').take(180)}"
+                )
+                ImageScanResult.NotScanned(ImageNotScannedReason.ClassificationFailed)
+            }
         }
     }
 
+    /** Only called under mutex. */
     private fun ensureSession(): OrtSession? {
         session?.let { return it }
         if (attempted) return null
         attempted = true
-        session = runCatching {
-            diagnostic("IMAGE_MODEL_LOAD_BEGIN asset=${ContentFilter.IMAGE_SAFETY_MODEL_ASSET}")
+        onModelStatus(ImageModelStatus.Initializing)
+        diagnostic("IMAGE_MODEL_LOAD_BEGIN asset=${ContentFilter.IMAGE_SAFETY_MODEL_ASSET}")
+        session = try {
+            // Resolving native runtime on the worker inside try also catches JNI/link errors.
+            val environment = OrtEnvironment.getEnvironment()
+            env = environment
             val bytes = context.assets.open(ContentFilter.IMAGE_SAFETY_MODEL_ASSET).use { it.readBytes() }
-            OrtSession.SessionOptions().use { options -> env.createSession(bytes, options) }.also { loaded ->
+            OrtSession.SessionOptions().use { options -> environment.createSession(bytes, options) }.also { loaded ->
                 diagnostic(
                     "IMAGE_MODEL_LOAD_OK bytes=${bytes.size} inputs=${loaded.inputNames.joinToString(",")} " +
                         "outputs=${loaded.outputNames.joinToString(",")}"
                 )
             }
-        }.onFailure {
+        } catch (failure: Throwable) {
+            onModelStatus(ImageModelStatus.Unavailable)
             diagnostic(
                 "IMAGE_MODEL_LOAD_FAILED asset=${ContentFilter.IMAGE_SAFETY_MODEL_ASSET} " +
-                    "exception=${it::class.java.simpleName}:${it.message.orEmpty().replace('\n', ' ').take(180)}"
+                    "exception=${failure::class.java.simpleName}:${failure.message.orEmpty().replace('\n', ' ').take(180)}"
             )
-        }.getOrNull()
+            null
+        }
+        if (session != null) onModelStatus(ImageModelStatus.Ready)
         return session
     }
 
     private fun classifyLocked(active: OrtSession, bitmap: Bitmap): ContentScores {
-        val input = active.inputInfo.entries.firstOrNull() ?: return ContentScores()
-        val shape = (input.value.info as? TensorInfo)?.shape ?: return ContentScores()
+        val input = active.inputInfo.entries.firstOrNull() ?: error("Image model has no input")
+        val shape = (input.value.info as? TensorInfo)?.shape ?: error("Image model input is not a tensor")
         val nchw = shape.size == 4 && shape.getOrNull(1) == 3L
         val h = when {
             nchw -> shape.getOrNull(2)?.takeIf { it > 0 }?.toInt()
@@ -382,12 +431,12 @@ private class OnnxImageSafetyClassifier(private val context: Context) {
             }
         }
         val tensorShape = if (nchw) longArrayOf(1, 3, h.toLong(), w.toLong()) else longArrayOf(1, h.toLong(), w.toLong(), 3)
-        OnnxTensor.createTensor(env, FloatBuffer.wrap(data), tensorShape).use { tensor ->
+        OnnxTensor.createTensor(requireNotNull(env), FloatBuffer.wrap(data), tensorShape).use { tensor ->
             active.run(mapOf(input.key to tensor)).use { result ->
                 val probabilities = floatsFromValue(result[0].value)
-                if (probabilities.size < 3) {
-                    diagnostic("IMAGE_MODEL_BAD_OUTPUT count=${probabilities.size} expected_at_least=3")
-                    return ContentScores()
+                if (probabilities.size < 3 || probabilities.take(3).any { !it.isFinite() }) {
+                    diagnostic("IMAGE_MODEL_BAD_OUTPUT count=${probabilities.size} expected_at_least=3_finite")
+                    error("Image model produced missing or invalid probabilities")
                 }
                 diagnostic(
                     "IMAGE_MODEL_RAW nsfl=${format(probabilities[0])} " +
@@ -416,11 +465,22 @@ private class OnnxToxicTextClassifier(private val context: Context) {
     private var attempted = false
     private var session: OrtSession? = null
     private var tokenizer: WordPieceTokenizer? = null
-    private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
+    private var env: OrtEnvironment? = null
 
     suspend fun classify(text: String): ContentScores = withContext(Dispatchers.Default) {
-        val pair = ensureLoaded() ?: return@withContext fallbackAggression(text)
-        mutex.withLock { classifyLocked(pair.first, pair.second, text) }
+        mutex.withLock {
+            // Initialization and inference are serialized: a concurrent caller
+            // cannot observe attempted=true while the session is still loading.
+            val pair = ensureLoaded() ?: return@withLock fallbackAggression(text)
+            try {
+                classifyLocked(pair.first, pair.second, text)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (failure: Throwable) {
+                Log.e("WeaveContentFilter", "TEXT_CLASSIFY_FAILED: ${failure::class.java.simpleName}", failure)
+                fallbackAggression(text)
+            }
+        }
     }
 
     private fun ensureLoaded(): Pair<OrtSession, WordPieceTokenizer>? {
@@ -432,7 +492,9 @@ private class OnnxToxicTextClassifier(private val context: Context) {
         runCatching {
             val model = context.assets.open(ContentFilter.TOXIC_MODEL_ASSET).use { it.readBytes() }
             val vocab = context.assets.open(ContentFilter.VOCAB_ASSET).bufferedReader().use { it.readLines() }
-            session = OrtSession.SessionOptions().use { options -> env.createSession(model, options) }
+            val environment = OrtEnvironment.getEnvironment()
+            env = environment
+            session = OrtSession.SessionOptions().use { options -> environment.createSession(model, options) }
             tokenizer = WordPieceTokenizer(vocab)
         }
         return session?.let { loadedSession -> tokenizer?.let { loadedSession to it } }
@@ -449,7 +511,7 @@ private class OnnxToxicTextClassifier(private val context: Context) {
                     "token_type_ids" -> encoded.types
                     else -> return@forEach
                 }
-                tensors[name] = OnnxTensor.createTensor(env, LongBuffer.wrap(values), longArrayOf(1, values.size.toLong()))
+                tensors[name] = OnnxTensor.createTensor(requireNotNull(env), LongBuffer.wrap(values), longArrayOf(1, values.size.toLong()))
             }
             if (!tensors.containsKey("input_ids")) return ContentScores()
             active.run(tensors).use { result ->

@@ -82,6 +82,8 @@ data class DaemonUiState(
     val nativeRunning: Boolean = false,
     val ready: Boolean = false,
     val authenticated: Boolean = false,
+    /** Once a start is rejected, stale native logs cannot mark this account ready. */
+    val accountStartBlocked: Boolean = false,
     val status: String = "Stopped",
     val mainDhtKey: String = "",
     val walkSettings: WalkSettingsUi = WalkSettingsUi(),
@@ -107,6 +109,7 @@ object DaemonStateStore {
                 nativeRunning = false,
                 ready = false,
                 authenticated = false,
+                accountStartBlocked = false,
                 status = status,
                 mainDhtKey = "",
                 walkSettings = WalkSettingsUi(),
@@ -119,6 +122,20 @@ object DaemonStateStore {
                 appVisibleName = "",
                 logs = emptyList(),
                 lastError = null,
+            )
+        }
+    }
+
+    /** A stale daemon is *not* a successful new-account login. Keep Weave gated. */
+    fun blockAccountStart(reason: String) {
+        mutableState.update {
+            it.copy(
+                ready = false,
+                authenticated = false,
+                accountStartBlocked = true,
+                mainDhtKey = "",
+                status = "Account switch blocked",
+                lastError = reason,
             )
         }
     }
@@ -139,6 +156,8 @@ object DaemonStateStore {
                 nativeRunning = false,
                 ready = false,
                 authenticated = false,
+                accountStartBlocked = false,
+                mainDhtKey = "",
                 status = message,
                 lastError = null,
             )
@@ -300,12 +319,25 @@ object DaemonStateStore {
                         }
                     }
                     "[gui] ready" in lower -> {
-                        next = next.copy(
-                            ready = true,
-                            authenticated = true,
-                            status = "Running",
-                            lastError = null,
-                        )
+                        // Never accept a previous account's ready line, even if Android
+                        // reused the foreground service or the UI state was stale.
+                        if (!next.accountStartBlocked && DaemonApiRuntime.authenticatedAccountMatches()) {
+                            next = next.copy(
+                                ready = true,
+                                authenticated = true,
+                                status = "Running",
+                                lastError = null,
+                            )
+                        } else {
+                            next = next.copy(
+                                ready = false,
+                                authenticated = false,
+                                accountStartBlocked = true,
+                                mainDhtKey = "",
+                                status = "Account identity mismatch",
+                                lastError = "The native daemon's authenticated account does not match the requested login. Stop the daemon completely before retrying.",
+                            )
+                        }
                     }
                     "welcome," in lower -> {
                         next = next.copy(
@@ -355,6 +387,9 @@ object DaemonStateStore {
                 current.logs + visibleLines
             } else {
                 (current.logs + visibleLines).takeLast(MAX_UI_LOG_LINES)
+            }
+            if (next.accountStartBlocked) {
+                next = next.copy(ready = false, authenticated = false, mainDhtKey = "")
             }
             next.copy(logs = combined)
         }

@@ -28,6 +28,13 @@ object DaemonApiRuntime {
      */
     fun daemonInstanceId(): String = daemonInstanceId.get()
 
+    /** Fail closed unless Rust's authenticated account is the one this host started. */
+    fun authenticatedAccountMatches(): Boolean {
+        val expected = username.get().trim()
+        return expected.isNotEmpty() && NativeDaemonBridge.isRunning() &&
+            NativeDaemonBridge.embeddedUsername() == expected
+    }
+
     /**
      * Read the active network profile written by the Rust local API. The username check is
      * important during account switching: an old daemon_endpoint.json can remain on disk until

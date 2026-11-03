@@ -21,7 +21,7 @@ console-ui = ["dep:crossterm"]
 tokio = {version = "1", features = ["full"] }
 flume = "0.12"
 serde_json = "1.0"
-veilid-core = { git = "https://gitlab.com/veilid/veilid.git", rev = "dd8e2cdd72b5bf817172ac31c20872b168c5c8fc" }
+veilid-core = { git = "https://gitlab.com/veilid/veilid.git", tag = "v0.5.8", version = "=0.5.8" }
 base64 = "0.21" # or latest version
 # better error Messages
 anyhow = "1.0"

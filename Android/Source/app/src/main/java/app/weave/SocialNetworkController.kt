@@ -7,6 +7,8 @@ import android.widget.Toast
 import android.util.Base64
 import app.weave.backbone.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Semaphore as CoroutineSemaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -27,11 +29,33 @@ private const val INBOX_DRAIN_MS = 60_000L
 
 /** Messages handled per sweep, so a large backlog cannot stall the worker loop. */
 private const val INBOX_DRAIN_LIMIT = 50
-private const val PEER_REFRESH_MS = 20_000L
+// Quickly populate a fresh/empty account, then return to low-cost background discovery.
+// These are peer-list/search intervals, not TTLs for already verified profile layouts.
+private const val PEER_WARMUP_REFRESH_MS = 15_000L
+private const val PEER_BACKGROUND_REFRESH_MS = 45_000L
+private const val PEER_WARMUP_MIN_MS = 60_000L
+private const val PEER_WARMUP_MAX_MS = 10 * 60_000L
+private const val PEER_WARMUP_TARGET_PROFILES = 30
+private const val PEER_WARMUP_TARGET_PEERS = 60
+private const val CUSTODY_RECOVERY_REFRESH_MS = 120_000L
+private const val PEER_WARMUP_PROFILE_BATCH = 24
+private const val PEER_BACKGROUND_PROFILE_BATCH = 12
+private const val ROOT_LOOKUP_RETRY_MS = 45_000L
+private const val PROFILE_BACKGROUND_RECHECK_MS = 45 * 60_000L
+private const val PROFILE_ACTIVE_RECHECK_MS = 5 * 60_000L
+private const val GROUP_DIRECTORY_BACKGROUND_RECHECK_MS = 60 * 60_000L
+private const val GROUP_DIRECTORY_ACTIVE_RECHECK_MS = 5 * 60_000L
+private const val FAILED_RECHECK_MS = 2 * 60_000L
+private const val DISCOVERY_SAVE_DELAY_MS = 15_000L
 private const val GOSSIP_INTERVAL_MS = 12_000L
 private const val GROUP_GOSSIP_INTERVAL_MS = 8_000L
+private const val GROUP_EVENT_INVENTORY_INTERVAL_MS = 90_000L
 private val RECONNECT_BACKOFF_MS = longArrayOf(1_500L, 3_000L, 6_000L, 15_000L, 30_000L)
 private const val GOSSIP_SUMMARY_LOG_REPEAT_MS = 60_000L
+// Untrusted leads only select what to check; all profile roots must be confirmed through
+// the actual account app directory before they are treated as genuine profiles.
+private const val GOSSIP_LEADS_PER_TICK = 6
+private const val GOSSIP_LEADS_LOG_INTERVAL_MS = 60_000L
 private const val DIAGNOSTIC_LOG_MAX_BYTES = 1024 * 1024
 private const val DIAGNOSTIC_LOG_KEEP_BYTES = 700 * 1024
 private const val PROFILE_MAX_BYTES = 4 * 1024 * 1024
@@ -100,12 +124,34 @@ class SocialNetworkController(context: Context) {
     private var widgetNetwork: WidgetNetworkManager? = null
     private var networkJob: Job? = null
     private val cache = KnowledgeCache()
+    private val savedDiscovery = EncryptedDiscoverySnapshot(vault)
+    private val profileCheckedAt = ConcurrentHashMap<String, Long>()
+    private val profileRetryAfter = ConcurrentHashMap<String, Long>()
+    private val directoryCheckedAt = ConcurrentHashMap<String, Long>()
+    private val directoryInFlight = ConcurrentHashMap.newKeySet<String>()
+    private val directoryLookupSlots = CoroutineSemaphore(2)
+    // Resolve missing app roots independently of the peer-list RPC. Otherwise even four
+    // slow root lookups can delay all 147 known peers from being considered for display.
+    private val rootLookupInFlight = ConcurrentHashMap.newKeySet<String>()
+    private val rootRetryAfter = ConcurrentHashMap<String, Long>()
+    private val rootLookupSlots = java.util.concurrent.Semaphore(3)
+    private val gossipDiscoveryLeads = GossipDiscoveryQueue()
+    private val lastGossipLeadLogMs = AtomicLong(0L)
+    // Bounded concurrency protects the embedded daemon, while allowing a useful first page.
+    private val profileVerifySlots = java.util.concurrent.Semaphore(4)
+    private val peerRefreshInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val lastVisibleDiscoveryRefreshAt = AtomicLong(0L)
+    private val discoverySaveLock = Any()
+    @Volatile private var discoverySaveJob: Job? = null
+    @Volatile private var discoverySnapshotDirty = false
+    private var discoveryOwner = ""
     // Concurrent collections rather than plain ones: the worker loop, every incoming message,
     // each profile verification and each comment operation are separate coroutines on
     // Dispatchers.IO, so these are genuinely touched from several threads at once. The same
     // oversight in KnowledgeCache is what crashed the app on the Home screen.
     private val fullRecords = ConcurrentHashMap<String, ProfilePageRecord>()
     private val profileDocuments = ConcurrentHashMap<String, String>()
+    private val profileFetchInFlight = ConcurrentHashMap.newKeySet<String>()
     private val knownPeers: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private val queryReplyAt = ConcurrentHashMap<String, Long>()
     private var profileStoreId: String? = null
@@ -114,12 +160,20 @@ class SocialNetworkController(context: Context) {
     private var nextRequestId = 1L
     private val gossipSentCount = AtomicLong(0)
     private val gossipReceivedCount = AtomicLong(0)
+    // Gossip failures are expected when cached peers go offline. Summarize them
+    // instead of letting hundreds of identical errors evict useful delivery logs.
+    private val gossipFailureTallies = ConcurrentHashMap<String, AtomicLong>()
+    private val lastGossipFailureSummaryAt = AtomicLong(0L)
     private val groupHintStamp = ConcurrentHashMap<String, Long>()
+    private val gossipEventInFlight = ConcurrentHashMap.newKeySet<String>()
+    private var eventInventoryCursor = 0
     private val gossipSummaryDigestBySource = ConcurrentHashMap<String, String>()
     private val gossipSummaryLogAtBySource = ConcurrentHashMap<String, Long>()
     private val groupHintInFlight = ConcurrentHashMap.newKeySet<String>()
     private val loggedGroupGeneration = ConcurrentHashMap<String, Long>()
     @Volatile private var lastGroupGossipSendLogMs = 0L
+    @Volatile private var lastGroupGossipDigest = ""
+    @Volatile private var lastGroupGossipBroadcastAtMs = 0L
     @Volatile private var lastDebugUiRefreshMs = 0L
     private val startupTrace = StringBuilder()
     @Volatile private var startupDiagnosticsCopied = false
@@ -173,6 +227,10 @@ class SocialNetworkController(context: Context) {
                         status = "VeilKnit connected; preparing Weave profile storage…"
                     )
                     log("Weave account active: main_dht=$mainDht")
+                    // GroupStore has already loaded from the encrypted vault during connect().
+                    // Restore known people before any DHT discovery; offline startup stays useful.
+                    restoreDiscovery(mainDht)
+                    updateSnapshots()
                     startupLog("binding Groups v2 event store")
                     groupEventsV2.bind(daemon!!, mainDht)
                     groupEventsV2.cleanup()
@@ -195,17 +253,27 @@ class SocialNetworkController(context: Context) {
                     groupRuntime?.recoverPendingContentV2()
                     widgetNetwork = WidgetNetworkManager(appContext, daemon!!, { _ui.value.mainDht }, ::log)
                     ensureLiveSubscriptions()
+                    val discoveryStartedAtMs = System.currentTimeMillis()
+                    scope.launch { refreshPeers(warmup = true) }
                     scope.launch { runCatching { widgetNetwork?.cleanupExpiredSessions() }.onFailure { log("widget session cleanup: ${it.message}") } }
                     val advertisedGroups = runCatching { groupRuntime?.publishMyDirectory() ?: 0 }
                         .onFailure { log("group directory publish deferred: ${it.message}") }
                         .getOrDefault(0)
                     log("group directory ready: $advertisedGroups owned/claimed branch advertisement(s)")
                     logGroupResponsibilities("startup")
+                    // The local directory may already know public group creators whose
+                    // profiles were never fetched. Give them a verified-root lookup lead.
+                    groups.all().asSequence()
+                        .filter { it.policy.visibility == GroupVisibility.Public }
+                        .map { it.ownerId }.distinct().take(64)
+                        .forEach { noteGossipDiscoveryLead(it, groupAuthority = true) }
                     readOwnRecord()
-                    refreshPeers()
+                    // The first peer lookup starts before slower own-directory publishing and
+                    // profile reads; cached names are already restored for immediate display.
                     runCatching { groupRuntime?.recoverCustodyV2() }
                         .onFailure { log("initial custody recovery deferred: ${it.message}") }
                     runCatching { gossipGroups() }.onFailure { log("initial group gossip deferred: ${it.message}") }
+                    runCatching { gossipEventInventory() }.onFailure { log("initial event inventory deferred: ${it.message}") }
                     updateSnapshots()
                     _ui.value = _ui.value.copy(connected = true, status = healthLine())
                     WeaveDiagnostics.event(appContext, "NETWORK_CONNECTED", "main_dht=${short(mainDht)}")
@@ -213,24 +281,46 @@ class SocialNetworkController(context: Context) {
                     reconnectFailures = 0
                     reconnectDelayMs = 0L
 
-                    var lastPeerRefresh = 0L
+                    var lastPeerRefresh = discoveryStartedAtMs
+                    var lastCustodyRecovery = discoveryStartedAtMs
                     var lastGossip = 0L
                     var lastGroupGossip = 0L
+                    var lastEventInventory = System.currentTimeMillis()
                     var lastSubscriptionCheck = 0L
                     var lastInboxDrain = System.currentTimeMillis()
                     while (isActive) {
                         // A different daemon_instance_id means every old session token is dead.
                         // A different profile_id additionally means all DHT/cache state belongs
                         // to another VeilKnit identity. Either case is a clean reconnect.
+                        if (daemon?.requiresNewSession() == true) {
+                            throw DaemonSessionInvalidException()
+                        }
                         if (daemon?.daemonIdentityChanged() != false) {
                             throw DaemonSessionChangedException()
                         }
 
                         val nowMs = System.currentTimeMillis()
-                        if (nowMs - lastPeerRefresh >= PEER_REFRESH_MS) {
-                            refreshPeers()
-                            runCatching { groupRuntime?.recoverCustodyV2() }
-                                .onFailure { log("custody recovery deferred: ${it.message}") }
+                        val warmupAge = nowMs - discoveryStartedAtMs
+                        // Discovery is not "warm" just because we have heard of 60 DHT nodes.
+                        // Only verified, locally usable layouts count toward the profile target.
+                        // A cold account needs more than four minutes of active searching.
+                        val warmingUp = warmupAge < PEER_WARMUP_MIN_MS ||
+                            (warmupAge < PEER_WARMUP_MAX_MS &&
+                                (profileDocuments.size < PEER_WARMUP_TARGET_PROFILES ||
+                                    knownPeers.size < PEER_WARMUP_TARGET_PEERS))
+                        val peerInterval = if (warmingUp) PEER_WARMUP_REFRESH_MS else PEER_BACKGROUND_REFRESH_MS
+                        if (nowMs - lastPeerRefresh >= peerInterval) {
+                            // Peer discovery stays responsive after login, but DHT verification
+                            // of already saved profiles still observes its long background TTL.
+                            scope.launch { refreshPeers(warmup = warmingUp) }
+                            // Custody recovery is separate, and must not run every 15 seconds.
+                            if (nowMs - lastCustodyRecovery >= CUSTODY_RECOVERY_REFRESH_MS) {
+                                scope.launch {
+                                    runCatching { groupRuntime?.recoverCustodyV2() }
+                                        .onFailure { log("custody recovery deferred: ${it.message}") }
+                                }
+                                lastCustodyRecovery = nowMs
+                            }
                             lastPeerRefresh = nowMs
                         }
                         if (nowMs - lastInboxDrain >= INBOX_DRAIN_MS) {
@@ -244,15 +334,31 @@ class SocialNetworkController(context: Context) {
                             runCatching { gossipGroups() }.onFailure { log("group gossip deferred: ${it.message}") }
                             lastGroupGossip = nowMs
                         }
+                        if (nowMs - lastEventInventory >= GROUP_EVENT_INVENTORY_INTERVAL_MS) {
+                            runCatching { gossipEventInventory() }
+                                .onFailure { log("event inventory deferred: ${it.message}") }
+                            lastEventInventory = nowMs
+                        }
                         if (nowMs - lastSubscriptionCheck >= 5_000L) {
                             ensureLiveSubscriptions()
                             lastSubscriptionCheck = nowMs
                         }
+                        // Turn gossip leads into bounded authenticated app-root lookups even
+                        // between 15/45-second ordinary walker polls.
+                        pumpGossipDiscovery()
                         activeIntent?.let(::runLocalSearch)
                         updateSnapshots()
                         setStatusQuiet(healthLine())
                         delay(1000)
                     }
+                } catch (invalid: DaemonSessionInvalidException) {
+                    if (!isActive) break
+                    reconnectFailures = 0
+                    reconnectDelayMs = 1_000L
+                    _ui.value = _ui.value.copy(connected = false)
+                    log("Weave app session expired inside the embedded daemon; reauthenticating")
+                    WeaveDiagnostics.event(appContext, "NETWORK_RECONNECT", "reason=app_session_invalid")
+                    updateStatus("Restoring Weave's daemon session…")
                 } catch (changed: DaemonSessionChangedException) {
                     if (!isActive) break
                     reconnectFailures = 0
@@ -295,6 +401,7 @@ class SocialNetworkController(context: Context) {
     }
 
     private class DaemonSessionChangedException : RuntimeException()
+    private class DaemonSessionInvalidException : RuntimeException()
 
     /**
      * Forget only network/account-derived state. Editable local content is intentionally not
@@ -314,6 +421,20 @@ class SocialNetworkController(context: Context) {
         activeIntent = null
         fullRecords.clear()
         profileDocuments.clear()
+        profileFetchInFlight.clear()
+        profileCheckedAt.clear()
+        profileRetryAfter.clear()
+        directoryCheckedAt.clear()
+        directoryInFlight.clear()
+        rootLookupInFlight.clear()
+        rootRetryAfter.clear()
+        gossipDiscoveryLeads.clear()
+        lastGossipLeadLogMs.set(0L)
+        lastVisibleDiscoveryRefreshAt.set(0L)
+        discoverySaveJob?.cancel()
+        discoverySaveJob = null
+        discoverySnapshotDirty = false
+        discoveryOwner = ""
         knownPeers.clear()
         queryReplyAt.clear()
         groupHintStamp.clear()
@@ -329,6 +450,12 @@ class SocialNetworkController(context: Context) {
         // which is why the editor could suddenly disappear back to Me.
         _ui.value = previous.copy(
             connected = false,
+            mainDht = "",
+            profileRoot = "",
+            published = false,
+            discoveryName = "",
+            discoveryDescription = "",
+            featuresText = "",
             recent = emptyList(),
             searchResults = emptyList(),
             peers = 0,
@@ -374,7 +501,11 @@ class SocialNetworkController(context: Context) {
         networkJob = null
         daemon?.close("controller stop")
         daemon = null
-        _ui.value = _ui.value.copy(connected = false)
+        _ui.value = _ui.value.copy(
+            connected = false, mainDht = "", profileRoot = "", published = false,
+            discoveryName = "", discoveryDescription = "", featuresText = "",
+            recent = emptyList(), searchResults = emptyList(),
+        )
         // Cancel the work, not the scope: cancelling the scope itself would make this
         // controller permanently unusable and break any later restart().
         scope.coroutineContext.cancelChildren()
@@ -437,6 +568,7 @@ class SocialNetworkController(context: Context) {
                 fullRecords[record.mainDht] = record
                 profileDocuments[record.mainDht] = profileText
                 cache.upsert(record.toHint(nowSeconds(), VerificationState.DHT_VERIFIED), "self", nowSeconds())
+                scheduleDiscoverySave()
                 _ui.value = _ui.value.copy(published = true)
                 oldBlob?.let { runCatching { d.deleteBlob(it) }.onFailure { log("old profile blob cleanup: ${it.message}") } }
                 persistMetadata()
@@ -487,6 +619,7 @@ class SocialNetworkController(context: Context) {
             fullRecords.remove(_ui.value.mainDht)
             profileDocuments.remove(_ui.value.mainDht)
             cache.remove(_ui.value.mainDht)
+            scheduleDiscoverySave()
             _ui.value = _ui.value.copy(published = false)
             updateStatus("Profile unpublished")
             updateSnapshots()
@@ -521,7 +654,18 @@ class SocialNetworkController(context: Context) {
         }.onFailure { log("DHT image import failed: ${it.message}") }.getOrNull()
     }
 
-    fun refreshNow() = scope.launch { refreshPeers(); groupRuntime?.recoverCustodyV2(); updateSnapshots() }
+    // Opening Home or Search should automatically request an up-to-date peer page.
+    // It is intentionally not a force-reverify of every known profile: cached
+    // layouts remain visible and verified records still honor their TTLs.
+    fun refreshDiscoveryWhenVisible() {
+        if (!_ui.value.connected) return
+        val now = System.currentTimeMillis()
+        val previous = lastVisibleDiscoveryRefreshAt.get()
+        if (now - previous < 15_000L || !lastVisibleDiscoveryRefreshAt.compareAndSet(previous, now)) return
+        scope.launch { refreshPeers(warmup = true) }
+    }
+
+    fun refreshNow() = scope.launch { refreshPeers(force = true); groupRuntime?.recoverCustodyV2(); updateSnapshots() }
     fun gossipNow() = scope.launch { gossipSummary(); ownRecord?.let(::gossipProfileAnnounce); updateSnapshots() }
 
     /**
@@ -799,7 +943,12 @@ class SocialNetworkController(context: Context) {
                 fullMedia = fullMedia,
             ) ?: error("Group runtime is not ready")
             log("group post submitted: group=${short(groupId)} conversation=${short(conversationId)}")
-            gossipGroups()
+            // The post is durably saved already; gossip is a fast-path hint, not part of the
+            // confirmation latency. Do not block the composer on extra networking.
+            scope.launch {
+                runCatching { gossipGroups(); gossipEventInventory(groupId) }
+                    .onFailure { log("post gossip deferred: ${it.message}") }
+            }
             conversationId
         }.onFailure { log("group post creation failed: ${it.message}") }
         withContext(Dispatchers.Main.immediate) {
@@ -812,13 +961,17 @@ class SocialNetworkController(context: Context) {
         conversationId: String,
         body: String,
         authorName: String,
-        onDone: (Boolean) -> Unit = {},
+        onDone: (Boolean, String?) -> Unit = { _, _ -> },
     ) = scope.launch {
-        val ok = runCatching {
+        val result = runCatching {
             groupRuntime?.postComment(groupId, conversationId, body, authorName)
                 ?: error("Group runtime is not ready")
-        }.onFailure { log("group comment failed: ${it.message}") }.isSuccess
-        withContext(Dispatchers.Main.immediate) { onDone(ok) }
+        }.onFailure { log("group comment failed: ${it.message}") }
+        if (result.isSuccess) scope.launch {
+            runCatching { gossipEventInventory(groupId) }
+                .onFailure { log("comment gossip deferred: ${it.message}") }
+        }
+        withContext(Dispatchers.Main.immediate) { onDone(result.isSuccess, result.getOrNull()?.messageId) }
     }
 
     fun refreshGroupPost(
@@ -836,6 +989,11 @@ class SocialNetworkController(context: Context) {
         runCatching {
             groupRuntime?.setPinned(groupId, postId, pinned) ?: error("Group runtime is not ready")
         }.onFailure { log("group pin failed: ${it.message}") }
+    }
+
+    fun setGroupAutoShowNewSubmissions(groupId: String, enabled: Boolean) = scope.launch {
+        runCatching { groupRuntime?.setAutoShowNewSubmissions(groupId, enabled) ?: error("Group runtime unavailable") }
+            .onFailure { log("group auto-show update failed: ${it.message}") }
     }
 
     fun setGroupFeatured(groupId: String, slot: FeaturedSlot) = scope.launch {
@@ -886,6 +1044,17 @@ class SocialNetworkController(context: Context) {
             groupRuntime?.moderatePost(groupId, postId, conversationId, postHash, state, messageRef, reason)
                 ?: error("Group runtime is not ready")
         }.onFailure { log("group moderation action failed: ${it.message}") }
+    }
+
+    fun loadGroupRawComments(
+        groupId: String,
+        conversationId: String,
+        onDone: (List<GroupRawCommentUi>) -> Unit,
+    ) = scope.launch {
+        val items = runCatching {
+            groupRuntime?.rawComments(groupId, conversationId) ?: emptyList()
+        }.onFailure { log("raw group comments load failed: ${it.message}") }.getOrDefault(emptyList())
+        withContext(Dispatchers.Main.immediate) { onDone(items) }
     }
 
     fun loadGroupMessage(
@@ -957,6 +1126,14 @@ class SocialNetworkController(context: Context) {
                 result.exceptionOrNull()?.message ?: "Author banned on this moderation branch.",
             )
         }
+    }
+
+    fun loadGroupPublicPost(
+        groupId: String, conversationId: String, onLoaded: (GroupMessageView?) -> Unit,
+    ) = scope.launch {
+        val post = runCatching { groupRuntime?.publicPostFromEvent(groupId, conversationId) }
+            .onFailure { log("group public post fetch failed: ${it.message}") }.getOrNull()
+        withContext(Dispatchers.Main.immediate) { onLoaded(post) }
     }
 
     fun loadGroupCuratorPosts(
@@ -1476,41 +1653,32 @@ class SocialNetworkController(context: Context) {
         }.onFailure { log("media fetch failed: ${it.message}") }.getOrNull()
     }
 
+    /** Prepare a nearby swipe target without fetching all discovery results at once.
+     * The in-flight set prevents repeat requests from the gesture, the prefetched neighbor,
+     * and the normal profile-opening path.
+     */
+    fun prefetchProfileAvailable(mainDht: String) {
+        if (mainDht.isBlank() || profileDocuments.containsKey(mainDht)) return
+        val hint = cache.get(mainDht)?.hint ?: return
+        scope.launch { verifyProfile(mainDht, hint.profileRootDht, active = true) }
+    }
+
     fun ensureProfileAvailable(mainDht: String) = scope.launch {
         val hint = cache.get(mainDht)?.hint ?: return@launch
-
-        // Group discovery is independent of the decorated-profile blob cache. A profile may have
-        // been cached before its owner created/claimed a group, so always refresh subkey 2.
-        runCatching {
-            val entries = groupRuntime?.discoverUserGroups(mainDht, hint.profileRootDht).orEmpty()
-            log("group directory refresh ${short(mainDht)}: ${entries.size} advertised")
-        }.onFailure {
-            log("group directory refresh ${short(mainDht)} failed: ${it.message}")
-        }
-
-        if (!profileDocuments.containsKey(mainDht)) {
-            verifyProfile(mainDht, hint.profileRootDht)
-        }
+        if (!profileDocuments.containsKey(mainDht)) verifyProfile(mainDht, hint.profileRootDht, active = true)
+        else scope.launch { verifyProfile(mainDht, hint.profileRootDht, active = true) }
+        refreshDirectoryIfDue(mainDht, hint.profileRootDht, active = true)
         updateSnapshots()
     }
 
-    /** Refresh only the lightweight group directory for a known user. Safe even if their profile
-     * document is already cached and therefore does not need to be downloaded again. */
+    /** The caller can request a group refresh, but opening a saved profile needn't re-read
+     * its directory every time. The cache is displayed immediately by GroupStore. */
     fun refreshUserGroups(mainDht: String) = scope.launch {
-        val d = daemon ?: return@launch
-        val root = fullRecords[mainDht]?.profileRootDht
-            ?.takeIf { it.isNotBlank() }
+        val root = fullRecords[mainDht]?.profileRootDht?.takeIf { it.isNotBlank() }
             ?: cache.get(mainDht)?.hint?.profileRootDht?.takeIf { it.isNotBlank() }
-            ?: runCatching { d.getAppRoot(mainDht).stringOrNull("root_dht") }.getOrNull()
             ?: return@launch
-
-        runCatching {
-            val entries = groupRuntime?.discoverUserGroups(mainDht, root).orEmpty()
-            log("group directory refresh ${short(mainDht)}: ${entries.size} advertised")
-            updateSnapshots()
-        }.onFailure {
-            log("group directory refresh ${short(mainDht)} failed: ${it.message}")
-        }
+        refreshDirectoryIfDue(mainDht, root, active = true)
+        updateSnapshots()
     }
 
     private fun runLocalSearch(intent: DiscoveryIntent) {
@@ -1613,7 +1781,9 @@ class SocialNetworkController(context: Context) {
                 discoveryDescription = record.description,
                 featuresText = record.features.joinToString(", "),
             )
-            runCatching { fetchVerifiedDocument(record) }.onFailure { log("own profile blob read: ${it.message}") }
+            runCatching { fetchVerifiedDocument(record) }.onSuccess { text ->
+                if (_ui.value.mainDht == record.mainDht) profileDocuments[record.mainDht] = text
+            }.onFailure { log("own profile blob read: ${it.message}") }
             log("loaded existing profile-page record generation ${record.generation}")
         }.onFailure { log("own profile read: ${it.message}") }
     }
@@ -1722,6 +1892,24 @@ class SocialNetworkController(context: Context) {
             }
             return
         }
+        GroupEventInventoryGossipV2.fromBytes(payload)?.let { packet ->
+            gossipReceivedCount.incrementAndGet()
+            if (source.isBlank() || source == _ui.value.mainDht) return
+            // A gossip sender isn't authenticated as the author. Check the event signature,
+            // local group policy and DHT content before exposing it in the raw view.
+            packet.events.forEach { event ->
+                if (!gossipEventInFlight.add(event.eventId)) return@forEach
+                scope.launch {
+                    try {
+                        log("[groups-v2] GOSSIP_EVENT_RECEIVED event=${event.eventId.take(8)} group=${short(event.groupId)} from=${short(source)}")
+                        groupRuntime?.receiveGossipEventV2(event, source)
+                    } finally {
+                        gossipEventInFlight.remove(event.eventId)
+                    }
+                }
+            }
+            return
+        }
         GroupGossipPacket.fromBytes(payload)?.let { packet ->
             gossipReceivedCount.incrementAndGet()
             receiveGroupGossip(packet, source)
@@ -1735,7 +1923,14 @@ class SocialNetworkController(context: Context) {
             is GossipMessage.Summary -> {
                 message.clusters.forEach { cluster ->
                     val representative = cluster.exemplars.firstOrNull() ?: MinHash(IntArray(MINHASH_SIZE) { 0xffff })
-                    cluster.samples.forEach { sample -> cache.upsert(sample.approximateHint(nowSeconds(), representative), source, nowSeconds()) }
+                    cluster.samples.forEach { sample ->
+                        if (cache.upsert(sample.approximateHint(nowSeconds(), representative), source, nowSeconds())) scheduleDiscoverySave()
+                        noteGossipDiscoveryLead(
+                            sample.mainDht, sample.profileRootDht, sample.generation, sample.updatedAt,
+                            advertisesGroups = sample.advertisesGroups,
+                            publishedProfile = sample.publishedProfile,
+                        )
+                    }
                 }
                 val digest = MessageDigest.getInstance("SHA-256")
                     .digest(message.toJson().toString().encodeToByteArray())
@@ -1752,8 +1947,9 @@ class SocialNetworkController(context: Context) {
             }
             is GossipMessage.ProfileAnnounce -> {
                 message.profile.verification = VerificationState.GOSSIP_HINT
-                cache.upsert(message.profile, source, nowSeconds())
-                if (message.profile.profileRootDht.isNotBlank()) scope.launch { verifyProfile(message.profile.mainDht, message.profile.profileRootDht) }
+                if (cache.upsert(message.profile, source, nowSeconds())) scheduleDiscoverySave()
+                noteGossipDiscoveryLead(message.profile.mainDht, message.profile.profileRootDht,
+                    message.profile.generation, message.profile.updatedAt)
             }
             is GossipMessage.SimilarityQuery -> {
                 val current = nowSeconds()
@@ -1768,8 +1964,8 @@ class SocialNetworkController(context: Context) {
             is GossipMessage.SimilarityResponse -> {
                 message.samples.forEach { hint ->
                     hint.verification = VerificationState.GOSSIP_HINT
-                    cache.upsert(hint, source, nowSeconds())
-                    if (hint.profileRootDht.isNotBlank()) scope.launch { verifyProfile(hint.mainDht, hint.profileRootDht) }
+                    if (cache.upsert(hint, source, nowSeconds())) scheduleDiscoverySave()
+                    noteGossipDiscoveryLead(hint.mainDht, hint.profileRootDht, hint.generation, hint.updatedAt)
                 }
                 log("search response ${message.requestId} from ${short(source)}: ${message.samples.size} samples")
             }
@@ -1780,44 +1976,269 @@ class SocialNetworkController(context: Context) {
         updateSnapshots()
     }
 
-    private fun refreshPeers() {
-        val d = daemon ?: return
-        runCatching {
-            val page = d.listAppPeers()
-            val peers = page.optJSONArray("peers")
-            knownPeers.clear()
-            if (peers != null) for (i in 0 until peers.length()) {
-                val peer = peers.getJSONObject(i)
-                val main = peer.getString("main_dht")
-                if (main == _ui.value.mainDht) continue
-                knownPeers += main
-                var root = peer.stringOrNull("app_root_dht")
-                if (root == null) root = runCatching { d.getAppRoot(main).stringOrNull("root_dht") }.getOrNull()
-                if (root != null) verifyProfile(main, root)
-            }
-            d.setInteractiveActivity(knownPeers.toList())
-            log("app peers: cached=${page.optInt("total_cached")} returned=${knownPeers.size} search=${page.optString("search_state")}")
-        }.onFailure { log("peer refresh failed: ${it.message}") }
+    private fun refreshPeers(force: Boolean = false, warmup: Boolean = false) {
+        if (!peerRefreshInFlight.compareAndSet(false, true)) return
+        val d = daemon
+        if (d == null) { peerRefreshInFlight.set(false); return }
+        val sessionOwner = _ui.value.mainDht
+        try {
+            runCatching {
+                // The daemon returns its app-peer cache immediately AND starts/refuels a
+                // focused walk. Repeating this at 15s intervals during warmup used to be
+                // the difference between finding a dozen and finding dozens of accounts.
+                val page = d.listAppPeers()
+                if (_ui.value.mainDht != sessionOwner || daemon !== d || !vault.attached) return@runCatching
+                val peers = page.optJSONArray("peers")
+                if (peers != null && peers.length() > 0) lastPeerSeenMs = System.currentTimeMillis()
+
+                // First inventory every peer. Do NOT perform synchronous getAppRoot RPCs
+                // in this loop: the old four serial requests could stall the whole pass.
+                val needsFirstRecord = ArrayList<Pair<String, String>>()
+                val needsMissingDocument = ArrayList<Pair<String, String>>()
+                val needsRecheck = ArrayList<Pair<String, String>>()
+                val needsRoot = ArrayList<String>()
+                if (peers != null) for (i in 0 until peers.length()) {
+                    if (_ui.value.mainDht != sessionOwner || daemon !== d || !vault.attached) return@runCatching
+                    val peer = peers.optJSONObject(i) ?: continue
+                    val main = peer.optString("main_dht")
+                    if (main.isBlank() || main == sessionOwner) continue
+                    knownPeers += main
+                    val root = peer.stringOrNull("app_root_dht")?.takeIf { it.isNotBlank() }
+                        ?: fullRecords[main]?.profileRootDht?.takeIf { it.isNotBlank() }
+
+                    if (root == null) {
+                        needsRoot += main
+                    } else if (!profileFetchInFlight.contains(main) && profileDue(main, root, force = force)) {
+                        when {
+                            !fullRecords.containsKey(main) -> needsFirstRecord += main to root
+                            !profileDocuments.containsKey(main) -> needsMissingDocument += main to root
+                            else -> needsRecheck += main to root
+                        }
+                    }
+                }
+                val batch = if (force || warmup) PEER_WARMUP_PROFILE_BATCH else PEER_BACKGROUND_PROFILE_BATCH
+                // Dispatch high-priority gossip first. Four verifier slots should not be
+                // monopolized by a backlog of 24 routine refreshes.
+                val prioritized = pumpGossipDiscovery()
+                val selected = (needsFirstRecord + needsMissingDocument + needsRecheck)
+                    .take(minOf(batch, maxOf(2, 8 - prioritized)))
+                selected.forEach { (main, root) ->
+                    scope.launch { verifyProfile(main, root, force = force) }
+                }
+                // Root lookup RPCs are separate, strictly bounded workers. The first
+                // successful lookup schedules verification without waiting for another poll.
+                var rootsQueued = 0
+                val rootBudget = if (warmup || force) 12 else 6
+                for (main in needsRoot) {
+                    if (rootsQueued >= rootBudget) break
+                    if (queueRootLookup(main, sessionOwner, d)) rootsQueued++
+                }
+                if (_ui.value.mainDht != sessionOwner || daemon !== d) return@runCatching
+                d.setInteractiveActivity(knownPeers.toList())
+                log("app peers: cached=${page.optInt("total_cached")} returned=${knownPeers.size} " +
+                    "profiles_scheduled=${selected.size} roots_queued=$rootsQueued " +
+                    "verified_layouts=${profileDocuments.size} warmup=$warmup " +
+                    "search=${page.optString("search_state")}")
+            }.onFailure { log("peer refresh failed: ${it.message}") }
+        } finally {
+            peerRefreshInFlight.set(false)
+        }
     }
 
-    private fun verifyProfile(expectedMainDht: String, root: String) {
-        val d = daemon ?: return
-        runCatching {
-            val result = d.readPublicStore(root, listOf(PROFILE_SUBKEY), true)
-            val record = decodeRecordValue(result.optJSONArray("values")?.optJSONObject(0)) ?: return@runCatching
-            if (record.mainDht != expectedMainDht || record.profileRootDht != root) {
-                log("profile rejected: app-root/profile binding mismatch for ${short(expectedMainDht)}")
-                return@runCatching
+    private fun queueRootLookup(main: String, owner: String, d: DaemonClient): Boolean {
+        if (System.currentTimeMillis() < (rootRetryAfter[main] ?: 0L)) return false
+        if (!rootLookupSlots.tryAcquire()) return false
+        if (!rootLookupInFlight.add(main)) {
+            rootLookupSlots.release()
+            return false
+        }
+        scope.launch {
+            var root: String? = null
+            try {
+                if (_ui.value.mainDht == owner && daemon === d && vault.attached) {
+                    root = runCatching { d.getAppRoot(main).stringOrNull("root_dht") }
+                        .getOrElse { error ->
+                            log("app root lookup ${short(main)} deferred: ${error.message}")
+                            null
+                        }?.takeIf { it.isNotBlank() }
+                    if (_ui.value.mainDht == owner && daemon === d && vault.attached) {
+                        if (root == null) rootRetryAfter[main] = System.currentTimeMillis() + ROOT_LOOKUP_RETRY_MS
+                        else rootRetryAfter.remove(main)
+                    } else {
+                        root = null
+                    }
+                }
+            } finally {
+                rootLookupInFlight.remove(main)
+                rootLookupSlots.release()
             }
-            require(record.profileBytes in 1..PROFILE_MAX_BYTES.toLong()) { "profile blob size outside prototype limit" }
-            fetchVerifiedDocument(record)
-            fullRecords[record.mainDht] = record
-            cache.upsert(record.toHint(nowSeconds(), VerificationState.DHT_VERIFIED), "dht", nowSeconds())
-            groupRuntime?.discoverUserGroups(record.mainDht, record.profileRootDht)
-        }.onFailure { log("verify ${short(expectedMainDht)}: ${it.message}") }
+            // Never hand a result from an old account/session to a new one.
+            if (root != null && _ui.value.mainDht == owner && daemon === d && vault.attached) {
+                verifyProfile(main, root!!)
+            }
+        }
+        return true
     }
 
-    private fun fetchVerifiedDocument(record: ProfilePageRecord) {
+    private fun profileDue(main: String, root: String, active: Boolean = false, force: Boolean = false): Boolean {
+        val now = System.currentTimeMillis()
+        if (now < (profileRetryAfter[main] ?: 0L) && !force) return false
+        val existing = fullRecords[main]
+        val hinted = cache.get(main)?.hint
+        // Cached metadata without a cached layout is not a fully available profile.
+        // Don't let an hours-long record TTL prevent its first document download.
+        val changed = existing == null || !profileDocuments.containsKey(main) || existing.profileRootDht != root ||
+            (hinted != null && (hinted.generation > existing.generation || hinted.updatedAt > existing.updatedAt))
+        if (changed) return true
+        val interval = if (active) PROFILE_ACTIVE_RECHECK_MS else PROFILE_BACKGROUND_RECHECK_MS
+        return force || now - (profileCheckedAt[main] ?: 0L) >= interval
+    }
+
+    private fun verifyProfile(expectedMainDht: String, root: String, active: Boolean = false, force: Boolean = false) {
+        if (root.isBlank() || !profileDue(expectedMainDht, root, active, force)) return
+        if (!profileFetchInFlight.add(expectedMainDht)) return
+        val d = daemon ?: run { profileFetchInFlight.remove(expectedMainDht); return }
+        val owner = _ui.value.mainDht
+        var acquired = false
+        try {
+            profileVerifySlots.acquire()
+            acquired = true
+            if (_ui.value.mainDht != owner || daemon !== d || !vault.attached) return
+            runCatching {
+                val result = d.readPublicStore(root, listOf(PROFILE_SUBKEY), true)
+                val record = decodeRecordValue(result.optJSONArray("values")?.optJSONObject(0))
+                    ?: error("profile record not published or unavailable")
+                require(record.mainDht == expectedMainDht && record.profileRootDht == root) {
+                    "app-root/profile binding mismatch"
+                }
+                require(record.profileBytes in 1..PROFILE_MAX_BYTES.toLong()) { "profile blob size outside limit" }
+                val previous = fullRecords[expectedMainDht]
+                // The verified digest lets us skip the much larger media-free VSPF download.
+                val identical = previous?.profileSha256Hex.equals(record.profileSha256Hex, ignoreCase = true) &&
+                    previous?.profileBytes == record.profileBytes &&
+                    profileDocuments.containsKey(expectedMainDht)
+                val downloadedDocument = if (!identical) fetchVerifiedDocument(record) else null
+                if (_ui.value.mainDht != owner || daemon !== d || !vault.attached) return@runCatching
+                if (downloadedDocument != null) profileDocuments[record.mainDht] = downloadedDocument
+                fullRecords[record.mainDht] = record
+                val changed = cache.upsert(record.toHint(nowSeconds(), VerificationState.DHT_VERIFIED), "dht", nowSeconds())
+                profileCheckedAt[expectedMainDht] = System.currentTimeMillis()
+                profileRetryAfter.remove(expectedMainDht)
+                gossipDiscoveryLeads.forget(expectedMainDht)
+                if (changed || !identical) scheduleDiscoverySave()
+                // Directory lookups can take many seconds. Never hold a profile
+                // verification slot while fetching a separate group's directory.
+                scope.launch {
+                    if (_ui.value.mainDht == owner && daemon === d && vault.attached) {
+                        refreshDirectoryIfDue(record.mainDht, record.profileRootDht, force = !identical)
+                    }
+                }
+            }.onFailure { err ->
+                profileRetryAfter[expectedMainDht] = System.currentTimeMillis() + FAILED_RECHECK_MS
+                log("verify ${short(expectedMainDht)}: ${err.message}")
+            }
+        } catch (interrupted: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } finally {
+            // Only release an acquired permit; acquire may have thrown on interruption.
+            // 'availablePermits' isn't used because other workers can be running concurrently.
+            if (acquired) profileVerifySlots.release()
+            profileFetchInFlight.remove(expectedMainDht)
+        }
+    }
+
+    private suspend fun refreshDirectoryIfDue(main: String, root: String, active: Boolean = false, force: Boolean = false) {
+        if (root.isBlank()) return
+        val now = System.currentTimeMillis()
+        val interval = if (active) GROUP_DIRECTORY_ACTIVE_RECHECK_MS else GROUP_DIRECTORY_BACKGROUND_RECHECK_MS
+        if (!force && now - (directoryCheckedAt[main] ?: 0L) < interval) return
+        if (!directoryInFlight.add(main)) return
+        val owner = _ui.value.mainDht
+        val runtime = groupRuntime
+        try {
+            // Suspend instead of occupying dozens of IO threads while profile discovery
+            // runs. Only two background group-directory DHT reads happen at a time.
+            directoryLookupSlots.withPermit {
+                if (_ui.value.mainDht != owner || !vault.attached || groupRuntime !== runtime || runtime == null) return@withPermit
+                if (!force && System.currentTimeMillis() - (directoryCheckedAt[main] ?: 0L) < interval) return@withPermit
+                val entries = runtime.discoverUserGroups(main, root)
+                if (_ui.value.mainDht != owner || groupRuntime !== runtime) return@withPermit
+                directoryCheckedAt[main] = System.currentTimeMillis()
+                // Authenticated directory entries are particularly valuable discovery
+                // leads for group creators/claimers we have not opened yet.
+                entries.take(32).forEach { entry ->
+                    noteGossipDiscoveryLead(entry.advertiserMainDht, groupAuthority = true)
+                    noteGossipDiscoveryLead(entry.creatorMainDht, groupAuthority = true)
+                }
+                scheduleDiscoverySave()
+                log("group directory checked ${short(main)}: ${entries.size} advertised")
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (_ui.value.mainDht == owner && groupRuntime === runtime) {
+                directoryCheckedAt[main] = System.currentTimeMillis() - interval + FAILED_RECHECK_MS
+                log("group directory refresh ${short(main)} failed; keeping cached data: ${e.message}")
+            }
+        } finally {
+            directoryInFlight.remove(main)
+        }
+    }
+
+    private fun restoreDiscovery(owner: String) {
+        discoveryOwner = owner
+        if (!vault.attached) return
+        runCatching {
+            val restored = savedDiscovery.read(owner) ?: return@runCatching
+            restored.entries.asReversed().forEach { entry ->
+                cache.upsert(entry.hint, null, nowSeconds())
+                entry.record?.let { fullRecords[entry.hint.mainDht] = it }
+                entry.document?.let { profileDocuments[entry.hint.mainDht] = it }
+            }
+            // Prior gossip-only leads can be picked up again without leaking any state
+            // across accounts. They must still pass authoritative app-root verification.
+            restored.entries.filter { it.record == null && it.hint.profileRootDht.isNotBlank() }
+                .take(64).forEach { entry ->
+                    noteGossipDiscoveryLead(entry.hint.mainDht, entry.hint.profileRootDht,
+                        entry.hint.generation, entry.hint.updatedAt)
+                }
+            profileCheckedAt.putAll(restored.verifiedAt)
+            directoryCheckedAt.putAll(restored.directoriesAt)
+            log("discovery-cache restored hints=${restored.entries.size} documents=${restored.entries.count { it.document != null }} encrypted=true")
+        }.onFailure { log("discovery-cache restore failed (ignored): ${it.message}") }
+    }
+
+    private fun scheduleDiscoverySave() {
+        if (!vault.attached || discoveryOwner.isBlank()) return
+        discoverySnapshotDirty = true
+        synchronized(discoverySaveLock) {
+            if (discoverySaveJob?.isActive == true) return
+            val owner = discoveryOwner
+            val generation = vault.generation()
+            discoverySaveJob = scope.launch {
+                delay(DISCOVERY_SAVE_DELAY_MS)
+                if (!discoverySnapshotDirty || _ui.value.mainDht != owner) return@launch
+                val entries = cache.recent().map { it.hint } + cache.all().map { it.hint }
+                val unique = entries.distinctBy { it.mainDht }.take(280).map { hint ->
+                    val verifiedRecord = fullRecords[hint.mainDht]
+                    val storedHint = verifiedRecord?.toHint(nowSeconds(), VerificationState.DHT_VERIFIED) ?: hint
+                    EncryptedDiscoverySnapshot.Entry(storedHint, verifiedRecord, profileDocuments[hint.mainDht])
+                }
+                runCatching {
+                    vault.withGeneration(generation) {
+                        savedDiscovery.write(owner, unique, profileCheckedAt, directoryCheckedAt)
+                    }
+                }.onSuccess { result ->
+                    if (result != null) {
+                        discoverySnapshotDirty = false
+                        log("discovery-cache saved hints=${result.first} documents=${result.second} encrypted=true")
+                    }
+                }.onFailure { log("discovery-cache save deferred: ${it.message}") }
+            }
+        }
+    }
+
+    private fun fetchVerifiedDocument(record: ProfilePageRecord): String {
         val d = daemon ?: error("Daemon is not connected")
         val (meta, bytes) = d.downloadBlob(record.profileBlobRoot, PROFILE_MAX_BYTES)
         require(bytes.size.toLong() == record.profileBytes) { "profile blob size mismatch" }
@@ -1830,7 +2251,7 @@ class SocialNetworkController(context: Context) {
         val decoded = ProfileCodec.decodeText(text)
         val validation = ProfileCodec.validate(decoded)
         require(validation.ok) { "invalid VSPF profile: ${validation.message}" }
-        profileDocuments[record.mainDht] = text
+        return text
     }
 
     private fun gossipGroups() {
@@ -1843,20 +2264,158 @@ class SocialNetworkController(context: Context) {
                 !_ui.value.published && hint.pointer.ownerMainDht == ownMainDht
             }
         if (hints.isEmpty() || knownPeers.isEmpty()) return
-        val packet = GroupGossipPacket(System.currentTimeMillis(), hints)
+        // No need to resend an unchanged branch inventory to six peers every eight seconds.
+        // Newly changed headers/pulses still announce on the next scheduled pass or right
+        // after creation. Periodic refresh remains for late-joining nodes.
+        val now = System.currentTimeMillis()
+        val digest = sha256Hex(GroupGossipPacket(0L, hints).toBytes()).take(16)
+        if (digest == lastGroupGossipDigest && now - lastGroupGossipBroadcastAtMs < 30_000L) return
+        val packet = GroupGossipPacket(now, hints)
         val bytes = packet.toBytes()
         if (bytes.size > 8 * 1024) {
             log("group gossip skipped: ${bytes.size} bytes exceeds gossip limit")
             return
         }
         val sent = sendGossipToSample(bytes, 6)
-        val now = System.currentTimeMillis()
-        // Gossip runs every few seconds, but the persisted diagnostic log should remain readable.
+        if (sent > 0) {
+            lastGroupGossipDigest = digest
+            lastGroupGossipBroadcastAtMs = now
+        }
+        // The persisted diagnostic log should remain readable.
         // Record a heartbeat at most once per minute; actual verified changes are logged immediately.
         if (sent > 0 && now - lastGroupGossipSendLogMs >= 60_000L) {
             lastGroupGossipSendLogMs = now
             log("group gossip heartbeat: ${hints.size} branch hint(s) sent to $sent peer(s)")
         }
+    }
+
+    /**
+     * Rolling public-event anti-entropy. Immediate announces use the latest group events;
+     * the 90-second pass rotates through the seven-day event store for late joiners.
+     * Sending references only is not a durable remote custody receipt.
+     */
+    private fun gossipEventInventory(groupId: String? = null) {
+        val d = daemon ?: return
+        if (d.requiresNewSession() || knownPeers.isEmpty()) return
+        val now = System.currentTimeMillis()
+        val eligible = groupEventsV2.allEvents().asSequence()
+            .filter { it.validation == GroupEventValidationV2.Valid }
+            .filter { it.event.expiresAt > now }
+            .filter { groupId == null || it.event.groupId == groupId }
+            .filter { groups.byId(it.event.groupId)?.policy?.visibility == GroupVisibility.Public }
+            .sortedByDescending { it.event.createdAt }
+            .toList()
+        if (eligible.isEmpty()) return
+        val events = (if (groupId != null) {
+            eligible.take(GroupEventInventoryGossipV2.MAX_EVENTS)
+        } else {
+            val start = eventInventoryCursor % eligible.size
+            eventInventoryCursor = (start + GroupEventInventoryGossipV2.MAX_EVENTS) % eligible.size
+            List(minOf(eligible.size, GroupEventInventoryGossipV2.MAX_EVENTS)) {
+                eligible[(start + it) % eligible.size]
+            }
+        }).map { it.event }
+        // A single oversize event must not make the whole inventory fail.
+        val fitted = mutableListOf<SignedGroupEventV2>()
+        events.forEach { event ->
+            val trial = GroupEventInventoryGossipV2(now, fitted + event).toBytes()
+            if (trial.size <= GroupEventInventoryGossipV2.MAX_BYTES) fitted += event
+        }
+        if (fitted.isEmpty()) return
+        val bytes = GroupEventInventoryGossipV2(now, fitted).toBytes()
+        val sent = sendGossipToSample(bytes, 3)
+        if (sent > 0) {
+            log("[groups-v2] GOSSIP_EVENT_ANNOUNCED events=${fitted.joinToString(",") { it.eventId.take(8) }} peers=$sent bytes=${bytes.size} periodic=${groupId == null}")
+        }
+    }
+
+    /**
+     * Select an interesting profile to verify, without promoting its advertised root,
+     * name, generation or publication status to trusted data. The root itself always
+     * comes from get_app_root (account DHT directory), or a previously verified record.
+     */
+    private fun noteGossipDiscoveryLead(
+        main: String,
+        advertisedRoot: String = "",
+        generation: Long = 0L,
+        updatedAt: Long = 0L,
+        groupAuthority: Boolean = false,
+        advertisesGroups: Boolean = false,
+        publishedProfile: Boolean = false,
+    ) {
+        if (!vault.attached || main == _ui.value.mainDht || main.isBlank()) return
+        val record = fullRecords[main]
+        val hasDocument = profileDocuments.containsKey(main)
+        val newer = record != null && (generation > record.generation || updatedAt > record.updatedAt)
+        // A repeated false "new generation" claim must not trigger an expensive
+        // force-refresh every gossip cycle when the DHT hasn't actually changed.
+        if (newer && System.currentTimeMillis() - (profileCheckedAt[main] ?: 0L) < 60_000L) return
+        val kind = when {
+            groupAuthority -> GossipLeadKind.GROUP_AUTHORITY
+            record == null && (advertisedRoot.isNotBlank() || publishedProfile || advertisesGroups) -> GossipLeadKind.UNREAD_PROFILE
+            record == null -> return
+            !hasDocument -> GossipLeadKind.MISSING_DOCUMENT
+            newer -> GossipLeadKind.NEWER_PROFILE
+            advertisesGroups -> GossipLeadKind.GROUP_DIRECTORY
+            else -> return
+        }
+        gossipDiscoveryLeads.offer(main, advertisedRoot, kind, generation, updatedAt, System.currentTimeMillis())
+    }
+
+    /** Run on the normal worker loop: 6 leads per tick, at most 3 app-root RPCs in flight. */
+    private fun pumpGossipDiscovery(): Int {
+        val d = daemon ?: return 0
+        val owner = _ui.value.mainDht
+        if (!_ui.value.connected || owner.isBlank() || !vault.attached || d.requiresNewSession()) return 0
+        val now = System.currentTimeMillis()
+        var dispatched = 0
+        gossipDiscoveryLeads.takeDue(now, GOSSIP_LEADS_PER_TICK).forEach { lead ->
+            if (_ui.value.mainDht != owner || daemon !== d || !vault.attached) return@forEach
+            val main = lead.mainDht
+            val record = fullRecords[main]
+            if (record != null) {
+                val missing = !profileDocuments.containsKey(main)
+                val newer = lead.generation > record.generation || lead.updatedAt > record.updatedAt
+                if (missing || newer) {
+                    // A profile may have moved to a new app root. Gossip cannot assert that
+                    // binding: re-resolve it through the owner's daemon DHT directory.
+                    if (lead.advertisedRoot.isNotBlank() && lead.advertisedRoot != record.profileRootDht) {
+                        if (queueRootLookup(main, owner, d)) dispatched++
+                        else gossipDiscoveryLeads.defer(main, now + 5_000L)
+                        return@forEach
+                    }
+                    if (profileFetchInFlight.contains(main) ||
+                        now < (profileRetryAfter[main] ?: 0L)) {
+                        gossipDiscoveryLeads.defer(main, now + 5_000L)
+                    } else {
+                        // Previously DHT-verified root: refresh it, never use an untrusted
+                        // gossip root. Force only if new generation actually needs checking.
+                        dispatched++
+                        scope.launch { verifyProfile(main, record.profileRootDht, force = newer) }
+                    }
+                } else {
+                    if (lead.kind == GossipLeadKind.GROUP_AUTHORITY ||
+                        lead.kind == GossipLeadKind.GROUP_DIRECTORY) {
+                        scope.launch {
+                            if (_ui.value.mainDht == owner && daemon === d && vault.attached)
+                                refreshDirectoryIfDue(main, record.profileRootDht, active = true)
+                        }
+                    }
+                    gossipDiscoveryLeads.forget(main)
+                }
+            } else if (queueRootLookup(main, owner, d)) {
+                // The authoritative get_app_root result will schedule verifyProfile.
+                dispatched++
+            } else {
+                // No free RPC slot is not an error and must not create a 90s delay.
+                gossipDiscoveryLeads.defer(main, now + 5_000L)
+            }
+        }
+        if (dispatched > 0 && now - lastGossipLeadLogMs.get() >= GOSSIP_LEADS_LOG_INTERVAL_MS &&
+            lastGossipLeadLogMs.compareAndSet(lastGossipLeadLogMs.get(), now)) {
+            log("gossip discovery: dispatched=$dispatched pending=${gossipDiscoveryLeads.size()} verified_layouts=${profileDocuments.size}")
+        }
+        return dispatched
     }
 
     private fun receiveGroupGossip(packet: GroupGossipPacket, source: String) {
@@ -1899,6 +2458,11 @@ class SocialNetworkController(context: Context) {
                 try {
                     val loaded = runCatching { groupRuntime?.refreshBranch(pointer) }.getOrNull()
                     if (loaded != null) {
+                        // Confirmed group headers provide useful leads to their owners and
+                        // creators, even when we have never opened either person's profile.
+                        noteGossipDiscoveryLead(pointer.ownerMainDht, groupAuthority = true)
+                        if (loaded.first.ownerId != pointer.ownerMainDht)
+                            noteGossipDiscoveryLead(loaded.first.ownerId, groupAuthority = true)
                         if (stamp > 0L) groupHintStamp[key] = stamp
                         groupTrustV2.ensureWatch(pointer.groupId, pointer.branchId)
                         val generation = loaded.second?.generation ?: -1L
@@ -1924,7 +2488,20 @@ class SocialNetworkController(context: Context) {
     }
 
     private fun gossipSummary() {
-        val clusters = cache.clusters(10, cache.generation() xor (nowSeconds() / 60)).map { it.copy(exemplars = it.exemplars.take(1), samples = it.samples.take(1)) }
+        val clusters = cache.clusters(10, cache.generation() xor (nowSeconds() / 60)).map { cluster ->
+            cluster.copy(exemplars = cluster.exemplars.take(1), samples = cluster.samples.take(1).map { sample ->
+                // Published/group flags are only hints to the receiver. Do not mark a
+                // gossip-learned, unverified profile as published.
+                sample.copy(
+                    publishedProfile = fullRecords.containsKey(sample.mainDht),
+                    advertisesGroups = groups.directoryFor(sample.mainDht)
+                        .any { it.visibility == GroupVisibility.Public } ||
+                        (sample.mainDht == _ui.value.mainDht &&
+                            groups.directoryEntriesForSelf(sample.mainDht)
+                                .any { it.visibility == GroupVisibility.Public }),
+                )
+            })
+        }
         val message = GossipMessage.Summary(cache.generation(), nowSeconds(), clusters).toJson().toString().encodeToByteArray()
         if (message.size > 8 * 1024) { log("summary skipped: ${message.size} bytes exceeds gossip limit"); return }
         sendGossipToSample(message, 6)
@@ -1937,13 +2514,34 @@ class SocialNetworkController(context: Context) {
 
     private fun sendGossipToSample(bytes: ByteArray, limit: Int): Int {
         val d = daemon ?: return 0
+        if (d.requiresNewSession()) return 0
         var sent = 0
         deterministicPeerSample(knownPeers.toList(), nowSeconds(), limit).forEach { peer ->
             runCatching { d.sendGossip(peer, bytes) }
                 .onSuccess { gossipSentCount.incrementAndGet(); sent++ }
-                .onFailure { log("gossip to ${short(peer)} failed: ${it.message}") }
+                .onFailure { recordGossipFailure(it) }
         }
         return sent
+    }
+
+    private fun recordGossipFailure(error: Throwable) {
+        val detail = error.message.orEmpty()
+        val reason = when {
+            detail.contains("No route blob published", ignoreCase = true) -> "missing_route"
+            detail.contains("offline", ignoreCase = true) -> "offline"
+            detail.contains("timeout", ignoreCase = true) -> "timeout"
+            detail.contains("authentication_failed", ignoreCase = true) -> "local_session"
+            else -> "other"
+        }
+        gossipFailureTallies.computeIfAbsent(reason) { AtomicLong(0L) }.incrementAndGet()
+        val now = System.currentTimeMillis()
+        val last = lastGossipFailureSummaryAt.get()
+        if (now - last >= 60_000L && lastGossipFailureSummaryAt.compareAndSet(last, now)) {
+            val totals = gossipFailureTallies.entries.sortedBy { it.key }
+                .mapNotNull { (kind, count) -> count.getAndSet(0L).takeIf { it > 0L }?.let { "$kind=$it" } }
+                .joinToString(" ")
+            if (totals.isNotEmpty()) log("gossip send failures (aggregated, no payloads): $totals")
+        }
     }
 
     private fun updateSnapshots() {
@@ -1960,7 +2558,6 @@ class SocialNetworkController(context: Context) {
                     .append(" rotating_samples=").append(cluster.samples.size).append('\n')
             }
         }
-        if (knownPeers.isNotEmpty()) lastPeerSeenMs = System.currentTimeMillis()
         _ui.value = _ui.value.copy(recent = recent, peers = knownPeers.size, verified = verified, gossipSent = gossipSentCount.get(), gossipReceived = gossipReceivedCount.get(), clusterText = clusterText)
     }
 
@@ -2533,11 +3130,22 @@ class SocialNetworkController(context: Context) {
             groupTrustV2.diagnosticLines().forEach { appendLine(it) }
             groupRuntime?.abuseDiagnosticLinesV2()?.forEach { appendLine(it) }
             appendLine()
+            appendLine("--- recent messaging milestones (latest 100) ---")
+            // Put high-signal group/custody lines ahead of the large network log;
+            // Android's Copy Log limit can truncate older raw diagnostics.
+            val persisted = readPersistentLogTail(DIAGNOSTIC_LOG_KEEP_BYTES)
+            val important = persisted.lineSequence().filter { line ->
+                line.contains("[groups-v2]") && listOf(
+                    "EVENT_CREATE_", "EVENT_STORE_INSERT", "EVENT_PROCESS_",
+                    "TRANSPORT_", "WITNESS_", "CUSTODY_", "RECOVERY_", "GOSSIP_EVENT_",
+                ).any(line::contains) && !line.contains("RECOVERY_BEGIN groups=0 peers=0")
+            }.toList().takeLast(100)
+            if (important.isEmpty()) appendLine("(none)") else important.forEach { appendLine(it) }
+            appendLine()
             appendLine("--- lifecycle / daemon RPC breadcrumbs ---")
             val breadcrumbs = WeaveDiagnostics.tail(appContext)
             appendLine(if (breadcrumbs.isNotBlank()) breadcrumbs else "(none)")
             appendLine("--- network/group log ---")
-            val persisted = readPersistentLogTail(DIAGNOSTIC_LOG_KEEP_BYTES)
             append(if (persisted.isNotBlank()) persisted else state.debugLog)
         }
     }

@@ -1,13 +1,11 @@
 package app.weave
 
 import android.net.Uri
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.*
 import androidx.compose.ui.text.style.TextDecoration
 
@@ -143,39 +141,30 @@ fun AutoLinkText(
     onLink: (DetectedLink) -> Unit,
 ) {
     val linkColor = MaterialTheme.colorScheme.primary
-    val annotated = remember(text, linkColor) {
+    val annotated = remember(text, linkColor, onLink) {
         buildAnnotatedString {
             append(text)
-            detectLinks(text).forEachIndexed { index, range ->
+            detectLinks(text).forEach { range ->
                 val raw = text.substring(range)
                 addStyle(
                     SpanStyle(color = linkColor, textDecoration = TextDecoration.Underline),
                     range.first,
                     range.last + 1,
                 )
-                addStringAnnotation(
-                    tag = "weave_link",
-                    annotation = raw,
-                    start = range.first,
-                    end = range.last + 1,
+                addLink(
+                    LinkAnnotation.Clickable(
+                        tag = raw,
+                        linkInteractionListener = { onLink(parseDetectedLink(raw)) },
+                    ),
+                    range.first,
+                    range.last + 1,
                 )
             }
         }
     }
-    var layout by remember(text) { mutableStateOf<TextLayoutResult?>(null) }
-    Text(
-        text = annotated,
-        style = style,
-        modifier = modifier.pointerInput(annotated) {
-            detectTapGestures { position: Offset ->
-                val result = layout ?: return@detectTapGestures
-                val offset = result.getOffsetForPosition(position)
-                val annotation = annotated.getStringAnnotations("weave_link", offset, offset)
-                    .firstOrNull()
-                    ?: return@detectTapGestures
-                onLink(parseDetectedLink(annotation.item))
-            }
-        },
-        onTextLayout = { layout = it },
-    )
+    // SelectionContainer owns long-press/drag gestures; Compose link annotations handle
+    // taps on links without a competing detectTapGestures pointer handler.
+    SelectionContainer {
+        Text(text = annotated, style = style, modifier = modifier)
+    }
 }

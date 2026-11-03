@@ -174,10 +174,14 @@ data class ProfileSampleRef(
     val generation: Long,
     val updatedAt: Long,
     val name: String,
+    // Optional, untrusted priority hints; older clients safely ignore these fields.
+    val publishedProfile: Boolean = false,
+    val advertisesGroups: Boolean = false,
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("main_dht", mainDht).put("profile_root_dht", profileRootDht)
         .put("generation", generation).put("updated_at", updatedAt).put("name", name)
+        .put("published_profile", publishedProfile).put("advertises_groups", advertisesGroups)
 
     fun approximateHint(observedAt: Long, clusterSignature: MinHash) = ProfileHint(
         mainDht, profileRootDht, generation, updatedAt, observedAt, name, "", emptyList(),
@@ -188,7 +192,8 @@ data class ProfileSampleRef(
         fun fromHint(hint: ProfileHint) = ProfileSampleRef(hint.mainDht, hint.profileRootDht, hint.generation, hint.updatedAt, hint.name)
         fun fromJson(obj: JSONObject) = ProfileSampleRef(
             obj.getString("main_dht"), obj.getString("profile_root_dht"), obj.optLong("generation"),
-            obj.optLong("updated_at"), obj.optString("name")
+            obj.optLong("updated_at"), obj.optString("name"),
+            obj.optBoolean("published_profile"), obj.optBoolean("advertises_groups")
         )
     }
 }
@@ -326,7 +331,11 @@ class KnowledgeCache {
         } else {
             current.lastSeenAt = now
             if (source != null) current.sourceCount = minOf(255, current.sourceCount + 1)
-            if (hint.generation > current.hint.generation || rank(hint.verification) > rank(current.hint.verification) || hint.updatedAt > current.hint.updatedAt) {
+            val incomingRank = rank(hint.verification)
+            val currentRank = rank(current.hint.verification)
+            if (incomingRank >= currentRank &&
+                (incomingRank > currentRank || hint.generation > current.hint.generation ||
+                    (hint.generation == current.hint.generation && hint.updatedAt > current.hint.updatedAt))) {
                 current.hint = hint
                 changed = true
             }

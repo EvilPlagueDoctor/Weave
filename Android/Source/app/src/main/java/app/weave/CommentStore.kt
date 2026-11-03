@@ -134,6 +134,8 @@ interface CommentStore {
     fun pointerFor(id: String): Pair<String, Int>?
 
     fun byId(id: String): Comment?
+    /** Account-local diagnostic snapshot. Implementations may opt out. */
+    fun monitorSnapshot(limit: Int = 250): List<Comment> = emptyList()
 
     /** Comments on this page the local user chose to hide. Hidden for them, not for anyone else. */
     fun hiddenForPage(pageKey: String): List<Comment>
@@ -341,6 +343,11 @@ class LocalCommentStore(context: Context) : CommentStore, PrivateVault.Participa
 
     @Synchronized
     override fun byId(id: String): Comment? = items.firstOrNull { it.id == id }
+
+    @Synchronized
+    override fun monitorSnapshot(limit: Int): List<Comment> =
+        items.takeLast(limit.coerceIn(1, 500)).toList()
+
 
     @Synchronized
     override fun hiddenForPage(pageKey: String): List<Comment> {

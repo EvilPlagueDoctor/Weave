@@ -41,10 +41,11 @@ sealed interface Destination {
     /** Existing profile-comment moderation/history, reached from Settings instead of a permanent tab. */
     data object Activity : Destination
 
-    data class Profile(val mainDht: String) : Destination
+    data class Profile(val mainDht: String, val swipeQueue: List<String> = emptyList()) : Destination
     data class QuickEdit(val pageIndex: Int) : Destination
     data object Editor : Destination
     data object Settings : Destination
+    data object EventMonitor : Destination
     /** Hidden full VeilKnit diagnostics/management surface. */
     data object VeilKnit : Destination
     /** Normal Settings shortcut directly to VeilKnit's encrypted account-backup page. */
@@ -64,10 +65,11 @@ private fun Destination.encode(): String = when (this) {
     Destination.Activity -> "activity"
     Destination.Editor -> "editor"
     Destination.Settings -> "settings"
+    Destination.EventMonitor -> "event-monitor"
     Destination.VeilKnit -> "veilknit"
     Destination.VeilKnitBackup -> "veilknit-backup"
     Destination.GroupModeration -> "group-moderation"
-    is Destination.Profile -> "profile\u0000$mainDht"
+    is Destination.Profile -> "profile\u0000$mainDht\u0000${swipeQueue.joinToString("\u0001")}"
     is Destination.QuickEdit -> "quickedit\u0000$pageIndex"
     is Destination.Group -> "group\u0000$groupId"
     is Destination.GroupPost -> "grouppost\u0000$groupId\u0000$conversationId"
@@ -82,10 +84,17 @@ private fun decodeDestination(raw: String): Destination = when {
     raw == "activity" -> Destination.Activity
     raw == "editor" -> Destination.Editor
     raw == "settings" -> Destination.Settings
+    raw == "event-monitor" -> Destination.EventMonitor
     raw == "veilknit" -> Destination.VeilKnit
     raw == "veilknit-backup" -> Destination.VeilKnitBackup
     raw == "group-moderation" -> Destination.GroupModeration
-    raw.startsWith("profile\u0000") -> Destination.Profile(raw.substringAfter('\u0000'))
+    raw.startsWith("profile\u0000") -> {
+        val parts = raw.split('\u0000', limit = 3)
+        Destination.Profile(
+            mainDht = parts.getOrElse(1) { "" },
+            swipeQueue = parts.getOrElse(2) { "" }.split('\u0001').filter { it.isNotBlank() },
+        )
+    }
     raw.startsWith("quickedit\u0000") ->
         Destination.QuickEdit(raw.substringAfter('\u0000').toIntOrNull() ?: 0)
     raw.startsWith("grouppost\u0000") -> {

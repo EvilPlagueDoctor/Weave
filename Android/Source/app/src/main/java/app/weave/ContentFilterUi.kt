@@ -5,6 +5,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -35,16 +36,16 @@ fun ContentFilterSettingsSection(filter: ContentFilter = LocalContentFilter.curr
     FilterPreferenceRow(
         category = ContentFilterCategory.Sexual,
         preference = filter.preferences.sexual,
-        status = if (filter.sexualImageModelReady) tr("Image model ready") else tr("Image model NOT installed — images cannot be classified"),
-        statusIsError = !filter.sexualImageModelReady,
+        status = imageModelStatusLabel(filter),
+        statusIsError = !filter.sexualImageModelReady || filter.imageModelStatus == ImageModelStatus.Unavailable,
         onSensitivity = { filter.update(ContentFilterCategory.Sexual, sensitivity = it) },
         onAction = { filter.update(ContentFilterCategory.Sexual, action = it) },
     )
     FilterPreferenceRow(
         category = ContentFilterCategory.Gore,
         preference = filter.preferences.gore,
-        status = if (filter.goreImageModelReady) tr("Image model ready") else tr("Image model NOT installed — images cannot be classified"),
-        statusIsError = !filter.goreImageModelReady,
+        status = imageModelStatusLabel(filter),
+        statusIsError = !filter.goreImageModelReady || filter.imageModelStatus == ImageModelStatus.Unavailable,
         onSensitivity = { filter.update(ContentFilterCategory.Gore, sensitivity = it) },
         onAction = { filter.update(ContentFilterCategory.Gore, action = it) },
     )
@@ -63,6 +64,15 @@ fun ContentFilterSettingsSection(filter: ContentFilter = LocalContentFilter.curr
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         modifier = Modifier.padding(top = 8.dp),
     )
+}
+
+@Composable
+private fun imageModelStatusLabel(filter: ContentFilter): String = when {
+    !filter.imageSafetyModelReady -> tr("Image model NOT installed — images cannot be classified")
+    filter.imageModelStatus == ImageModelStatus.NotInitialized -> tr("Image model installed — loads on first scan")
+    filter.imageModelStatus == ImageModelStatus.Initializing -> tr("Image model initializing…")
+    filter.imageModelStatus == ImageModelStatus.Ready -> tr("Image model ready")
+    else -> tr("Image model failed to initialize — images will stay unscanned")
 }
 
 @Composable
@@ -179,7 +189,9 @@ fun FilteredPlainText(
     }
     val decision = filter.decision(scores ?: ContentScores(), contentId)
     FilterGate(contentId = contentId, decision = decision, modifier = modifier) { gateModifier ->
-        Text(text = text, modifier = gateModifier, style = style, maxLines = maxLines, overflow = overflow)
+        SelectionContainer {
+            Text(text = text, modifier = gateModifier, style = style, maxLines = maxLines, overflow = overflow)
+        }
     }
 }
 
@@ -215,22 +227,37 @@ private fun FilteredImageInternal(
 ) {
     val filter = LocalContentFilter.current
     val prefs = filter.preferences
-    val active = (prefs.sexual.sensitivity != FilterSensitivity.Off && prefs.sexual.action != FilterAction.Show) ||
-        (prefs.gore.sensitivity != FilterSensitivity.Off && prefs.gore.action != FilterAction.Show)
-    var scores by remember(contentId, bitmap) { mutableStateOf<ContentScores?>(null) }
-    LaunchedEffect(contentId, bitmap, prefs.sexual.sensitivity, prefs.gore.sensitivity) {
-        scores = filter.classifyImage(contentId, bitmap)
+    val active = filter.imageFilteringEnabled()
+    // Re-key the state whenever an image or its filter settings change: no frame can
+    // display the unclassified image while a new scan is starting.
+    var scan by remember(contentId, bitmap, active, prefs.sexual.sensitivity, prefs.sexual.action,
+        prefs.gore.sensitivity, prefs.gore.action) {
+        mutableStateOf<ImageScanResult>(
+            if (active) ImageScanResult.NotScanned(ImageNotScannedReason.WaitingForInitialization)
+            else ImageScanResult.Disabled
+        )
     }
-    if (active && scores == null) {
-        FilterCheckingPlaceholder(modifier, compact)
+    LaunchedEffect(contentId, bitmap, active, prefs.sexual.sensitivity, prefs.sexual.action,
+        prefs.gore.sensitivity, prefs.gore.action) {
+        if (active) scan = filter.classifyImage(contentId, bitmap)
+    }
+    if (!active) {
+        // With filtering disabled there is no initialization, queue, or image delay.
+        Box(modifier) { content(Modifier) }
         return
     }
-    val decision = filter.decision(scores ?: ContentScores(), contentId)
-    LaunchedEffect(contentId, decision.action, decision.category, decision.score, compact) {
-        filter.logImageRender(contentId, decision, compact)
-    }
-    FilterGate(contentId = contentId, decision = decision, modifier = modifier, compact = compact) { childModifier ->
-        content(childModifier)
+    when (val result = scan) {
+        is ImageScanResult.Scanned -> {
+            val decision = filter.decision(result.scores, contentId)
+            LaunchedEffect(contentId, decision.action, decision.category, decision.score, compact) {
+                filter.logImageRender(contentId, decision, compact)
+            }
+            FilterGate(contentId = contentId, decision = decision, modifier = modifier, compact = compact) { childModifier ->
+                content(childModifier)
+            }
+        }
+        is ImageScanResult.NotScanned -> ImageNotScannedPlaceholder(modifier, compact, result.reason)
+        ImageScanResult.Disabled -> FilterCheckingPlaceholder(modifier, compact)
     }
 }
 
@@ -243,6 +270,33 @@ private fun FilterCheckingPlaceholder(modifier: Modifier = Modifier, compact: Bo
                 Spacer(Modifier.width(8.dp))
                 Text(tr("Checking your content filters…"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
+        }
+    }
+}
+
+@Composable
+private fun ImageNotScannedPlaceholder(
+    modifier: Modifier,
+    compact: Boolean,
+    reason: ImageNotScannedReason,
+) {
+    if (reason == ImageNotScannedReason.WaitingForInitialization) {
+        FilterCheckingPlaceholder(modifier, compact)
+        return
+    }
+    // A missing/broken ONNX model must NOT expose an unclassified image or provide
+    // a "tap to reveal" bypass. Turning image filtering off in Settings shows it.
+    Surface(modifier = modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(8.dp)) {
+        Box(Modifier.padding(if (compact) 4.dp else 12.dp), contentAlignment = Alignment.Center) {
+            Text(
+                if (compact) tr("Not scanned")
+                else if (reason == ImageNotScannedReason.ModelUnavailable)
+                    tr("Not scanned — image model unavailable. Check the model or restart Weave.")
+                else tr("Not scanned — image classification failed."),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = if (compact) 2 else 4,
+            )
         }
     }
 }

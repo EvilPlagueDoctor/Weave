@@ -1137,21 +1137,34 @@ impl HopPickerStrategy for RandomHopPicker {
 struct FocusedHopPicker {
     preferred: RandomHopPicker,
     fallback: RandomHopPicker,
+    // A seed must not consume another hop through the fallback candidate pool.
+    preferred_keys: HashSet<String>,
 }
 
 impl FocusedHopPicker {
     fn new(own_dht: &RecordKey, preferred: Vec<RecordKey>, fallback: Vec<RecordKey>) -> Self {
+        let preferred_keys: HashSet<String> = preferred.iter().map(ToString::to_string).collect();
+        let unexplored = fallback
+            .into_iter()
+            .filter(|peer| !preferred_keys.contains(&peer.to_string()))
+            .collect();
         Self {
             preferred: RandomHopPicker::new(own_dht, preferred),
-            fallback: RandomHopPicker::new(own_dht, fallback),
+            fallback: RandomHopPicker::new(own_dht, unexplored),
+            preferred_keys,
         }
     }
 }
 
 impl HopPickerStrategy for FocusedHopPicker {
     fn add_candidates(&mut self, candidates: Vec<RecordKey>) -> usize {
-        // Discovery after the seed hop remains ordinary randomized walking.
-        self.fallback.add_candidates(candidates)
+        // After a small number of seed hops, explore bloom-matching new candidates.
+        // Do not visit a preferred seed a second time in the fallback frontier.
+        let novel = candidates
+            .into_iter()
+            .filter(|peer| !self.preferred_keys.contains(&peer.to_string()))
+            .collect();
+        self.fallback.add_candidates(novel)
     }
 
     fn next_hop(&mut self) -> Option<RecordKey> {
@@ -1989,41 +2002,76 @@ impl WalkTask {
         let own_dht = package.dht_record.key().clone();
         let base_dht = WalkDht::new(init.dht_module.clone(), init.own_dht_package, true, None);
 
-        let mut list_manager = InternalListManager::load_from_user_or_bootstrap(
+        // Load the encrypted local candidate list before publishing the walker, but do not
+        // wait for a remote DHT round trip. A slow read of our own routing table used to
+        // consume the caller's entire 45-second startup deadline and permanently disable
+        // application discovery for the session (even when Veilid was AttachedGood).
+        let list_manager = InternalListManager::load_from_user_or_bootstrap(
             init.auth.as_deref(),
             init.session.as_deref(),
         )?
         .with_limits(init.list_limits);
-
-        let own_snapshot = base_dht.read_owned(&own_dht).await;
-        list_manager.process_own_snapshot(&own_snapshot, &own_dht);
-
         let app_discovery = AppDiscoveryCache::load(init.auth.clone(), init.session.clone());
-        let now = current_timestamp();
-        let app_cutoff = now.saturating_sub(APP_DISCOVERY_ACTIVITY_TTL_SECS);
-        let mut seeded_app_cache = false;
-        for entry in &list_manager.list.entries {
-            if entry.app_info_updated_at >= app_cutoff && !entry.application_ids.is_empty() {
-                seeded_app_cache |= app_discovery
-                    .observe_direct_app_set(
-                        &entry.their_address,
-                        &entry.application_ids,
+        let internal_list = Arc::new(RwLock::new(list_manager));
+
+        // Rehydrate the app-specific index from locally verified entries in the background.
+        // This never blocks the walker actor or the application's first peer-list request.
+        let seed_list = internal_list.clone();
+        let seed_discovery = app_discovery.clone();
+        tokio::spawn(async move {
+            let now = current_timestamp();
+            let cutoff = now.saturating_sub(APP_DISCOVERY_ACTIVITY_TTL_SECS);
+            let seed_entries = {
+                let list = seed_list.read().await;
+                list.list.entries.iter()
+                    .filter(|entry| entry.app_info_updated_at >= cutoff && !entry.application_ids.is_empty())
+                    .map(|entry| (
+                        entry.their_address.clone(),
+                        entry.application_ids.clone(),
                         entry.app_info_updated_at,
-                        entry
-                            .last_direct_dht_read_at
-                            .max(entry.app_info_updated_at),
-                        now,
-                    )
+                        entry.last_direct_dht_read_at.max(entry.app_info_updated_at),
+                    ))
+                    .collect::<Vec<_>>()
+            };
+            let mut changed = false;
+            for (peer, app_ids, updated_at, verified_at) in seed_entries {
+                changed |= seed_discovery
+                    .observe_direct_app_set(&peer, &app_ids, updated_at, verified_at, now)
                     .await;
             }
-        }
-        if seeded_app_cache {
-            if let Err(error) = app_discovery.persist().await {
-                crate::teprintln!("[walk] could not save seeded app-discovery cache: {error}");
+            if changed {
+                if let Err(error) = seed_discovery.persist().await {
+                    crate::teprintln!("[walk] could not save seeded app-discovery cache: {error}");
+                }
             }
-        }
+        });
 
-        let internal_list = Arc::new(RwLock::new(list_manager));
+        // Our own previously published routing-table candidates are useful, but optional:
+        // the encrypted local list plus bootstrap entries can begin walking immediately.
+        // Read those DHT pages asynchronously and merge them as unverified hints. A stuck
+        // read is bounded independently and cannot take the entire walker offline.
+        let own_snapshot_dht = base_dht.clone();
+        let own_snapshot_key = own_dht.clone();
+        let own_snapshot_list = internal_list.clone();
+        tokio::spawn(async move {
+            const OWN_SNAPSHOT_READ_TIMEOUT: Duration = Duration::from_secs(30);
+            match tokio::time::timeout(
+                OWN_SNAPSHOT_READ_TIMEOUT,
+                own_snapshot_dht.read_owned(&own_snapshot_key),
+            ).await {
+                Ok(snapshot) if snapshot.fatal_error.is_none() => {
+                    let mut list = own_snapshot_list.write().await;
+                    list.process_own_snapshot(&snapshot, &own_snapshot_key);
+                    crate::tprintln!("[walker] own routing-table snapshot merged in background");
+                }
+                Ok(snapshot) => {
+                    crate::teprintln!("[walker] own routing-table snapshot deferred: {:?}", snapshot.fatal_error);
+                }
+                Err(_) => {
+                    crate::teprintln!("[walker] own routing-table snapshot read exceeded 30s; continuing with encrypted local candidates");
+                }
+            }
+        });
         let last_snapshots = Arc::new(RwLock::new(Vec::new()));
         let current_walk = Arc::new(RwLock::new(None));
         let app_recommendations = Arc::new(RwLock::new(HashMap::new()));
@@ -2255,7 +2303,9 @@ impl WalkTask {
         );
         let mut seen = HashSet::new();
         seeds.retain(|peer| seen.insert(peer.to_string()));
-        let rotation_epoch = now / (15 * 60);
+        // Rotate preferred entry points between searches. A 15-minute seed order
+        // caused repeated app searches to revisit the same established accounts.
+        let rotation_epoch = now / (2 * 60);
         seeds.sort_by_key(|peer| {
             let mut hasher = blake3::Hasher::new();
             hasher.update(b"veilknit/app-search-seed/v1");
@@ -2264,7 +2314,11 @@ impl WalkTask {
             hasher.update(peer.to_string().as_bytes());
             *hasher.finalize().as_bytes()
         });
-        seeds.truncate(APP_DISCOVERY_MAX_SEARCH_SEEDS);
+        // Previously the entire 16-hop walk could be spent on up to 256 known
+        // seeds. Reserve roughly two thirds of hops for unexplored topology and
+        // bloom-matching peers discovered during this walk.
+        let seed_budget = (hop_count / 3).clamp(2, 8);
+        seeds.truncate(seed_budget);
         let config = WalkConfig::app_search(
             hop_count.clamp(4, 64),
             seeds,
@@ -3295,6 +3349,23 @@ mod patch_c_tests {
 
     const KEY_ONE: &str = "VLD0:Ql5L4_BYpaHtBECl5khtcSIW-lAnnC5vV5PIZCl7vAs:9C9jBokYTHBBBaq7aev39a9ujPVCCzGLE0-Tx_N7FyQ";
     const KEY_TWO: &str = "VLD0:_kOiks1ZUX1EWMHhhCW8VVkHFiA8dAHZi8FwjPfPluA:zn52H-kRgsgzeVYabmSf4D15el-73HwVJ6o84RipMPc";
+
+    #[test]
+    fn focused_picker_does_not_revisit_preferred_seed_as_fallback() {
+        let own: RecordKey = KEY_ONE.parse().unwrap();
+        let seed: RecordKey = KEY_TWO.parse().unwrap();
+        // The own identity is ignored and the preferred seed is not visited again
+        // even if it also appears in the ordinary candidate list.
+        let mut picker = FocusedHopPicker::new(
+            &own,
+            vec![seed.clone()],
+            vec![seed.clone(), own.clone()],
+        );
+        assert_eq!(picker.next_hop(), Some(seed.clone()));
+        assert!(picker.next_hop().is_none());
+        assert_eq!(picker.add_candidates(vec![seed]), 0);
+        assert!(picker.next_hop().is_none());
+    }
 
     fn sample_entry(key: RecordKey) -> RecordTableEntry {
         RecordTableEntry {
